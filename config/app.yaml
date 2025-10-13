@@ -1,0 +1,85 @@
+# config/app.yaml
+streamlit:
+  page_title: "Decision Intelligence Chat"
+  layout: "wide"
+  theme:
+    primaryColor: "#2563eb"
+    backgroundColor: "#0b1220"
+    secondaryBackgroundColor: "#0e1726"
+    textColor: "#e5e7eb"
+
+storage:
+  # Choose one: aws | azure | gcp
+  provider: "azure"
+  base_prefix: "kb/"
+  paths:
+    raw: "raw/"
+    chunks: "chunks/"
+    index: "index/"
+    ingested: "ingested/"
+  aws:
+    bucket: "your-bucket-name"
+    region: "ap-southeast-2"
+    # Use env vars for creds (recommended) or an instance role
+    access_key_id: "${AWS_ACCESS_KEY_ID}"
+    secret_access_key: "${AWS_SECRET_ACCESS_KEY}"
+    session_token: "${AWS_SESSION_TOKEN}"   # optional
+  azure:
+    account_url: "${AZURE_ACCOUNT_URL}"     # e.g., https://<acct>.blob.core.windows.net
+    container: "forecast360-kb"
+    connection_string: "${AZURE_STORAGE_CONNECTION_STRING}"  # omit if using managed identity
+    use_managed_identity: true
+  gcp:
+    bucket: "your-gcs-bucket"
+    project: "your-gcp-project-id"
+    # Prefer Workload Identity or ADC; fallback to a SA key path
+    service_account_json_path: "${GOOGLE_APPLICATION_CREDENTIALS}"
+
+vector_store:
+  type: "milvus"
+  # If using Zilliz Cloud: uri like "https://xxx.api.gcp.zillizcloud.com"
+  uri: "${MILVUS_URI}"
+  token: "${MILVUS_TOKEN}"          # optional depending on deploy
+  database: "default"
+  collection: "kb_chunks"
+  dim: 768                          # match your embedding model
+  metric: "COSINE"                  # COSINE | L2 | IP
+  index:
+    type: "HNSW"                    # HNSW | IVF_FLAT | IVF_SQ8 etc.
+    params:
+      M: 16
+      efConstruction: 200
+  search_params:
+    ef: 64
+    nprobe: 16
+
+rag:
+  chunk_size: 800
+  chunk_overlap: 120
+  top_k: 5
+  score_threshold: 0.1
+  reranker:
+    enabled: false
+    model: null
+  metadata_filters: []              # e.g., [{"key":"region","op":"==","value":"APAC"}]
+  show_citations: true
+
+llm:
+  provider: "anthropic"
+  model: "claude-4-5-sonnet"
+  temperature: 0.2
+  max_tokens: 1024
+  api_key_env: "ANTHROPIC_API_KEY"  # read from environment
+
+uploads:
+  allow_types: ["pdf","docx","pptx","txt","md","csv","xlsx"]
+  max_file_mb: 1024
+
+security:
+  redact_pii: false
+  allowed_domains: []               # e.g., ["example.com"]
+  allow_local_files: false
+
+logging:
+  level: "INFO"
+  sink: "stdout"
