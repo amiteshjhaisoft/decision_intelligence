@@ -46,7 +46,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     },
     "llm": {
         "provider": "anthropic",
-        "model": "claude-3-5-sonnet",
+        "model": "claude-sonnet-4-5",
         "temperature": 0.2,
         "max_tokens": 1024,
     },
@@ -262,8 +262,8 @@ def render_sidebar(cfg: Dict[str, Any]):
         # LLM
         st.subheader("LLM")
         cfg["llm"]["model"] = st.selectbox(
-            "Claude model", ["claude-3-5-sonnet", "claude-3-opus", "claude-3-haiku"],
-            index=["claude-3-5-sonnet", "claude-3-opus", "claude-3-haiku"].index(cfg["llm"]["model"]) if cfg["llm"]["model"] in ["claude-3-5-sonnet", "claude-3-opus", "claude-3-haiku"] else 0,
+            "Claude model", ["claude-sonnet-4-5", "claude-3-opus", "claude-3-haiku"],
+            index=["claude-sonnet-4-5", "claude-3-opus", "claude-3-haiku"].index(cfg["llm"]["model"]) if cfg["llm"]["model"] in ["claude-sonnet-4-5", "claude-3-opus", "claude-3-haiku"] else 0,
             help="Only Claude is wired in this UI; swap later if needed.",
         )
         cfg["llm"]["temperature"] = st.slider("Temperature", 0.0, 1.0, float(cfg["llm"]["temperature"]))
