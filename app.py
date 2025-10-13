@@ -171,7 +171,7 @@ def orchestrate_response(query: str, cfg: Dict[str, Any]) -> Dict[str, Any]:
     answer = call_claude(
         system_prompt=system_prompt,
         messages=chat_context,
-        model=llm_cfg.get("model", "claude-3-5-sonnet"),
+        model=llm_cfg.get("model", "claude-4-5-sonnet"),
         temperature=float(llm_cfg.get("temperature", 0.2)),
         max_tokens=int(llm_cfg.get("max_tokens", 1024)),
     )
