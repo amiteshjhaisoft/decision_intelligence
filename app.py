@@ -1,443 +1,836 @@
-# Author: Amitesh Jha | iSOFT
-
-# app.py — Modern Streamlit Chat Interface (UI-focused)
-# Author: Your Name | 2025-10-13
-# Description: A polished, configurable chat UI ready to plug into a RAG/Claude backend.
-# - Safe to run without API keys (demo mode)
-# - Reads optional YAML at ./config/app.yaml for UI and RAG toggles
-# - Includes sidebar settings, message actions, source/citations panel, and file upload
-# - Backend hooks are stubbed: wire your retrieval + Claude call inside `orchestrate_response()`
+# Author: Amitesh Jha | iSoft | 2025-10-12
+# deci_int.py — Streamlit RAG chat (Claude-only, no sidebar, hardcoded settings)
+# Forecast360 customizations:
+# - Azure Blob is the single source of truth (mirror prefix to ./KB even if meta/version.json is absent)
+# - Secrets-first Azure config (Streamlit secrets -> env), with clear diagnostics
+# - Auto-index with FAISS (HuggingFace all-MiniLM-L6-v2) and signature-based change detection
+# - Inline status bar; compact controls (chat height, quick reindex, show KB stats)
+# - Chat slash-commands: /read <name>, /open <name>, /show <name>, /set key=value ...
+# - Full-document summarization via Claude when documents are long
+# - Robust loaders; safe fallbacks for CSV/XLSX/TSV/HTML/PDF; placeholders for non-text assets
+# - Clean, Forecast360-themed chat UI; no sidebar
 
 from __future__ import annotations
 
-import os
-import json
-import time
-import base64
-import uuid
+import os, glob, time, base64, hashlib, json, shutil, re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import List, Tuple, Optional, Dict, Any
 
 import streamlit as st
+import pandas as pd
 
-# --- Avatars (custom images)
-AVATAR_USER = "assets/avatar.png"
-AVATAR_ASSISTANT = "assets/llm.png"
+# ---- Runtime hygiene
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
+# ---- LangChain / Vector
+from langchain_community.vectorstores import FAISS
 try:
-    import yaml  # type: ignore
-except Exception:  # yaml is optional; app still runs
-    yaml = None  # type: ignore
+    from langchain_huggingface import HuggingFaceEmbeddings
+except Exception:
+    from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.schema import Document
+from langchain.chains import ConversationalRetrievalChain
+from langchain.memory import ConversationBufferMemory
+from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.messages import AIMessage, BaseMessage
+from langchain_core.outputs import ChatGeneration, ChatResult
 
-# ------------------------------
-# Config loading (optional YAML)
-# ------------------------------
-DEFAULT_CONFIG: Dict[str, Any] = {
-    "streamlit": {
-        "page_title": "Decision Intelligence Chat",
-        "layout": "wide",
-        "theme": {
-            "primaryColor": "#2563eb",  # Tailwind indigo-600
-            "backgroundColor": "#0b1220",
-            "secondaryBackgroundColor": "#0e1726",
-            "textColor": "#e5e7eb",
-        },
-    },
-    "llm": {
-        "provider": "anthropic",
-        "model": "claude-sonnet-4-5",
-        "temperature": 0.2,
-        "max_tokens": 1024,
-    },
-    "rag": {
-        "top_k": 5,
-        "score_threshold": 0.1,
-        "show_citations": True,
-    },
-}
+# Loaders
+from langchain_community.document_loaders import (
+    PyPDFLoader, BSHTMLLoader, Docx2txtLoader, CSVLoader, UnstructuredPowerPointLoader
+)
+
+# ---- Anthropic (Claude only)
+try:
+    from anthropic import Anthropic as _AnthropicClientNew
+except Exception:
+    _AnthropicClientNew = None
+try:
+    from anthropic import Client as _AnthropicClientOld
+except Exception:
+    _AnthropicClientOld = None
+
+# ---- Azure SDK (used to pull KB down to ./KB)
+try:
+    from azure.storage.blob import BlobServiceClient, ContainerClient
+    try:
+        from azure.identity import DefaultAzureCredential
+    except Exception:
+        DefaultAzureCredential = None  # type: ignore
+    _AZURE_OK = True
+except Exception:
+    BlobServiceClient = ContainerClient = DefaultAzureCredential = None  # type: ignore
+    _AZURE_OK = False
+
+# ---------------- Constants (hardcoded; no sidebar)
+DEFAULT_CLAUDE = "claude-sonnet-4-5"
+_EMB_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+_EMB_MODEL_KW = {"device": "cpu", "trust_remote_code": False}
+_ENCODE_KW = {"normalize_embeddings": True}
+
+TEXT_EXTS = {".txt", ".md", ".rtf", ".html", ".htm", ".json", ".xml"}
+DOC_EXTS  = {".pdf", ".docx", ".csv", ".tsv", ".pptx", ".pptm", ".doc", ".odt"}
+SPREADSHEET_EXTS = {".xlsx", ".xlsm", ".xltx"}
+SUPPORTED_TEXT_DOCS = TEXT_EXTS | DOC_EXTS | SPREADSHEET_EXTS
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".tiff"}
+AUDIO_EXTS = {".mp3", ".wav", ".m4a"}
+VIDEO_EXTS = {".mp4", ".mov", ".avi"}
+SUPPORTED_EXTS = SUPPORTED_TEXT_DOCS | IMAGE_EXTS | AUDIO_EXTS | VIDEO_EXTS
+
+GREETING_RE = re.compile(
+    r"""^\s*(hi|hello|hey|hiya|yo|hola|namaste|namaskar|g'day|good\s+(morning|afternoon|evening))[\s!,.?]*$""",
+    re.IGNORECASE,
+)
+
+VectorStoreType = FAISS
+
+# ---------------- Minimal Claude wrapper (no tools, plain text)
+class ClaudeDirect(BaseChatModel):
+    model: str = DEFAULT_CLAUDE
+    temperature: float = 0.2
+    max_tokens: int = 800
+    _client: object = None
+
+    def __init__(self, client, **kwargs):
+        super().__init__(**kwargs)
+        object.__setattr__(self, "_client", client)
+
+    @property
+    def _llm_type(self) -> str:
+        return "claude_direct"
+
+    def _convert_msgs(self, messages: list[BaseMessage]):
+        out = []
+        for m in messages:
+            role = "user" if m.type == "human" else ("assistant" if m.type == "ai" else "user")
+            if isinstance(m.content, str):
+                text = m.content
+            else:
+                parts = m.content or []
+                text = "".join(p.get("text", "") if isinstance(p, dict) else str(p) for p in parts)
+            out.append({"role": role, "content": [{"type": "text", "text": text}]})
+        return out
+
+    def _generate(self, messages: list[BaseMessage], stop=None, run_manager=None, **kwargs) -> ChatResult:
+        amsgs = self._convert_msgs(messages)
+        resp = self._client.messages.create(
+            model=self.model, messages=amsgs, temperature=self.temperature, max_tokens=self.max_tokens
+        )
+        text = ""
+        content = getattr(resp, "content", []) or []
+        for blk in content:
+            if getattr(blk, "type", None) == "text":
+                text += getattr(blk, "text", "") or ""
+            elif isinstance(blk, dict) and blk.get("type") == "text":
+                text += blk.get("text", "") or ""
+        ai = AIMessage(content=text)
+        return ChatResult(generations=[ChatGeneration(message=ai)])
+
+# ---------------- Theme / CSS (Forecast360 look)
+try:
+    st.set_page_config(page_title="Forecast360 • Chat", page_icon="💬", layout="wide")
+except Exception:
+    pass
+
+USER_AVATAR_PATH: Optional[Path] = None
+ASSIST_AVATAR_PATH: Optional[Path] = None
 
 
-def load_yaml_config() -> Dict[str, Any]:
-    """Load ./config/app.yaml if present; merge onto DEFAULT_CONFIG (shallow)."""
-    cfg = DEFAULT_CONFIG.copy()
-    cfg_path = Path("config/app.yaml")
-    if cfg_path.is_file() and yaml is not None:
+def _first_existing(paths: list[Optional[Path]]) -> Optional[Path]:
+    for p in paths:
+        if p and p.exists():
+            return p
+    return None
+
+
+def _resolve_avatar_paths() -> Tuple[Optional[Path], Optional[Path]]:
+    user_env = os.getenv("USER_AVATAR_PATH")
+    asst_env = os.getenv("ASSISTANT_AVATAR_PATH")
+    user = _first_existing([
+        Path(user_env).expanduser().resolve() if user_env else None,
+        Path.cwd() / "assets" / "avatar.png",
+        Path.cwd() / "assets" / "user.png",
+        Path.cwd() / "assets" / "me.png",
+    ])
+    asst = _first_existing([
+        Path(asst_env).expanduser().resolve() if asst_env else None,
+        Path.cwd() / "assets" / "llm.png",
+        Path.cwd() / "assets" / "assistant.png",
+        Path.cwd() / "assets" / "bot.png",
+        Path.cwd() / "assets" / "robot.png",
+    ])
+    return user, asst
+
+
+USER_AVATAR_PATH, ASSIST_AVATAR_PATH = _resolve_avatar_paths()
+
+
+def _img_to_data_uri(path: Optional[Path]) -> Optional[str]:
+    if not path or not path.exists():
+        return None
+    b64 = base64.b64encode(path.read_bytes()).decode("ascii")
+    ext = (path.suffix.lower().lstrip(".") or "png")
+    mime = "image/png" if ext in ("png", "apng") else ("image/jpeg" if ext in ("jpg", "jpeg") else "image/svg+xml")
+    return f"data:{mime};base64,{b64}"
+
+
+USER_AVATAR_URI = _img_to_data_uri(USER_AVATAR_PATH)
+ASSIST_AVATAR_URI = _img_to_data_uri(ASSIST_AVATAR_PATH)
+user_bg = f"background-image:url('{USER_AVATAR_URI}');" if USER_AVATAR_URI else ""
+asst_bg = f"background-image:url('{ASSIST_AVATAR_URI}');" if ASSIST_AVATAR_URI else ""
+
+st.markdown(f"""
+<style>
+:root{{ --bg:#f7f8fb; --panel:#fff; --text:#0b1220; --border:#e7eaf2;
+       --bubble-user:#eef4ff; --bubble-assist:#f6f7fb; --accent:#2563eb; }}
+.chat-card{{ background:var(--panel); border:1px solid var(--border); border-radius:14px;
+            box-shadow:0 6px 16px rgba(16,24,40,.05); overflow:hidden; }}
+.msg{{ display:flex; align-items:flex-start; gap:.65rem; margin:.45rem 0; }}
+.avatar{{ width:32px; height:32px; border-radius:50%; border:1px solid var(--border);
+          background-size:cover; background-position:center; background-repeat:no-repeat; flex:0 0 32px; }}
+.avatar.user {{ {user_bg} }}
+.avatar.assistant {{ {asst_bg} }}
+.bubble{{ border:1px solid var(--border); background:var(--bubble-assist);
+         padding:.8rem .95rem; border-radius:12px; max-width:960px; white-space:pre-wrap; line-height:1.45; }}
+.msg.user .bubble{{ background:var(--bubble-user); }}
+.status-inline{{ width:100%; border:1px solid var(--border); background:#fafcff; border-radius:10px;
+                padding:.5rem .7rem; font-size:.9rem; color:#111827; margin:.5rem 0 .8rem; }}
+.small-note{{opacity:.85;font-size:.85rem}}
+</style>
+""", unsafe_allow_html=True)
+
+# ---------------- KB + Azure helpers (download-only mirror)
+
+def _local_kb_dir() -> Path:
+    p = Path.cwd() / "KB"
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def _kb_local_version() -> Optional[str]:
+    vf = _local_kb_dir() / "meta" / "version.json"
+    if vf.exists():
         try:
-            with cfg_path.open("r", encoding="utf-8") as f:
-                y = yaml.safe_load(f) or {}
-            # Shallow merge
-            for k, v in y.items():
-                if isinstance(v, dict) and k in cfg and isinstance(cfg[k], dict):
-                    cfg[k].update(v)
-                else:
-                    cfg[k] = v
-        except Exception as e:
-            st.sidebar.warning(f"⚠️ Failed to read app.yaml: {e}")
-    return cfg
+            return json.loads(vf.read_text(encoding="utf-8")).get("version")
+        except Exception:
+            return None
+    return None
 
 
-# ------------------------------
-# Utilities
-# ------------------------------
-@dataclass
-class Source:
-    title: str
-    snippet: str
-    url: Optional[str] = None
-    score: Optional[float] = None
-    doc_id: Optional[str] = None
+def _azure_cfg() -> Dict[str, Any]:
+    # Prefer Streamlit secrets; then env
+    try:
+        az = st.secrets.get("azure", {})  # type: ignore
+    except Exception:
+        az = {}
+    return {
+        "account_url":       az.get("account_url")         or os.getenv("AZURE_ACCOUNT_URL"),
+        "connection_string": az.get("connection_string")   or os.getenv("AZURE_STORAGE_CONNECTION_STRING"),
+        "container":         az.get("container")           or os.getenv("AZURE_BLOB_CONTAINER", "forecast360-kb"),
+        "prefix":            az.get("prefix", "KB"),
+        "sas_url":           az.get("container_sas_url")   or os.getenv("AZURE_BLOB_CONTAINER_URL"),
+    }
 
 
-def _img_to_b64(path: str) -> Optional[str]:
-    p = Path(path)
-    if not p.is_file():
+def _azure_diag(cfg: Dict[str, Any]) -> str:
+    flags = []
+    flags.append("sas_url" if cfg.get("sas_url") else "-")
+    flags.append("conn_str" if cfg.get("connection_string") else "-")
+    flags.append("acct_url" if cfg.get("account_url") else "-")
+    return "/".join(flags) + f" · container='{cfg.get('container')}' · prefix='{cfg.get('prefix')}'"
+
+
+def _azure_container_client() -> Optional["ContainerClient"]:
+    if not _AZURE_OK:
+        return None
+    cfg = _azure_cfg()
+    if cfg["sas_url"]:
+        try:
+            return ContainerClient.from_container_url(cfg["sas_url"])
+        except Exception:
+            return None
+    if cfg["connection_string"]:
+        try:
+            svc = BlobServiceClient.from_connection_string(cfg["connection_string"])
+            return svc.get_container_client(cfg["container"])
+        except Exception:
+            return None
+    if cfg["account_url"] and DefaultAzureCredential is not None:
+        try:
+            cred = DefaultAzureCredential(exclude_interactive_browser_credential=True)
+            svc = BlobServiceClient(account_url=cfg["account_url"], credential=cred)
+            return svc.get_container_client(cfg["container"])
+        except Exception:
+            return None
+    return None
+
+
+def _azure_kb_version() -> Optional[str]:
+    if not _AZURE_OK:
         return None
     try:
-        return base64.b64encode(p.read_bytes()).decode("utf-8")
+        cli = _azure_container_client()
+        if not cli:
+            return None
+        pref = _azure_cfg()["prefix"].rstrip("/") + "/"
+        blob = pref + "meta/version.json"
+        txt = cli.download_blob(blob).readall().decode("utf-8")
+        return json.loads(txt).get("version")
     except Exception:
         return None
 
 
-def _init_session_state():
-    if "messages" not in st.session_state:
-        st.session_state.messages: List[Dict[str, Any]] = []
-    if "config" not in st.session_state:
-        st.session_state.config = load_yaml_config()
-    if "chat_id" not in st.session_state:
-        st.session_state.chat_id = uuid.uuid4().hex[:8]
-    if "sidebar_open" not in st.session_state:
-        st.session_state.sidebar_open = True
+def _download_entire_prefix(cli: "ContainerClient", prefix: str, dest: Path) -> int:
+    """Mirror ALL blobs under prefix into dest. Returns number of files downloaded."""
+    count = 0
+    prefix = prefix.rstrip("/") + "/" if prefix else ""
+    for blob in cli.list_blobs(name_starts_with=prefix or None):
+        rel = blob.name[len(prefix):] if prefix else blob.name
+        if not rel or rel.endswith("/"):
+            continue
+        target = dest / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            data = cli.download_blob(blob.name).readall()
+            with open(target, "wb") as f:
+                f.write(data)
+            count += 1
+        except Exception:
+            pass
+    return count
 
 
-# ------------------------------
-# Backend stubs (plug your logic)
-# ------------------------------
-
-def retrieve_documents(query: str, top_k: int = 5) -> List[Source]:
-    """Stub: Replace with Milvus search + metadata fetch.
-    Return a few dummy sources for demo.
+def sync_kb_from_azure_if_needed(status_placeholder=None) -> Tuple[Path, str]:
     """
-    demo = [
-        Source(
-            title="Quarterly Sales Plan",
-            snippet="Targets and assumptions for Q4, including supply constraints and pricing.",
-            url=None,
-            score=0.62,
-            doc_id="doc_q4_plan",
-        ),
-        Source(
-            title="Ops Note: Inventory Risk",
-            snippet="Spike in lead times for APAC vendors; mitigation via safety stock.",
-            url=None,
-            score=0.58,
-            doc_id="doc_ops_risk",
-        ),
-    ]
-    return demo[:top_k]
+    If Azure has a different KB version, or local KB is empty/missing meta,
+    mirror prefix -> ./KB (download all files). Returns (kb_path, status_label).
+    """
+    kb_root = _local_kb_dir()
+    if not _AZURE_OK:
+        return kb_root, "Azure SDK missing — using local KB only."
+
+    cli = _azure_container_client()
+    if not cli:
+        return kb_root, "Azure not configured — using local KB only."
+
+    cfg  = _azure_cfg()
+    pref = cfg["prefix"].rstrip("/") if cfg["prefix"] else ""
+
+    remote_ver = _azure_kb_version()
+    local_ver  = _kb_local_version()
+
+    local_empty = len(list(kb_root.rglob("*"))) == 0
+
+    should_mirror = (remote_ver is not None and remote_ver != local_ver) or (remote_ver is None and local_empty)
+
+    if not should_mirror:
+        label = f"KB sync OK · remote={remote_ver or 'unknown'} · local={local_ver or 'unknown'} · {_azure_diag(cfg)}"
+        return kb_root, label
+
+    # wipe local KB to avoid stale files
+    try:
+        shutil.rmtree(kb_root, ignore_errors=True)
+    except Exception:
+        pass
+    kb_root.mkdir(parents=True, exist_ok=True)
+
+    downloaded = _download_entire_prefix(cli, pref, kb_root)
+    label = f"Synced {downloaded} files from Azure · remote={remote_ver or 'unknown'} · {_azure_diag(cfg)}"
+    return kb_root, label
+
+# ---------------- Small utils
+
+def human_time(ms: float) -> str:
+    return f"{ms:.0f} ms" if ms < 1000 else f"{ms/1000:.2f} s"
 
 
-def call_claude(system_prompt: str, messages: List[Dict[str, str]], model: str, temperature: float, max_tokens: int) -> str:
-    """Stub: Wire Anthropic SDK here. Keep UI functional in demo mode."""
-    # Example streaming simulation
-    canned = (
-        "Based on the retrieved context, here are the key insights and a next-step plan."
-        "\n\n1) Demand uptick likely in Q4 (holiday promotions)."
-        "\n2) Constrain SKUs with long lead times; build safety stock."
-        "\n3) Prioritize high-margin bundles in APAC."
-    )
-    return canned
+def stable_hash(s: str) -> str:
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()[:12]
 
 
-def orchestrate_response(query: str, cfg: Dict[str, Any]) -> Dict[str, Any]:
-    """Retrieval → Prompting → LLM. Return dict with 'answer' and 'sources'."""
-    rag_cfg = cfg.get("rag", {})
-    llm_cfg = cfg.get("llm", {})
-
-    sources = retrieve_documents(query, top_k=rag_cfg.get("top_k", 5))
-
-    system_prompt = (
-        "You are a Decision Intelligence assistant. Use the provided sources to answer."
-        " If sources are insufficient, say what else is needed. Always be concise and actionable."
-    )
-
-    chat_context = [
-        {"role": m["role"], "content": m["content"]}
-        for m in st.session_state.messages
-        if m["role"] in {"user", "assistant"}
-    ]
-    chat_context.append({"role": "user", "content": query})
-
-    answer = call_claude(
-        system_prompt=system_prompt,
-        messages=chat_context,
-        model=llm_cfg.get("model", "claude-4-5-sonnet"),
-        temperature=float(llm_cfg.get("temperature", 0.2)),
-        max_tokens=int(llm_cfg.get("max_tokens", 1024)),
-    )
-
-    return {"answer": answer, "sources": sources}
+def iter_files(folder: str) -> List[str]:
+    paths: List[str] = []
+    for ext in SUPPORTED_EXTS:
+        paths.extend(glob.glob(os.path.join(folder, f"**/*{ext}"), recursive=True))
+    return sorted(list(set(paths)))
 
 
-# ------------------------------
-# UI Building Blocks
-# ------------------------------
+def compute_kb_signature(folder: str) -> Tuple[str, int]:
+    files = iter_files(folder)
+    lines = []
+    base = os.path.abspath(folder)
+    for p in files:
+        try:
+            stt = os.stat(p)
+            rel = os.path.relpath(os.path.abspath(p), base)
+            lines.append(f"{rel}|{stt.st_size}|{int(stt.st_mtime)}")
+        except Exception:
+            continue
+    lines.sort()
+    raw = "\n".join(lines) + str(SUPPORTED_TEXT_DOCS)
+    return stable_hash(raw if raw else f"EMPTY-{time.time()}"), len(files)
 
-GLOBAL_CSS = """
-/* Layout + Colors */
-:root{
-  --bg:#0b1220; --bg2:#0e1726; --panel:#0f172a; --border:#1f2a44; --text:#e5e7eb; --muted:#a5b4fc;
-  --accent:#2563eb; --accent2:#22d3ee; --success:#10b981; --warn:#f59e0b;
-}
-section.main > div { padding-top: 0 !important; }
+# ---------------- Loading
 
-/* Chat bubbles */
-.chat-wrap{display:flex;gap:12px;margin:8px 0;padding:8px 10px;align-items:flex-start}
-.chat-msg{max-width: 1150px; border:1px solid var(--border); background:linear-gradient(180deg,rgba(17,24,39,.75),rgba(17,24,39,.55));
-  padding:12px 14px;border-radius:16px;box-shadow:0 8px 24px rgba(0,0,0,.18)}
-.msg-user{background:linear-gradient(180deg,rgba(37,99,235,.15),rgba(37,99,235,.05));}
-.msg-assistant{background:linear-gradient(180deg,rgba(34,211,238,.12),rgba(34,211,238,.05));}
-.msg-tool{background:linear-gradient(180deg,rgba(16,185,129,.12),rgba(16,185,129,.05));}
-
-/* Avatar */
-.avatar{width:36px;height:36px;border-radius:50%;border:1px solid var(--border);object-fit:cover;box-shadow:0 2px 8px rgba(0,0,0,.2)}
-
-/* Message header */
-.msg-head{display:flex;align-items:center;gap:8px;margin-bottom:6px;opacity:.9;font-size:.85rem;color:var(--muted)}
-.msg-body{white-space:pre-wrap;line-height:1.55}
-
-/* Sources panel */
-.sources-card{border:1px solid var(--border);background:linear-gradient(180deg,rgba(15,23,42,.9),rgba(15,23,42,.7));padding:10px 12px;border-radius:14px}
-.source-item{display:flex;gap:10px;align-items:flex-start;padding:8px 0;border-bottom:1px dashed rgba(255,255,255,.07)}
-.source-item:last-child{border-bottom:0}
-.source-score{font-size:.8rem;opacity:.8}
-
-/* Header bar */
-.header{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:12px 16px;margin:10px 0 4px;
-  background:linear-gradient(135deg, rgba(37,99,235,.15), rgba(34,211,238,.10)); border:1px solid var(--border); border-radius:16px}
-.header .title{font-weight:800;font-size:1.1rem;letter-spacing:.3px}
-.header .badge{font-size:.75rem;opacity:.85;padding:4px 8px;border:1px solid var(--border);border-radius:999px}
-
-/* Input row */
-.input-hint{opacity:.7;font-size:.85rem;margin-top:6px}
-
-/* Buttons */
-.pill{border-radius:999px;border:1px solid var(--border);padding:6px 12px;background:linear-gradient(180deg,rgba(17,24,39,.85),rgba(17,24,39,.6));}
-.pill:hover{filter:brightness(1.1)}
-
-/* File pill */
-.file-pill{display:inline-flex;align-items:center;gap:8px;padding:6px 10px;margin-top:6px;border:1px dashed var(--border);border-radius:10px}
-
-/* Small helpers */
-.kpi{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin:6px 0}
-.kpi .card{border:1px solid var(--border);border-radius:12px;padding:8px 10px;background:linear-gradient(180deg,rgba(2,6,23,.8),rgba(2,6,23,.6))}
-"""
+def _fallback_read(path: str) -> str:
+    try:
+        if path.lower().endswith(tuple(SPREADSHEET_EXTS)):
+            df = pd.read_excel(path).astype(str).iloc[:1000, :50]
+            header = " | ".join(df.columns.tolist())
+            body = "\n".join(" | ".join(row) for row in df.values.tolist())
+            return f"Spreadsheet content from {Path(path).name}:\nColumns: {header}\nData:\n{body}"
+        if path.lower().endswith((".csv", ".tsv")):
+            sep = "\t" if path.lower().endswith(".tsv") else ","
+            df = pd.read_csv(path, sep=sep).astype(str).iloc[:1000, :50]
+            header = " | ".join(df.columns.tolist())
+            body = "\n".join(" | ".join(row) for row in df.values.tolist())
+            return f"CSV/TSV content from {Path(path).name}:\nColumns: {header}\nData:\n{body}"
+        return Path(path).read_text(encoding="utf-8", errors="ignore")
+    except Exception as e:
+        st.error(f"Error reading file {Path(path).name}: {e}")
+        return ""
 
 
-def render_header(cfg: Dict[str, Any]):
-    col1, col2 = st.columns([1, 1])
-    with col1:
-        header_html = (
-            f"<div class='header'><div class='title'>🧠 Decision Intelligence Chat "
-            f"<span class='badge'>Chat ID: {st.session_state.chat_id}</span></div>"
-            "<div class='badge'>Claude • RAG • Milvus-ready</div></div>"
+def load_one(path: str) -> List[Document]:
+    p = path.lower()
+    if p.endswith(tuple(IMAGE_EXTS | AUDIO_EXTS | VIDEO_EXTS)):
+        doc_type = "Image" if p.endswith(tuple(IMAGE_EXTS)) else ("Audio" if p.endswith(tuple(AUDIO_EXTS)) else "Video")
+        placeholder_content = (
+            f"This document is a {doc_type} file. "
+            f"Text content unavailable (requires OCR/transcription). "
+            f"Metadata: {Path(path).name}."
         )
-        st.markdown(header_html, unsafe_allow_html=True)
-    with col2:
-        st.markdown(
-            '<div class="kpi">'
-            ' <div class="card"><div>Model</div><b>' + cfg["llm"]["model"] + '</b></div>'
-            ' <div class="card"><div>Top-K</div><b>' + str(cfg["rag"]["top_k"]) + '</b></div>'
-            ' <div class="card"><div>Temp</div><b>' + str(cfg["llm"]["temperature"]) + '</b></div>'
-            '</div>',
-            unsafe_allow_html=True,
+        return [Document(page_content=placeholder_content, metadata={"source": path, "type": doc_type, "status": "placeholder"})]
+
+    try:
+        if p.endswith(".pdf"):
+            return PyPDFLoader(path).load()
+        if p.endswith((".html", ".htm")):
+            return BSHTMLLoader(path).load()
+        if p.endswith(".docx"):
+            return Docx2txtLoader(path).load()
+        if p.endswith((".pptx", ".pptm")):
+            return UnstructuredPowerPointLoader(path).load()
+        if p.endswith(".csv"):
+            return CSVLoader(path).load()
+        if p.endswith(".tsv"):
+            return CSVLoader(path, csv_args={"delimiter": "\t"}).load()
+        if p.endswith(tuple(TEXT_EXTS | SPREADSHEET_EXTS | {".doc", ".odt"})):
+            txt = _fallback_read(path)
+            return [Document(page_content=txt, metadata={"source": path})] if txt.strip() else []
+        txt = _fallback_read(path)
+        return [Document(page_content=txt, metadata={"source": path})] if txt.strip() else []
+    except Exception as e:
+        st.warning(f"Failed to load/process {Path(path).name}. Error: {e}")
+        return []
+
+
+def load_documents(folder: str) -> List[Document]:
+    docs: List[Document] = []
+    files_to_load = [p for p in iter_files(folder) if Path(p).suffix.lower() in SUPPORTED_EXTS]
+    for path in files_to_load:
+        docs.extend(load_one(path))
+    return docs
+
+# ---------------- Indexing (FAISS)
+
+@dataclass
+class ChunkingConfig:
+    chunk_size: int = 1200
+    chunk_overlap: int = 200
+
+
+@st.cache_resource(show_spinner=False)
+def _cached_embeddings() -> HuggingFaceEmbeddings:
+    return HuggingFaceEmbeddings(
+        model_name=_EMB_MODEL,
+        model_kwargs=_EMB_MODEL_KW,
+        encode_kwargs=_ENCODE_KW,
+    )
+
+
+def _make_embeddings():
+    return _cached_embeddings()
+
+
+def _faiss_dir(persist_dir: str, collection_name: str) -> Path:
+    return Path(persist_dir).expanduser().resolve() / collection_name
+
+
+def index_folder_langchain(folder: str, persist_dir: str, collection_name: str,
+                           emb_model: str, chunk_cfg: ChunkingConfig) -> Tuple[int, int]:
+    raw_docs = load_documents(folder)
+    faiss_dir = _faiss_dir(persist_dir, collection_name)
+
+    if not raw_docs:
+        if faiss_dir.exists():
+            shutil.rmtree(faiss_dir, ignore_errors=True)
+        return (0, 0)
+
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=chunk_cfg.chunk_size, chunk_overlap=chunk_cfg.chunk_overlap,
+        separators=["\n\n", "\n", ". ", " "]
+    )
+    splat = splitter.split_documents(raw_docs)
+    embeddings = _make_embeddings()
+
+    faiss_db = FAISS.from_documents(documents=splat, embedding=embeddings)
+    faiss_dir.mkdir(parents=True, exist_ok=True)
+    faiss_db.save_local(str(faiss_dir))
+    return (len(raw_docs), len(splat))
+
+
+def get_vectorstore(persist_dir: str, collection_name: str, emb_model: str) -> Optional[FAISS]:
+    key = f"_vs::{persist_dir}::{collection_name}::{emb_model}"
+    if key in st.session_state:
+        return st.session_state[key]
+    faiss_path = _faiss_dir(persist_dir, collection_name)
+    if not faiss_path.exists():
+        return None
+    try:
+        vs = FAISS.load_local(
+            folder_path=str(faiss_path),
+            embeddings=_make_embeddings(),
+            allow_dangerous_deserialization=True,
         )
+        st.session_state[key] = vs
+        return vs
+    except Exception as e:
+        st.error(f"Failed to load FAISS index from disk. Error: {e}")
+        return None
+
+# ---------------- Claude init (hardcoded model) — lazy, cached
+
+def _strip_proxy_env() -> None:
+    for v in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy", "NO_PROXY", "no_proxy"):
+        os.environ.pop(v, None)
 
 
-def render_sidebar(cfg: Dict[str, Any]):
-    with st.sidebar:
-        st.markdown("## ⚙️ Settings")
-        st.caption("These mirror values from config/app.yaml if present.")
-
-        # LLM
-        st.subheader("LLM")
-        cfg["llm"]["model"] = st.selectbox(
-            "Claude model", ["claude-sonnet-4-5", "claude-3-opus", "claude-3-haiku"],
-            index=["claude-sonnet-4-5", "claude-3-opus", "claude-3-haiku"].index(cfg["llm"]["model"]) if cfg["llm"]["model"] in ["claude-sonnet-4-5", "claude-3-opus", "claude-3-haiku"] else 0,
-            help="Only Claude is wired in this UI; swap later if needed.",
-        )
-        cfg["llm"]["temperature"] = st.slider("Temperature", 0.0, 1.0, float(cfg["llm"]["temperature"]))
-        cfg["llm"]["max_tokens"] = st.slider("Max tokens", 256, 4096, int(cfg["llm"]["max_tokens"]))
-
-        # RAG
-        st.subheader("Retrieval")
-        cfg["rag"]["top_k"] = st.slider("Top-K", 1, 20, int(cfg["rag"]["top_k"]))
-        cfg["rag"]["score_threshold"] = st.slider("Score threshold", 0.0, 1.0, float(cfg["rag"]["score_threshold"]))
-        cfg["rag"]["show_citations"] = st.toggle("Show citations", bool(cfg["rag"].get("show_citations", True)))
-
-        # Session controls
-        st.divider()
-        col_a, col_b = st.columns(2)
-        with col_a:
-            if st.button("🗑️ Clear chat", use_container_width=True, type="secondary"):
-                st.session_state.messages = []
-                st.toast("Chat cleared.")
-        with col_b:
-            if st.button("📥 Export chat", use_container_width=True, type="secondary"):
-                payload = {
-                    "chat_id": st.session_state.chat_id,
-                    "messages": st.session_state.messages,
-                    "config": cfg,
-                }
-                st.download_button(
-                    "Download JSON",
-                    data=json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8"),
-                    file_name=f"chat_{st.session_state.chat_id}.json",
-                    mime="application/json",
-                    use_container_width=True,
-                )
-
-        st.divider()
-        st.caption("Demo mode: backend calls are stubbed. Wire your Milvus + Claude in orchestrate_response().")
+def _get_secret_api_key() -> Optional[str]:
+    try:
+        s = st.secrets
+    except Exception:
+        s = None
+    if s:
+        for k in ("ANTHROPIC_API_KEY","anthropic_api_key","CLAUDE_API_KEY","claude_api_key"):
+            v = s.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+        for parent in ("anthropic","claude","secrets"):
+            if parent in s and isinstance(s[parent], dict):
+                ns = s[parent]
+                for k in ("api_key","ANTHROPIC_API_KEY","key","token"):
+                    v = ns.get(k)
+                    if isinstance(v, str) and v.strip():
+                        return v.strip()
+    for k in ("ANTHROPIC_API_KEY","anthropic_api_key","CLAUDE_API_KEY","claude_api_key"):
+        v = os.getenv(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return None
 
 
-def _role_badge(role: str) -> str:
+@st.cache_resource(show_spinner=False)
+def _anthropic_client_from_secrets_cached():
+    _strip_proxy_env()
+    api_key = _get_secret_api_key()
+    if not api_key:
+        raise RuntimeError("Missing ANTHROPIC_API_KEY. Set it in .streamlit/secrets.toml under [anthropic] api_key=\"...\" or env.")
+    os.environ["ANTHROPIC_API_KEY"] = api_key
+    if _AnthropicClientNew is not None:
+        return _AnthropicClientNew(api_key=api_key)
+    if _AnthropicClientOld is not None:
+        return _AnthropicClientOld(api_key=api_key)
+    raise RuntimeError("Anthropic SDK not installed correctly.")
+
+
+def make_llm(model_name: str, temperature: float):
+    client = _anthropic_client_from_secrets_cached()
+    return ClaudeDirect(client=client, model=model_name or DEFAULT_CLAUDE,
+                        temperature=temperature, max_tokens=800)
+
+
+def make_chain(vs: VectorStoreType, llm: BaseChatModel, k: int):
+    retriever = vs.as_retriever(search_kwargs={"k": k})
+    memory = ConversationBufferMemory(memory_key="chat_history", output_key="answer", return_messages=True)
+    return ConversationalRetrievalChain.from_llm(
+        llm=llm, retriever=retriever, memory=memory, return_source_documents=True, verbose=False
+    )
+
+# ---------------- Defaults + auto-index (hardcoded)
+
+def settings_defaults() -> Dict[str, Any]:
+    kb_dir = str(_local_kb_dir())
     return {
-        "user": "👤 You",
-        "assistant": "🤖 Assistant",
-        "tool": "🔧 Tool",
-        "system": "🔒 System",
-    }.get(role, role)
+        "persist_dir": ".faiss_index",
+        "collection_name": f"kb-{stable_hash(kb_dir)}",
+        "base_folder": kb_dir,
+        "emb_model": _EMB_MODEL,
+        "chunk_cfg": ChunkingConfig(),
+        "claude_model": DEFAULT_CLAUDE,
+        "temperature": 0.2,
+        "top_k": 5,
+        "auto_index_min_interval_sec": 8,
+        "chat_height": 560,
+    }
 
 
-def render_messages():
-    def _avatar_tag(role: str) -> str:
-        path = AVATAR_ASSISTANT if role == "assistant" else (AVATAR_USER if role == "user" else None)
-        if path:
-            b64 = _img_to_b64(path)
-            if b64:
-                return f"<img class='avatar' src='data:image/png;base64,{b64}' alt='{role}'>"
-        # Fallback emoji circle
-        emoji = "🤖" if role == "assistant" else ("👤" if role == "user" else "🧩")
-        return f"<div class='avatar' style='display:flex;align-items:center;justify-content:center;font-size:18px;'>{emoji}</div>"
+def auto_index_if_needed(status_placeholder: Optional[object] = None) -> Optional[VectorStoreType]:
+    folder = st.session_state.get("base_folder")
+    persist = st.session_state.get("persist_dir")
+    colname = st.session_state.get("collection_name")
+    emb_model = st.session_state.get("emb_model")
+    min_gap = int(st.session_state.get("auto_index_min_interval_sec", 8))
 
-    for i, m in enumerate(st.session_state.messages):
-        role = m.get("role", "assistant")
-        classes = "msg-assistant" if role == "assistant" else ("msg-user" if role == "user" else "msg-tool")
-        head = f"<div class='msg-head'>{_role_badge(role)} • {time.strftime('%H:%M')}</div>"
-        body = f"<div class='msg-body'>{st._escape_markdown(str(m.get('content','')), unsafe_allow_html=False)}</div>"
-        html = (
-            "<div class='chat-wrap'>" + _avatar_tag(role) +
-            f"<div class='chat-msg {classes}'>{head}{body}</div>" +
-            "</div>"
-        )
-        st.markdown(html, unsafe_allow_html=True)
+    sig_now, file_count = compute_kb_signature(folder)
+    last_sig = st.session_state.get("_kb_last_sig")
+    last_time = float(st.session_state.get("_kb_last_index_ts", 0.0))
+    now = time.time()
 
-        # Optional sources under assistant messages
-        if role == "assistant" and m.get("sources"):
-            with st.expander("Sources / citations", expanded=False):
-                for s in m["sources"]:
-                    score = f"<span class='source-score'>score: {s.get('score'):.2f}</span>" if s.get("score") is not None else ""
-                    title = s.get("title") or s.get("doc_id") or "Document"
-                    snippet = s.get("snippet") or ""
-                    url = s.get("url")
-                    line = f"<div class='source-item'><div><b>{title}</b> {score}<br><span>{snippet}</span>"
-                    if url:
-                        line += f"<br><a href='{url}' target='_blank'>Open</a>"
-                    line += "</div></div>"
-                    st.markdown(line, unsafe_allow_html=True)
+    need_index = (last_sig != sig_now) or (last_sig is None)
+    throttled = (now - last_time) < min_gap
+    target = status_placeholder if status_placeholder is not None else st
 
+    faiss_path = _faiss_dir(persist, colname)
+    index_exists = faiss_path.is_dir() and any(faiss_path.iterdir())
 
-        # Optional sources under assistant messages
-        if role == "assistant" and m.get("sources"):
-            with st.expander("Sources / citations", expanded=False):
-                for s in m["sources"]:
-                    score = f"<span class='source-score'>score: {s.get('score'):.2f}</span>" if s.get("score") is not None else ""
-                    title = s.get("title") or s.get("doc_id") or "Document"
-                    snippet = s.get("snippet") or ""
-                    url = s.get("url")
-                    line = f"<div class='source-item'><div><b>{title}</b> {score}<br><span>{snippet}</span>"
-                    if url:
-                        line += f"<br><a href='{url}' target='_blank'>Open</a>"
-                    line += "</div></div>"
-                    st.markdown(line, unsafe_allow_html=True)
-
-
-def render_input_row(cfg: Dict[str, Any]):
-    st.markdown("<style>div[data-testid='stChatMessageInput']{bottom:10px;}</style>", unsafe_allow_html=True)
-
-    up_files = st.file_uploader(
-        "Attach files (optional) — PDFs, DOCX, CSV, etc.",
-        type=["pdf", "docx", "pptx", "txt", "md", "csv", "xlsx"],
-        accept_multiple_files=True,
-        help="These can be routed to your ingestion flow to ground responses.",
-    )
-    if up_files:
-        st.markdown(
-            " ".join([f"<span class='file-pill'>📎 {f.name} ({f.size//1024} KB)</span>" for f in up_files]),
-            unsafe_allow_html=True,
+    if need_index and not throttled:
+        try:
+            target.markdown('<div class="status-inline">Indexing…</div>', unsafe_allow_html=True)
+            n_docs, n_chunks = index_folder_langchain(folder, persist, colname, emb_model,
+                                                      st.session_state.get("chunk_cfg", ChunkingConfig()))
+            st.session_state["_kb_last_sig"] = sig_now
+            st.session_state["_kb_last_index_ts"] = now
+            st.session_state["_kb_last_counts"] = {"files": file_count, "docs": n_docs, "chunks": n_chunks}
+            label = f"Indexed: <b>{n_docs}</b> files → <b>{n_chunks}</b> chunks"
+        except Exception as e:
+            label = f"Auto-index failed: <b>{e}</b>"
+        target.markdown(f'<div class="status-inline">{label}</div>', unsafe_allow_html=True)
+    elif not index_exists:
+        try:
+            target.markdown('<div class="status-inline">Index missing — building…</div>', unsafe_allow_html=True)
+            n_docs, n_chunks = index_folder_langchain(folder, persist, colname, emb_model,
+                                                      st.session_state.get("chunk_cfg", ChunkingConfig()))
+            st.session_state["_kb_last_sig"] = sig_now
+            st.session_state["_kb_last_index_ts"] = now
+            st.session_state["_kb_last_counts"] = {"files": file_count, "docs": n_docs, "chunks": n_chunks}
+            target.markdown(f'<div class="status-inline">Indexed: <b>{n_docs}</b> files → <b>{n_chunks}</b> chunks</div>',
+                            unsafe_allow_html=True)
+        except Exception as e:
+            target.markdown(f'<div class="status-inline">Auto-index failed: <b>{e}</b></div>',
+                            unsafe_allow_html=True)
+    else:
+        ts = st.session_state.get("_kb_last_index_ts")
+        when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts)) if ts else "—"
+        target.markdown(
+            f'<div class="status-inline">Auto-index is <b>ON</b> · Files: <b>{file_count}</b> · Last indexed: <b>{when}</b> · Index: <code>{colname}</code></div>',
+            unsafe_allow_html=True
         )
 
-    user_text = st.chat_input("Ask about your business, KPIs, risks…")
-    if user_text:
-        # Echo user message
-        st.session_state.messages.append({"role": "user", "content": user_text})
-        render_messages()  # immediate UI feedback
-        st.session_state["pending_query"] = user_text
-        st.session_state["pending_files"] = up_files or []
-        st.rerun()
+    try:
+        return get_vectorstore(persist, colname, emb_model)
+    except Exception:
+        return None
+
+# ---------------- UI helpers
+def _avatar_for_role(role: str) -> Optional[str]:
+    # Prefer data URIs (work in Streamlit avatars); fall back to local path, then emoji
+    if role == "user":
+        return USER_AVATAR_URI or (str(USER_AVATAR_PATH) if USER_AVATAR_PATH else "👤")
+    if role == "assistant":
+        return ASSIST_AVATAR_URI or (str(ASSIST_AVATAR_PATH) if ASSIST_AVATAR_PATH else "🤖")
+    return None
+
+def render_chat_history():
+    for message in st.session_state.get("messages", []):
+        role = message["role"]
+        with st.chat_message(role, avatar=_avatar_for_role(role)):
+            st.markdown(message["content"])
 
 
-# ------------------------------
-# App Entrypoint
-# ------------------------------
+def build_citation_block(source_docs: List[Document], kb_root: str | None = None) -> str:
+    if not source_docs:
+        return ""
+    from collections import Counter
+    names = []
+    for d in source_docs:
+        meta = getattr(d, "metadata", {}) or {}
+        src = meta.get("source", "unknown")
+        try:
+            display = str(Path(src).resolve().relative_to(Path(kb_root).resolve())) if kb_root else Path(src).name
+        except Exception:
+            display = Path(src).name
+        names.append(display)
+    counts = Counter(names)
+    lines = [f"- {name}" + (f" ×{n}" if n > 1 else "") for name, n in counts.items()]
+    return "\n\n**Sources**\n" + "\n".join(lines)
+
+
+def read_whole_file_from_disk(path: str) -> str:
+    docs = load_one(path)
+    return "".join(
+        (f"\n\n--- [{i}] {Path((d.metadata or {}).get('source','')).name} ---\n") + (d.page_content or "")
+        for i, d in enumerate(docs, 1)
+    ).strip()
+
+
+def read_whole_doc_by_name(name_or_stem: str, base_folder: str) -> Tuple[str, List[str]]:
+    name_or_stem = name_or_stem.lower().strip()
+    candidates = [p for p in iter_files(base_folder) if name_or_stem in os.path.basename(p).lower()]
+    texts = []
+    for p in candidates:
+        try:
+            texts.append(read_whole_file_from_disk(p))
+        except Exception as e:
+            texts.append(f"[Error reading {os.path.basename(p)}: {e}]")
+    return ("\n\n".join(t for t in texts if t.strip()) or ""), candidates
+
+# ---------------- LLM & Chain
+
+def make_llm_and_chain(vs: VectorStoreType):
+    llm = make_llm(st.session_state["claude_model"], float(st.session_state["temperature"]))
+    chain = make_chain(vs, llm, int(st.session_state["top_k"]))
+    return llm, chain
+
+
+_SLASH_SET_RE = re.compile(r"/set\s+(.+)$", re.IGNORECASE)
+_KV_RE = re.compile(r"(\w+)\s*=\s*([\w\.\-]+)")
+
+
+def _apply_settings_kv(s: str) -> str:
+    changed = []
+    for k, v in _KV_RE.findall(s):
+        try:
+            if k in {"top_k", "chat_height"}:
+                st.session_state[k] = int(v)
+            elif k in {"temperature"}:
+                st.session_state[k] = float(v)
+            elif k in {"claude_model"}:
+                st.session_state[k] = v
+            elif k in {"chunk_size", "chunk_overlap"}:
+                cfg = st.session_state.get("chunk_cfg", ChunkingConfig())
+                if k == "chunk_size":
+                    cfg.chunk_size = int(v)
+                else:
+                    cfg.chunk_overlap = int(v)
+                st.session_state["chunk_cfg"] = cfg
+            changed.append(f"{k}→{st.session_state[k]}")
+        except Exception:
+            pass
+    return ", ".join(changed) if changed else "No changes applied."
+
+
+def handle_user_input(query: str, vs: Optional[VectorStoreType]):
+    st.session_state.setdefault("messages", [])
+
+    # Slash: /set key=val ... (update settings)
+    mset = _SLASH_SET_RE.search(query)
+    if mset:
+        applied = _apply_settings_kv(mset.group(1))
+        st.session_state["messages"].append({"role": "assistant", "content": f"Applied settings: {applied}"})
+        st.rerun(); return
+
+    st.session_state["messages"].append({"role": "user", "content": query})
+
+    # Full-document commands
+    m = re.match(r"^\s*(read|open|show)\s+(.+)$", query, flags=re.IGNORECASE)
+    if m:
+        target = m.group(2).strip().strip('"').strip("'")
+        full_text, files = read_whole_doc_by_name(target, st.session_state["base_folder"])
+        if not files:
+            st.session_state["messages"].append({"role": "assistant", "content": f"Couldn't find a file containing “{target}” in the Knowledge Base folder."})
+            st.rerun(); return
+
+        if len(full_text) > 8000:
+            try:
+                llm, _ = make_llm_and_chain(vs or FAISS.from_texts([""], _make_embeddings()))
+                summary = llm.predict(f"Summarize the following document concisely, focusing on key facts and numbers:\n\n{full_text[:180000]}")
+                reply = f"**Full-document summary for:** {', '.join(Path(p).name for p in files)}\n\n{summary}"
+            except Exception as e:
+                reply = f"Loaded the full document but failed to summarize: {e}\n\n--- RAW BEGIN ---\n{full_text[:20000]}\n--- RAW TRUNCATED ---"
+        else:
+            reply = f"**Full document content:**\n\n{full_text}"
+
+        st.session_state["messages"].append({"role": "assistant", "content": reply})
+        st.rerun(); return
+
+    if GREETING_RE.match(query):
+        st.session_state["messages"].append({"role": "assistant", "content": "Hello"})
+        st.rerun(); return
+
+    if vs is None:
+        st.session_state["messages"].append({"role": "assistant", "content": "Vector store unavailable. Ensure the FAISS index exists."})
+        st.rerun(); return
+
+    t0 = time.time()
+    try:
+        _, chain = make_llm_and_chain(vs)
+        with st.spinner("Querying Claude with RAG..."):
+            result = chain.invoke({"question": query})
+            answer = result.get("answer", "").strip() or "Not found in Knowledge Base."
+            sources = result.get("source_documents", []) or []
+        citation_block = build_citation_block(sources, kb_root=st.session_state.get("base_folder"))
+        msg = f"{answer}{citation_block}\n\n_(Answered in {human_time((time.time()-t0)*1000)})_"
+    except Exception as e:
+        msg = f"RAG error: {e}"
+
+    st.session_state["messages"].append({"role": "assistant", "content": msg})
+    st.rerun()
+
+# ---------------- Main (no sidebar; Azure KB → local; auto-index; chat)
 
 def main():
-    cfg = load_yaml_config()
+    # 1) Hardcoded defaults
+    for k, v in settings_defaults().items():
+        st.session_state.setdefault(k, v)
 
-    # Page config
-    try:
-        st.set_page_config(
-            page_title=cfg["streamlit"].get("page_title", "Decision Intelligence Chat"),
-            page_icon="🧠",
-            layout=cfg["streamlit"].get("layout", "wide"),
-        )
-    except Exception:
-        pass  # set_page_config can only be called once per run
+    # 2) Sync local KB with Azure (source of truth)
+    kb_dir, sync_label = sync_kb_from_azure_if_needed()
+    st.session_state["base_folder"] = str(kb_dir)
+    st.session_state["collection_name"] = f"kb-{stable_hash(str(kb_dir))}"
 
-    _init_session_state()
+    # 3) Top header + compact controls
+    st.markdown("### 💬 Chat with Forecast360")
+    st.markdown(f"<div class='status-inline'><b>KB Sync:</b> {sync_label}</div>", unsafe_allow_html=True)
 
-    # Theme-ish CSS (app-local)
-    st.markdown(f"<style>{GLOBAL_CSS}</style>", unsafe_allow_html=True)
+    c1, c2, c3 = st.columns([1,2,1], vertical_alignment="center")
+    with c1:
+        hero_status = st.container()
+        vs = auto_index_if_needed(status_placeholder=hero_status)
+    with c2:
+        if st.button("Reindex KB", use_container_width=True):
+            # Force reindex by clearing signature and last-time
+            st.session_state.pop("_kb_last_sig", None)
+            st.session_state["_kb_last_index_ts"] = 0
+    with c3:
+        st.session_state["chat_height"] = st.number_input("Chat height (px)", 420, 1200, st.session_state.get("chat_height", 560), step=20)
+        
+    # with c4:
+    #     counts = st.session_state.get("_kb_last_counts", {})
+    #     st.markdown(
+    #         f"<div class='small-note'>Files: <b>{counts.get('files','–')}</b> · Docs: <b>{counts.get('docs','–')}</b> · Chunks: <b>{counts.get('chunks','–')}</b></div>",
+    #         unsafe_allow_html=True,
+    #     )
 
-    # Header + Sidebar
-    render_header(cfg)
-    render_sidebar(cfg)
+    # 4) Auto-index
+    # hero_status = st.container()
+    # vs = auto_index_if_needed(status_placeholder=hero_status)
 
-    # Chat history
-    render_messages()
+    # 5) Chat UI (no sidebar)
+    st.session_state.setdefault("messages", [{"role": "assistant", "content": "Hi! Ask me anything about Forecast360."}])
+    st.markdown('<div class="chat-card">', unsafe_allow_html=True)
+    chat_area = st.container(height=int(st.session_state.get("chat_height", 560)), border=False)
+    with chat_area:
+        render_chat_history()
+    user_text = st.chat_input("Type your question… ")
+    st.markdown("</div>", unsafe_allow_html=True)
 
-    # If there's a pending query (from previous run), answer it now
-    if q := st.session_state.pop("pending_query", None):
-        with st.chat_message("assistant", avatar=AVATAR_ASSISTANT):
-            with st.spinner("Thinking…"):
-                result = orchestrate_response(q, cfg)
-        answer = result.get("answer", "I couldn't produce an answer.")
-
-        # Store assistant message with optional sources for the expander
-        sources_payload = [
-            {"title": s.title, "snippet": s.snippet, "url": s.url, "score": s.score, "doc_id": s.doc_id}
-            for s in result.get("sources", [])
-        ]
-        st.session_state.messages.append({
-            "role": "assistant",
-            "content": answer,
-            "sources": sources_payload if cfg.get("rag", {}).get("show_citations", True) else None,
-        })
-        st.rerun()
-
-    # Input row at the bottom
-    render_input_row(cfg)
+    if user_text and user_text.strip():
+        handle_user_input(user_text.strip(), vs)
 
 
 if __name__ == "__main__":
