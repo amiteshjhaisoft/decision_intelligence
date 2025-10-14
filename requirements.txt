@@ -1,6 +1,8 @@
 # ---------- Core UI ----------
 streamlit>=1.34
 pyyaml>=6.0.1
+docx2txt>=0.8
+
 
 # ---------- Data / file parsing ----------
 pandas>=2.2
