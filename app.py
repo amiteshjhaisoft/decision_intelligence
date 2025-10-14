@@ -349,36 +349,47 @@ def _milvus_cfg() -> Dict[str, Any]:
     }
     # Default to Milvus-Lite local db file next to app if nothing provided
     if not (cfg["uri"] or cfg["host"]):
-        cfg["uri"] = str(Path.cwd() / ".milvus" / "milvus.db")
+        cfg["uri"] = str(Path.cwd() / ".milvus" / "milvus.db")  # we will convert to sqlite:// later
     return cfg
+
+def _to_sqlite_uri(abs_path: Path) -> str:
+    """
+    Convert filesystem path to sqlite URI acceptable by Milvus-Lite/pymilvus.
+    - Linux/Unix absolute: sqlite:////abs/path/to.db
+    - Windows absolute:    sqlite:///C:/path/to.db
+    """
+    p = abs_path.expanduser().resolve()
+    posix = p.as_posix()
+    if p.is_absolute() and posix.startswith("/"):  # Unix
+        return f"sqlite:////{posix.lstrip('/')}"
+    return f"sqlite:///{posix}"
 
 def _milvus_conn_args() -> Dict[str, Any]:
     """
     Build connection args for LangChain Milvus.
-    - Milvus-Lite: **plain absolute path** ending with `.db` (no `file:` scheme)
+    - Milvus-Lite: **sqlite://** URI to a local .db file
     - Remote Milvus: host/port or full https:// URI + token
-    - If user accidentally provides `file:/...`, normalize back to plain path.
+    - If user provides plain '/path/milvus.db' or 'file:/...', normalize to sqlite://
     """
     cfg = _milvus_cfg()
     args: Dict[str, Any] = {}
     uri = cfg.get("uri")
     if uri:
-        s = str(uri)
-        # Strip an accidental file: prefix
+        s = str(uri).strip()
+        # Handle 'file:/path' → '/path'
         if s.startswith("file:"):
             s = s.replace("file:", "", 1)
-        # If it looks like http(s) or another scheme, pass as-is (remote)
-        if "://" in s and not s.endswith(".db"):
+        if s.endswith(".db") and "://" not in s:
+            args["uri"] = _to_sqlite_uri(Path(s))
+        elif s.startswith("sqlite://"):
             args["uri"] = s
         else:
-            # Treat as filesystem path for Milvus-Lite
-            p = Path(s).expanduser().resolve()
-            p.parent.mkdir(parents=True, exist_ok=True)
-            args["uri"] = str(p)  # PLAIN PATH, e.g. /mount/.../milvus.db
+            # remote Milvus (http(s) or grpc), pass-through
+            args["uri"] = s
     else:
         # Host/port style (remote Milvus/Zilliz)
         args["host"] = cfg.get("host", "127.0.0.1")
-        args["port"] = int(cfg["port"]) if cfg.get("port") else 19530
+        args["port"] = int(cfg.get("port") or 19530)
         if cfg.get("user"):
             args["user"] = cfg["user"]
         if cfg.get("password"):
@@ -431,15 +442,21 @@ def _milvus_collection_exists(name: str) -> bool:
 # ---------------- Milvus-Lite <-> Azure Blob snapshot helpers
 
 def _milvus_local_file() -> Optional[Path]:
-    """Return the local filesystem path for Milvus-Lite when using a local .db path."""
+    """Return the local filesystem path for Milvus-Lite when using sqlite:// URI."""
     args = _milvus_conn_args()
     uri = args.get("uri")
     if not uri:
         return None
     s = str(uri)
-    if "://" in s and not s.endswith(".db"):
-        return None  # remote Milvus
-    return Path(s).expanduser().resolve()
+    if s.startswith("sqlite://"):
+        # strip prefix: sqlite:///, sqlite://// (support both)
+        path = s.replace("sqlite:///", "", 1)
+        if path.startswith("/"):  # handle quadruple slash case
+            # After replacement of 'sqlite:///', Linux absolute becomes '/abs/path' already
+            pass
+        return Path(path)
+    # remote Milvus
+    return None
 
 def _azure_index_blob_path() -> str:
     col = st.session_state.get("collection_name", "milvus")
@@ -450,7 +467,7 @@ def restore_milvus_db_from_blob_if_exists() -> str:
         return "Azure SDK not available — skipping Milvus restore."
     local_path = _milvus_local_file()
     if not local_path:
-        return "Not using Milvus-Lite (no local .db) — skipping restore."
+        return "Not using Milvus-Lite (no sqlite:// URI) — skipping restore."
     cli = _azure_container_client()
     if not cli:
         return "Azure not configured — skipping Milvus restore."
@@ -619,30 +636,29 @@ def index_folder_milvus(folder: str, collection_name: str, chunk_cfg: ChunkingCo
                 _milvus_utility.drop_collection(collection_name, using="default")
         except Exception:
             pass
-        return (0, 0)
+    else:
+        chunks = _split_docs(raw_docs, chunk_cfg)
+        embeddings = _make_embeddings()
 
-    chunks = _split_docs(raw_docs, chunk_cfg)
-    embeddings = _make_embeddings()
+        _connect_milvus()
+        conn_args = _milvus_conn_args()
 
-    _connect_milvus()
-    conn_args = _milvus_conn_args()
+        Milvus.from_documents(
+            documents=chunks,
+            embedding=embeddings,
+            collection_name=collection_name,
+            connection_args=conn_args,
+            drop_old=True,   # idempotent rebuilds on change
+        )
 
-    Milvus.from_documents(
-        documents=chunks,
-        embedding=embeddings,
-        collection_name=collection_name,
-        connection_args=conn_args,
-        drop_old=True,   # idempotent rebuilds on change
-    )
+        # After successful (re)index, back up Milvus-Lite DB to Azure (if configured)
+        try:
+            note = backup_milvus_db_to_blob()
+            st.markdown(f'<div class="status-inline">{note}</div>', unsafe_allow_html=True)
+        except Exception:
+            pass
 
-    # After successful (re)index, back up Milvus-Lite DB to Azure (if configured)
-    try:
-        note = backup_milvus_db_to_blob()
-        st.markdown(f'<div class="status-inline">{note}</div>', unsafe_allow_html=True)
-    except Exception:
-        pass
-
-    return (len(raw_docs), len(chunks))
+    return (len(raw_docs), len(_split_docs(raw_docs, chunk_cfg)) if raw_docs else 0)
 
 def get_vectorstore(collection_name: str) -> Optional[Milvus]:
     try:
