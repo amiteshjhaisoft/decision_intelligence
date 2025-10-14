@@ -1,14 +1,14 @@
 # Author: Amitesh Jha | iSoft | 2025-10-12
 # deci_int.py — Streamlit RAG chat (Claude-only, no sidebar, hardcoded settings)
-# Forecast360 customizations:
-# - Azure Blob is the single source of truth (mirror prefix to ./KB even if meta/version.json is absent)
-# - Secrets-first Azure config (Streamlit secrets -> env), with clear diagnostics
-# - Auto-index with FAISS (HuggingFace all-MiniLM-L6-v2) and signature-based change detection
-# - Inline status bar; compact controls (chat height, quick reindex, show KB stats)
-# - Chat slash-commands: /read <name>, /open <name>, /show <name>, /set key=value ...
-# - Full-document summarization via Claude when documents are long
-# - Robust loaders; safe fallbacks for CSV/XLSX/TSV/HTML/PDF; placeholders for non-text assets
-# - Clean, Forecast360-themed chat UI; no sidebar
+# Milvus rewrite:
+# - Vector DB: Milvus / Milvus-Lite (via LangChain Milvus)
+# - Chunking: RecursiveCharacterTextSplitter
+# - Embeddings: sentence-transformers/all-MiniLM-L6-v2
+# Forecast360 customizations preserved:
+# - Azure Blob is source of truth (mirror to ./KB even if meta missing)
+# - Secrets-first config with diagnostics
+# - Auto-index with signature-based change detection
+# - Clean chat UI; no sidebar; compact controls
 
 from __future__ import annotations
 
@@ -25,8 +25,8 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
-# ---- LangChain / Vector
-from langchain_community.vectorstores import FAISS
+# ---- LangChain / Vector (Milvus)
+from langchain_community.vectorstores import Milvus
 try:
     from langchain_huggingface import HuggingFaceEmbeddings
 except Exception:
@@ -54,7 +54,7 @@ try:
 except Exception:
     _AnthropicClientOld = None
 
-# ---- Azure SDK (used to pull KB down to ./KB)
+# ---- Azure SDK (pull KB → ./KB)
 try:
     from azure.storage.blob import BlobServiceClient, ContainerClient
     try:
@@ -66,7 +66,14 @@ except Exception:
     BlobServiceClient = ContainerClient = DefaultAzureCredential = None  # type: ignore
     _AZURE_OK = False
 
-# ---------------- Constants (hardcoded; no sidebar)
+# ---- Milvus admin helpers (via pymilvus utility)
+try:
+    from pymilvus import utility as _milvus_utility
+    _MILVUS_ADMIN = True
+except Exception:
+    _MILVUS_ADMIN = False
+
+# ---------------- Constants
 DEFAULT_CLAUDE = "claude-sonnet-4-5"
 _EMB_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 _EMB_MODEL_KW = {"device": "cpu", "trust_remote_code": False}
@@ -86,9 +93,7 @@ GREETING_RE = re.compile(
     re.IGNORECASE,
 )
 
-VectorStoreType = FAISS
-
-# ---------------- Minimal Claude wrapper (no tools, plain text)
+# ---------------- Minimal Claude wrapper
 class ClaudeDirect(BaseChatModel):
     model: str = DEFAULT_CLAUDE
     temperature: float = 0.2
@@ -130,7 +135,7 @@ class ClaudeDirect(BaseChatModel):
         ai = AIMessage(content=text)
         return ChatResult(generations=[ChatGeneration(message=ai)])
 
-# ---------------- Theme / CSS (Forecast360 look)
+# ---------------- Theme / CSS
 try:
     st.set_page_config(page_title="Forecast360 • Chat", page_icon="💬", layout="wide")
 except Exception:
@@ -139,13 +144,11 @@ except Exception:
 USER_AVATAR_PATH: Optional[Path] = None
 ASSIST_AVATAR_PATH: Optional[Path] = None
 
-
 def _first_existing(paths: list[Optional[Path]]) -> Optional[Path]:
     for p in paths:
         if p and p.exists():
             return p
     return None
-
 
 def _resolve_avatar_paths() -> Tuple[Optional[Path], Optional[Path]]:
     user_env = os.getenv("USER_AVATAR_PATH")
@@ -165,9 +168,7 @@ def _resolve_avatar_paths() -> Tuple[Optional[Path], Optional[Path]]:
     ])
     return user, asst
 
-
 USER_AVATAR_PATH, ASSIST_AVATAR_PATH = _resolve_avatar_paths()
-
 
 def _img_to_data_uri(path: Optional[Path]) -> Optional[str]:
     if not path or not path.exists():
@@ -176,7 +177,6 @@ def _img_to_data_uri(path: Optional[Path]) -> Optional[str]:
     ext = (path.suffix.lower().lstrip(".") or "png")
     mime = "image/png" if ext in ("png", "apng") else ("image/jpeg" if ext in ("jpg", "jpeg") else "image/svg+xml")
     return f"data:{mime};base64,{b64}"
-
 
 USER_AVATAR_URI = _img_to_data_uri(USER_AVATAR_PATH)
 ASSIST_AVATAR_URI = _img_to_data_uri(ASSIST_AVATAR_PATH)
@@ -203,13 +203,12 @@ st.markdown(f"""
 </style>
 """, unsafe_allow_html=True)
 
-# ---------------- KB + Azure helpers (download-only mirror)
+# ---------------- KB + Azure helpers
 
 def _local_kb_dir() -> Path:
     p = Path.cwd() / "KB"
     p.mkdir(parents=True, exist_ok=True)
     return p
-
 
 def _kb_local_version() -> Optional[str]:
     vf = _local_kb_dir() / "meta" / "version.json"
@@ -220,9 +219,7 @@ def _kb_local_version() -> Optional[str]:
             return None
     return None
 
-
 def _azure_cfg() -> Dict[str, Any]:
-    # Prefer Streamlit secrets; then env
     try:
         az = st.secrets.get("azure", {})  # type: ignore
     except Exception:
@@ -235,14 +232,12 @@ def _azure_cfg() -> Dict[str, Any]:
         "sas_url":           az.get("container_sas_url")   or os.getenv("AZURE_BLOB_CONTAINER_URL"),
     }
 
-
 def _azure_diag(cfg: Dict[str, Any]) -> str:
     flags = []
     flags.append("sas_url" if cfg.get("sas_url") else "-")
     flags.append("conn_str" if cfg.get("connection_string") else "-")
     flags.append("acct_url" if cfg.get("account_url") else "-")
     return "/".join(flags) + f" · container='{cfg.get('container')}' · prefix='{cfg.get('prefix')}'"
-
 
 def _azure_container_client() -> Optional["ContainerClient"]:
     if not _AZURE_OK:
@@ -268,7 +263,6 @@ def _azure_container_client() -> Optional["ContainerClient"]:
             return None
     return None
 
-
 def _azure_kb_version() -> Optional[str]:
     if not _AZURE_OK:
         return None
@@ -283,9 +277,7 @@ def _azure_kb_version() -> Optional[str]:
     except Exception:
         return None
 
-
 def _download_entire_prefix(cli: "ContainerClient", prefix: str, dest: Path) -> int:
-    """Mirror ALL blobs under prefix into dest. Returns number of files downloaded."""
     count = 0
     prefix = prefix.rstrip("/") + "/" if prefix else ""
     for blob in cli.list_blobs(name_starts_with=prefix or None):
@@ -303,12 +295,7 @@ def _download_entire_prefix(cli: "ContainerClient", prefix: str, dest: Path) -> 
             pass
     return count
 
-
 def sync_kb_from_azure_if_needed(status_placeholder=None) -> Tuple[Path, str]:
-    """
-    If Azure has a different KB version, or local KB is empty/missing meta,
-    mirror prefix -> ./KB (download all files). Returns (kb_path, status_label).
-    """
     kb_root = _local_kb_dir()
     if not _AZURE_OK:
         return kb_root, "Azure SDK missing — using local KB only."
@@ -322,7 +309,6 @@ def sync_kb_from_azure_if_needed(status_placeholder=None) -> Tuple[Path, str]:
 
     remote_ver = _azure_kb_version()
     local_ver  = _kb_local_version()
-
     local_empty = len(list(kb_root.rglob("*"))) == 0
 
     should_mirror = (remote_ver is not None and remote_ver != local_ver) or (remote_ver is None and local_empty)
@@ -331,7 +317,6 @@ def sync_kb_from_azure_if_needed(status_placeholder=None) -> Tuple[Path, str]:
         label = f"KB sync OK · remote={remote_ver or 'unknown'} · local={local_ver or 'unknown'} · {_azure_diag(cfg)}"
         return kb_root, label
 
-    # wipe local KB to avoid stale files
     try:
         shutil.rmtree(kb_root, ignore_errors=True)
     except Exception:
@@ -342,22 +327,82 @@ def sync_kb_from_azure_if_needed(status_placeholder=None) -> Tuple[Path, str]:
     label = f"Synced {downloaded} files from Azure · remote={remote_ver or 'unknown'} · {_azure_diag(cfg)}"
     return kb_root, label
 
-# ---------------- Small utils
+# ---------------- Milvus connection config
+
+def _milvus_cfg() -> Dict[str, Any]:
+    try:
+        mv = st.secrets.get("milvus", {})  # type: ignore
+    except Exception:
+        mv = {}
+
+    # Connection preference: uri → host/port → token
+    cfg: Dict[str, Any] = {
+        "uri":     mv.get("uri") or os.getenv("MILVUS_URI"),    # e.g., "milvus.db" for Milvus-Lite OR "http://host:19530"
+        "host":    mv.get("host") or os.getenv("MILVUS_HOST"),
+        "port":    mv.get("port") or os.getenv("MILVUS_PORT"),
+        "user":    mv.get("user") or os.getenv("MILVUS_USER"),
+        "password":mv.get("password") or os.getenv("MILVUS_PASSWORD"),
+        "token":   mv.get("token") or os.getenv("MILVUS_TOKEN"),
+        "secure":  mv.get("secure", False) if mv.get("secure") is not None else (os.getenv("MILVUS_SECURE","false").lower()=="true"),
+        "db_name": mv.get("db_name") or os.getenv("MILVUS_DB_NAME", "default"),
+        "collection": mv.get("collection"),  # optional; we fallback below
+    }
+
+    # Defaults: prefer local Milvus-Lite file
+    if not (cfg["uri"] or cfg["host"]):
+        cfg["uri"] = str(Path.cwd() / ".milvus" / "milvus.db")
+    return cfg
+
+def _milvus_conn_args() -> Dict[str, Any]:
+    """Return LangChain Milvus connection_args from secrets/env."""
+    cfg = _milvus_cfg()
+    args: Dict[str, Any] = {}
+    if cfg["uri"]:
+        # Works for Milvus-Lite (local file) and HTTP URIs as well
+        # Ensure parent dir exists when it's a local path
+        if "://" not in str(cfg["uri"]):
+            p = Path(str(cfg["uri"])).expanduser().resolve()
+            p.parent.mkdir(parents=True, exist_ok=True)
+            args["uri"] = str(p)
+        else:
+            args["uri"] = cfg["uri"]
+    else:
+        # Host/port style
+        args["host"] = cfg["host"]
+        args["port"] = int(cfg["port"]) if cfg["port"] else 19530
+        if cfg["user"]:
+            args["user"] = cfg["user"]
+        if cfg["password"]:
+            args["password"] = cfg["password"]
+        if cfg["secure"]:
+            args["secure"] = True
+        if cfg["token"]:
+            args["token"] = cfg["token"]
+    # Database name (if supported by server)
+    if cfg["db_name"]:
+        args["db_name"] = cfg["db_name"]
+    return args
+
+def _milvus_collection_name(base_kb_dir: str) -> str:
+    # Prefer explicit name from secrets; else stable name per KB folder
+    explicit = _milvus_cfg().get("collection")
+    if explicit and isinstance(explicit, str) and explicit.strip():
+        return explicit.strip()
+    return f"kb_{hashlib.sha1(base_kb_dir.encode('utf-8')).hexdigest()[:10]}"
+
+# ---------------- Utils
 
 def human_time(ms: float) -> str:
     return f"{ms:.0f} ms" if ms < 1000 else f"{ms/1000:.2f} s"
 
-
 def stable_hash(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()[:12]
-
 
 def iter_files(folder: str) -> List[str]:
     paths: List[str] = []
     for ext in SUPPORTED_EXTS:
         paths.extend(glob.glob(os.path.join(folder, f"**/*{ext}"), recursive=True))
     return sorted(list(set(paths)))
-
 
 def compute_kb_signature(folder: str) -> Tuple[str, int]:
     files = iter_files(folder)
@@ -394,7 +439,6 @@ def _fallback_read(path: str) -> str:
         st.error(f"Error reading file {Path(path).name}: {e}")
         return ""
 
-
 def load_one(path: str) -> List[Document]:
     p = path.lower()
     if p.endswith(tuple(IMAGE_EXTS | AUDIO_EXTS | VIDEO_EXTS)):
@@ -428,7 +472,6 @@ def load_one(path: str) -> List[Document]:
         st.warning(f"Failed to load/process {Path(path).name}. Error: {e}")
         return []
 
-
 def load_documents(folder: str) -> List[Document]:
     docs: List[Document] = []
     files_to_load = [p for p in iter_files(folder) if Path(p).suffix.lower() in SUPPORTED_EXTS]
@@ -436,13 +479,12 @@ def load_documents(folder: str) -> List[Document]:
         docs.extend(load_one(path))
     return docs
 
-# ---------------- Indexing (FAISS)
+# ---------------- Embeddings
 
 @dataclass
 class ChunkingConfig:
     chunk_size: int = 1200
     chunk_overlap: int = 200
-
 
 @st.cache_resource(show_spinner=False)
 def _cached_embeddings() -> HuggingFaceEmbeddings:
@@ -452,63 +494,71 @@ def _cached_embeddings() -> HuggingFaceEmbeddings:
         encode_kwargs=_ENCODE_KW,
     )
 
-
 def _make_embeddings():
     return _cached_embeddings()
 
+# ---------------- Milvus indexing & retrieval
 
-def _faiss_dir(persist_dir: str, collection_name: str) -> Path:
-    return Path(persist_dir).expanduser().resolve() / collection_name
-
-
-def index_folder_langchain(folder: str, persist_dir: str, collection_name: str,
-                           emb_model: str, chunk_cfg: ChunkingConfig) -> Tuple[int, int]:
-    raw_docs = load_documents(folder)
-    faiss_dir = _faiss_dir(persist_dir, collection_name)
-
-    if not raw_docs:
-        if faiss_dir.exists():
-            shutil.rmtree(faiss_dir, ignore_errors=True)
-        return (0, 0)
-
+def _split_docs(docs: List[Document], cfg: ChunkingConfig) -> List[Document]:
     splitter = RecursiveCharacterTextSplitter(
-        chunk_size=chunk_cfg.chunk_size, chunk_overlap=chunk_cfg.chunk_overlap,
+        chunk_size=cfg.chunk_size, chunk_overlap=cfg.chunk_overlap,
         separators=["\n\n", "\n", ". ", " "]
     )
-    splat = splitter.split_documents(raw_docs)
-    embeddings = _make_embeddings()
+    return splitter.split_documents(docs)
 
-    faiss_db = FAISS.from_documents(documents=splat, embedding=embeddings)
-    faiss_dir.mkdir(parents=True, exist_ok=True)
-    faiss_db.save_local(str(faiss_dir))
-    return (len(raw_docs), len(splat))
-
-
-def get_vectorstore(persist_dir: str, collection_name: str, emb_model: str) -> Optional[FAISS]:
-    key = f"_vs::{persist_dir}::{collection_name}::{emb_model}"
-    if key in st.session_state:
-        return st.session_state[key]
-    faiss_path = _faiss_dir(persist_dir, collection_name)
-    if not faiss_path.exists():
-        return None
+def _milvus_collection_exists(name: str) -> bool:
+    if not _MILVUS_ADMIN:
+        return False
     try:
-        vs = FAISS.load_local(
-            folder_path=str(faiss_path),
-            embeddings=_make_embeddings(),
-            allow_dangerous_deserialization=True,
+        return _milvus_utility.has_collection(name)
+    except Exception:
+        return False
+
+def index_folder_milvus(folder: str, collection_name: str, chunk_cfg: ChunkingConfig) -> Tuple[int, int]:
+    """(re)build Milvus collection with fresh chunks. Returns (#raw_docs, #chunks)."""
+    raw_docs = load_documents(folder)
+    if not raw_docs:
+        # If nothing to index, drop any stale collection to avoid misleading search
+        if _milvus_collection_exists(collection_name):
+            try:
+                _milvus_utility.drop_collection(collection_name)
+            except Exception:
+                pass
+        return (0, 0)
+
+    chunks = _split_docs(raw_docs, chunk_cfg)
+    embeddings = _make_embeddings()
+    conn_args = _milvus_conn_args()
+
+    # drop_old=True ensures idempotent rebuilds
+    Milvus.from_documents(
+        documents=chunks,
+        embedding=embeddings,
+        collection_name=collection_name,
+        connection_args=conn_args,
+        drop_old=True,
+        # NOTE: LangChain sets dim automatically from embeddings; IVF/PQ defaults are fine
+    )
+    return (len(raw_docs), len(chunks))
+
+def get_vectorstore(collection_name: str) -> Optional[Milvus]:
+    try:
+        conn_args = _milvus_conn_args()
+        # Instantiate a handle to an existing collection
+        return Milvus(
+            embedding_function=_make_embeddings(),
+            collection_name=collection_name,
+            connection_args=conn_args,
         )
-        st.session_state[key] = vs
-        return vs
     except Exception as e:
-        st.error(f"Failed to load FAISS index from disk. Error: {e}")
+        st.error(f"Failed to connect to Milvus collection '{collection_name}'. Error: {e}")
         return None
 
-# ---------------- Claude init (hardcoded model) — lazy, cached
+# ---------------- Claude init
 
 def _strip_proxy_env() -> None:
     for v in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy", "NO_PROXY", "no_proxy"):
         os.environ.pop(v, None)
-
 
 def _get_secret_api_key() -> Optional[str]:
     try:
@@ -533,13 +583,12 @@ def _get_secret_api_key() -> Optional[str]:
             return v.strip()
     return None
 
-
 @st.cache_resource(show_spinner=False)
 def _anthropic_client_from_secrets_cached():
     _strip_proxy_env()
     api_key = _get_secret_api_key()
     if not api_key:
-        raise RuntimeError("Missing ANTHROPIC_API_KEY. Set it in .streamlit/secrets.toml under [anthropic] api_key=\"...\" or env.")
+        raise RuntimeError("Missing ANTHROPIC_API_KEY. Put it in .streamlit/secrets.toml under [anthropic] api_key=\"...\" or env.")
     os.environ["ANTHROPIC_API_KEY"] = api_key
     if _AnthropicClientNew is not None:
         return _AnthropicClientNew(api_key=api_key)
@@ -547,28 +596,25 @@ def _anthropic_client_from_secrets_cached():
         return _AnthropicClientOld(api_key=api_key)
     raise RuntimeError("Anthropic SDK not installed correctly.")
 
-
 def make_llm(model_name: str, temperature: float):
     client = _anthropic_client_from_secrets_cached()
     return ClaudeDirect(client=client, model=model_name or DEFAULT_CLAUDE,
                         temperature=temperature, max_tokens=800)
 
-
-def make_chain(vs: VectorStoreType, llm: BaseChatModel, k: int):
+def make_chain(vs: Milvus, llm: BaseChatModel, k: int):
     retriever = vs.as_retriever(search_kwargs={"k": k})
     memory = ConversationBufferMemory(memory_key="chat_history", output_key="answer", return_messages=True)
     return ConversationalRetrievalChain.from_llm(
         llm=llm, retriever=retriever, memory=memory, return_source_documents=True, verbose=False
     )
 
-# ---------------- Defaults + auto-index (hardcoded)
+# ---------------- Defaults + auto-index
 
 def settings_defaults() -> Dict[str, Any]:
     kb_dir = str(_local_kb_dir())
     return {
-        "persist_dir": ".faiss_index",
-        "collection_name": f"kb-{stable_hash(kb_dir)}",
         "base_folder": kb_dir,
+        "collection_name": _milvus_collection_name(kb_dir),
         "emb_model": _EMB_MODEL,
         "chunk_cfg": ChunkingConfig(),
         "claude_model": DEFAULT_CLAUDE,
@@ -578,12 +624,9 @@ def settings_defaults() -> Dict[str, Any]:
         "chat_height": 560,
     }
 
-
-def auto_index_if_needed(status_placeholder: Optional[object] = None) -> Optional[VectorStoreType]:
+def auto_index_if_needed(status_placeholder: Optional[object] = None) -> Optional[Milvus]:
     folder = st.session_state.get("base_folder")
-    persist = st.session_state.get("persist_dir")
     colname = st.session_state.get("collection_name")
-    emb_model = st.session_state.get("emb_model")
     min_gap = int(st.session_state.get("auto_index_min_interval_sec", 8))
 
     sig_now, file_count = compute_kb_signature(folder)
@@ -595,14 +638,13 @@ def auto_index_if_needed(status_placeholder: Optional[object] = None) -> Optiona
     throttled = (now - last_time) < min_gap
     target = status_placeholder if status_placeholder is not None else st
 
-    faiss_path = _faiss_dir(persist, colname)
-    index_exists = faiss_path.is_dir() and any(faiss_path.iterdir())
+    # If collection missing, force index once
+    coll_missing = not _milvus_collection_exists(colname)
 
-    if need_index and not throttled:
+    if (need_index and not throttled) or coll_missing:
         try:
-            target.markdown('<div class="status-inline">Indexing…</div>', unsafe_allow_html=True)
-            n_docs, n_chunks = index_folder_langchain(folder, persist, colname, emb_model,
-                                                      st.session_state.get("chunk_cfg", ChunkingConfig()))
+            target.markdown('<div class="status-inline">Indexing into Milvus…</div>', unsafe_allow_html=True)
+            n_docs, n_chunks = index_folder_milvus(folder, colname, st.session_state.get("chunk_cfg", ChunkingConfig()))
             st.session_state["_kb_last_sig"] = sig_now
             st.session_state["_kb_last_index_ts"] = now
             st.session_state["_kb_last_counts"] = {"files": file_count, "docs": n_docs, "chunks": n_chunks}
@@ -610,35 +652,22 @@ def auto_index_if_needed(status_placeholder: Optional[object] = None) -> Optiona
         except Exception as e:
             label = f"Auto-index failed: <b>{e}</b>"
         target.markdown(f'<div class="status-inline">{label}</div>', unsafe_allow_html=True)
-    elif not index_exists:
-        try:
-            target.markdown('<div class="status-inline">Index missing — building…</div>', unsafe_allow_html=True)
-            n_docs, n_chunks = index_folder_langchain(folder, persist, colname, emb_model,
-                                                      st.session_state.get("chunk_cfg", ChunkingConfig()))
-            st.session_state["_kb_last_sig"] = sig_now
-            st.session_state["_kb_last_index_ts"] = now
-            st.session_state["_kb_last_counts"] = {"files": file_count, "docs": n_docs, "chunks": n_chunks}
-            target.markdown(f'<div class="status-inline">Indexed: <b>{n_docs}</b> files → <b>{n_chunks}</b> chunks</div>',
-                            unsafe_allow_html=True)
-        except Exception as e:
-            target.markdown(f'<div class="status-inline">Auto-index failed: <b>{e}</b></div>',
-                            unsafe_allow_html=True)
     else:
         ts = st.session_state.get("_kb_last_index_ts")
         when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts)) if ts else "—"
         target.markdown(
-            f'<div class="status-inline">Auto-index is <b>ON</b> · Files: <b>{file_count}</b> · Last indexed: <b>{when}</b> · Index: <code>{colname}</code></div>',
+            f'<div class="status-inline">Auto-index is <b>ON</b> · Files: <b>{file_count}</b> · Last indexed: <b>{when}</b> · Collection: <code>{colname}</code></div>',
             unsafe_allow_html=True
         )
 
     try:
-        return get_vectorstore(persist, colname, emb_model)
+        return get_vectorstore(colname)
     except Exception:
         return None
 
 # ---------------- UI helpers
+
 def _avatar_for_role(role: str) -> Optional[str]:
-    # Prefer data URIs (work in Streamlit avatars); fall back to local path, then emoji
     if role == "user":
         return USER_AVATAR_URI or (str(USER_AVATAR_PATH) if USER_AVATAR_PATH else "👤")
     if role == "assistant":
@@ -650,7 +679,6 @@ def render_chat_history():
         role = message["role"]
         with st.chat_message(role, avatar=_avatar_for_role(role)):
             st.markdown(message["content"])
-
 
 def build_citation_block(source_docs: List[Document], kb_root: str | None = None) -> str:
     if not source_docs:
@@ -669,14 +697,12 @@ def build_citation_block(source_docs: List[Document], kb_root: str | None = None
     lines = [f"- {name}" + (f" ×{n}" if n > 1 else "") for name, n in counts.items()]
     return "\n\n**Sources**\n" + "\n".join(lines)
 
-
 def read_whole_file_from_disk(path: str) -> str:
     docs = load_one(path)
     return "".join(
         (f"\n\n--- [{i}] {Path((d.metadata or {}).get('source','')).name} ---\n") + (d.page_content or "")
         for i, d in enumerate(docs, 1)
     ).strip()
-
 
 def read_whole_doc_by_name(name_or_stem: str, base_folder: str) -> Tuple[str, List[str]]:
     name_or_stem = name_or_stem.lower().strip()
@@ -691,15 +717,13 @@ def read_whole_doc_by_name(name_or_stem: str, base_folder: str) -> Tuple[str, Li
 
 # ---------------- LLM & Chain
 
-def make_llm_and_chain(vs: VectorStoreType):
+def make_llm_and_chain(vs: Milvus):
     llm = make_llm(st.session_state["claude_model"], float(st.session_state["temperature"]))
     chain = make_chain(vs, llm, int(st.session_state["top_k"]))
     return llm, chain
 
-
 _SLASH_SET_RE = re.compile(r"/set\s+(.+)$", re.IGNORECASE)
 _KV_RE = re.compile(r"(\w+)\s*=\s*([\w\.\-]+)")
-
 
 def _apply_settings_kv(s: str) -> str:
     changed = []
@@ -723,11 +747,9 @@ def _apply_settings_kv(s: str) -> str:
             pass
     return ", ".join(changed) if changed else "No changes applied."
 
-
-def handle_user_input(query: str, vs: Optional[VectorStoreType]):
+def handle_user_input(query: str, vs: Optional[Milvus]):
     st.session_state.setdefault("messages", [])
 
-    # Slash: /set key=val ... (update settings)
     mset = _SLASH_SET_RE.search(query)
     if mset:
         applied = _apply_settings_kv(mset.group(1))
@@ -736,7 +758,6 @@ def handle_user_input(query: str, vs: Optional[VectorStoreType]):
 
     st.session_state["messages"].append({"role": "user", "content": query})
 
-    # Full-document commands
     m = re.match(r"^\s*(read|open|show)\s+(.+)$", query, flags=re.IGNORECASE)
     if m:
         target = m.group(2).strip().strip('"').strip("'")
@@ -747,7 +768,9 @@ def handle_user_input(query: str, vs: Optional[VectorStoreType]):
 
         if len(full_text) > 8000:
             try:
-                llm, _ = make_llm_and_chain(vs or FAISS.from_texts([""], _make_embeddings()))
+                llm, _ = make_llm_and_chain(vs or Milvus(embedding_function=_make_embeddings(),
+                                                         collection_name=st.session_state["collection_name"],
+                                                         connection_args=_milvus_conn_args()))
                 summary = llm.predict(f"Summarize the following document concisely, focusing on key facts and numbers:\n\n{full_text[:180000]}")
                 reply = f"**Full-document summary for:** {', '.join(Path(p).name for p in files)}\n\n{summary}"
             except Exception as e:
@@ -763,7 +786,7 @@ def handle_user_input(query: str, vs: Optional[VectorStoreType]):
         st.rerun(); return
 
     if vs is None:
-        st.session_state["messages"].append({"role": "assistant", "content": "Vector store unavailable. Ensure the FAISS index exists."})
+        st.session_state["messages"].append({"role": "assistant", "content": "Vector store unavailable. Ensure the Milvus collection exists."})
         st.rerun(); return
 
     t0 = time.time()
@@ -781,19 +804,21 @@ def handle_user_input(query: str, vs: Optional[VectorStoreType]):
     st.session_state["messages"].append({"role": "assistant", "content": msg})
     st.rerun()
 
-# ---------------- Main (no sidebar; Azure KB → local; auto-index; chat)
+# ---------------- Main
 
 def main():
-    # 1) Hardcoded defaults
+    # 1) Defaults
     for k, v in settings_defaults().items():
         st.session_state.setdefault(k, v)
 
-    # 2) Sync local KB with Azure (source of truth)
+    # 2) Sync KB from Azure
     kb_dir, sync_label = sync_kb_from_azure_if_needed()
     st.session_state["base_folder"] = str(kb_dir)
-    st.session_state["collection_name"] = f"kb-{stable_hash(str(kb_dir))}"
+    # Recompute collection name if not explicitly provided
+    if not _milvus_cfg().get("collection"):
+        st.session_state["collection_name"] = _milvus_collection_name(str(kb_dir))
 
-    # 3) Top header + compact controls
+    # 3) Header + controls
     st.markdown("### 💬 Chat with Forecast360")
     st.markdown(f"<div class='status-inline'><b>KB Sync:</b> {sync_label}</div>", unsafe_allow_html=True)
 
@@ -803,24 +828,12 @@ def main():
         vs = auto_index_if_needed(status_placeholder=hero_status)
     with c2:
         if st.button("Reindex KB", use_container_width=True):
-            # Force reindex by clearing signature and last-time
             st.session_state.pop("_kb_last_sig", None)
             st.session_state["_kb_last_index_ts"] = 0
     with c3:
         st.session_state["chat_height"] = st.number_input("Chat height (px)", 420, 1200, st.session_state.get("chat_height", 560), step=20)
-        
-    # with c4:
-    #     counts = st.session_state.get("_kb_last_counts", {})
-    #     st.markdown(
-    #         f"<div class='small-note'>Files: <b>{counts.get('files','–')}</b> · Docs: <b>{counts.get('docs','–')}</b> · Chunks: <b>{counts.get('chunks','–')}</b></div>",
-    #         unsafe_allow_html=True,
-    #     )
 
-    # 4) Auto-index
-    # hero_status = st.container()
-    # vs = auto_index_if_needed(status_placeholder=hero_status)
-
-    # 5) Chat UI (no sidebar)
+    # 4) Chat UI
     st.session_state.setdefault("messages", [{"role": "assistant", "content": "Hi! Ask me anything about Forecast360."}])
     st.markdown('<div class="chat-card">', unsafe_allow_html=True)
     chat_area = st.container(height=int(st.session_state.get("chat_height", 560)), border=False)
@@ -831,7 +844,6 @@ def main():
 
     if user_text and user_text.strip():
         handle_user_input(user_text.strip(), vs)
-
 
 if __name__ == "__main__":
     main()
