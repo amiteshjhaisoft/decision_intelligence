@@ -39,10 +39,19 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 
-# Loaders
+# Loaders (docx2txt optional; fallback to python-docx)
 from langchain_community.document_loaders import (
-    PyPDFLoader, BSHTMLLoader, Docx2txtLoader, CSVLoader, UnstructuredPowerPointLoader
+    PyPDFLoader, BSHTMLLoader, CSVLoader, UnstructuredPowerPointLoader
 )
+try:
+    from langchain_community.document_loaders import Docx2txtLoader  # requires docx2txt
+    _HAS_DOCX2TXT = True
+except Exception:
+    _HAS_DOCX2TXT = False
+    try:
+        from docx import Document as _PyDocxDoc  # from python-docx
+    except Exception:
+        _PyDocxDoc = None
 
 # ---- Milvus admin / connections
 from pymilvus import connections as _milvus_connections, utility as _milvus_utility
@@ -330,7 +339,6 @@ def _milvus_cfg() -> Dict[str, Any]:
         mv = st.secrets.get("milvus", {})  # type: ignore
     except Exception:
         mv = {}
-
     cfg: Dict[str, Any] = {
         "uri":     mv.get("uri") or os.getenv("MILVUS_URI"),
         "host":    mv.get("host") or os.getenv("MILVUS_HOST"),
@@ -342,33 +350,39 @@ def _milvus_cfg() -> Dict[str, Any]:
         "db_name": mv.get("db_name") or os.getenv("MILVUS_DB_NAME", "default"),
         "collection": mv.get("collection"),
     }
-
     if not (cfg["uri"] or cfg["host"]):
         cfg["uri"] = str(Path.cwd() / ".milvus" / "milvus.db")
     return cfg
 
 def _milvus_conn_args() -> Dict[str, Any]:
+    """
+    Build connection args for LangChain Milvus.
+    - Local Milvus-Lite file paths are normalized to 'file:<abs-path>'
+    - HTTP(S) URIs and host/port configs are passed through
+    """
     cfg = _milvus_cfg()
     args: Dict[str, Any] = {}
-    if cfg["uri"]:
-        if "://" not in str(cfg["uri"]):
-            p = Path(str(cfg["uri"])).expanduser().resolve()
-            p.parent.mkdir(parents=True, exist_ok=True)
-            args["uri"] = str(p)
+    uri = cfg.get("uri")
+    if uri:
+        s = str(uri)
+        if s.startswith("file:") or "://" in s:
+            args["uri"] = s
         else:
-            args["uri"] = cfg["uri"]
+            p = Path(s).expanduser().resolve()
+            p.parent.mkdir(parents=True, exist_ok=True)
+            args["uri"] = f"file:{p}"
     else:
-        args["host"] = cfg["host"]
-        args["port"] = int(cfg["port"]) if cfg["port"] else 19530
-        if cfg["user"]:
+        args["host"] = cfg.get("host", "127.0.0.1")
+        args["port"] = int(cfg["port"]) if cfg.get("port") else 19530
+        if cfg.get("user"):
             args["user"] = cfg["user"]
-        if cfg["password"]:
+        if cfg.get("password"):
             args["password"] = cfg["password"]
-        if cfg["secure"]:
+        if cfg.get("secure"):
             args["secure"] = True
-        if cfg["token"]:
+        if cfg.get("token"):
             args["token"] = cfg["token"]
-    if cfg["db_name"]:
+    if cfg.get("db_name"):
         args["db_name"] = cfg["db_name"]
     return args
 
@@ -408,6 +422,62 @@ def _milvus_collection_exists(name: str) -> bool:
         return _milvus_utility.has_collection(name, using="default")
     except Exception:
         return False
+
+# ---------------- Milvus-Lite <-> Azure Blob backup/restore helpers
+
+def _milvus_local_file() -> Optional[Path]:
+    """Return the local filesystem path for Milvus-Lite when using a file: URI or plain path."""
+    args = _milvus_conn_args()
+    uri = args.get("uri")
+    if not uri:
+        return None
+    s = str(uri)
+    if s.startswith("file:"):
+        return Path(s.replace("file:", "", 1)).expanduser().resolve()
+    if "://" not in s:  # (Shouldn't happen after normalization, but keep for safety)
+        return Path(s).expanduser().resolve()
+    return None  # remote Milvus (not Lite)
+
+def _azure_index_blob_path() -> str:
+    col = st.session_state.get("collection_name", "milvus")
+    return f"indexes/{col}.db"
+
+def restore_milvus_db_from_blob_if_exists() -> str:
+    if not _AZURE_OK:
+        return "Azure SDK not available — skipping Milvus restore."
+    local_path = _milvus_local_file()
+    if not local_path:
+        return "Not using Milvus-Lite (no local file) — skipping restore."
+    cli = _azure_container_client()
+    if not cli:
+        return "Azure not configured — skipping Milvus restore."
+    blob_name = _azure_index_blob_path()
+    try:
+        props = cli.get_blob_client(blob_name).get_blob_properties()  # raises if missing
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(local_path, "wb") as f:
+            data = cli.download_blob(blob_name).readall()
+            f.write(data)
+        return f"Restored Milvus DB from Azure blob ‘{blob_name}’ ({props.size} bytes)."
+    except Exception:
+        return "No Milvus snapshot found in Azure — fresh index will be created."
+
+def backup_milvus_db_to_blob() -> str:
+    if not _AZURE_OK:
+        return "Azure SDK not available — skipping Milvus backup."
+    local_path = _milvus_local_file()
+    if not local_path or not local_path.exists():
+        return "No local Milvus DB file to back up — skipping."
+    cli = _azure_container_client()
+    if not cli:
+        return "Azure not configured — skipping Milvus backup."
+    blob_name = _azure_index_blob_path()
+    try:
+        with open(local_path, "rb") as f:
+            cli.upload_blob(name=blob_name, data=f, overwrite=True)
+        return f"Backed up Milvus DB to Azure blob ‘{blob_name}’."
+    except Exception as e:
+        return f"Milvus backup failed: {e}"
 
 # ---------------- Utils
 
@@ -475,7 +545,17 @@ def load_one(path: str) -> List[Document]:
         if p.endswith((".html", ".htm")):
             return BSHTMLLoader(path).load()
         if p.endswith(".docx"):
-            return Docx2txtLoader(path).load()
+            if _HAS_DOCX2TXT:
+                return Docx2txtLoader(path).load()
+            # Fallback to python-docx
+            try:
+                if '._PyDocxDoc' in globals() and _PyDocxDoc is not None:
+                    d = _PyDocxDoc(path)
+                    text = "\n".join([para.text for para in d.paragraphs]) or ""
+                    return [Document(page_content=text, metadata={"source": path})] if text.strip() else []
+            except Exception as e:
+                st.warning(f"python-docx fallback failed for {Path(path).name}: {e}")
+                return []
         if p.endswith((".pptx", ".pptm")):
             return UnstructuredPowerPointLoader(path).load()
         if p.endswith(".csv"):
@@ -532,7 +612,6 @@ def index_folder_milvus(folder: str, collection_name: str, chunk_cfg: ChunkingCo
     """
     raw_docs = load_documents(folder)
     if not raw_docs:
-        # No text to index; drop any stale collection so searches don't silently "succeed"
         try:
             if _milvus_collection_exists(collection_name):
                 _milvus_utility.drop_collection(collection_name, using="default")
@@ -553,6 +632,14 @@ def index_folder_milvus(folder: str, collection_name: str, chunk_cfg: ChunkingCo
         connection_args=conn_args,
         drop_old=True,   # idempotent rebuilds on change
     )
+
+    # After successful (re)index, back up Milvus-Lite DB to Azure (if configured)
+    try:
+        note = backup_milvus_db_to_blob()
+        st.markdown(f'<div class="status-inline">{note}</div>', unsafe_allow_html=True)
+    except Exception:
+        pass
+
     return (len(raw_docs), len(chunks))
 
 def get_vectorstore(collection_name: str) -> Optional[Milvus]:
@@ -836,6 +923,10 @@ def main():
     if not _milvus_cfg().get("collection"):
         st.session_state["collection_name"] = _milvus_collection_name(str(kb_dir))
 
+    # NEW: try to restore a previous Milvus-Lite snapshot from Azure
+    restore_note = restore_milvus_db_from_blob_if_exists()
+    st.markdown(f"<div class='status-inline'>{restore_note}</div>", unsafe_allow_html=True)
+
     # 3) Header + controls
     st.markdown("### 💬 Chat with Forecast360")
     st.markdown(f"<div class='status-inline'><b>KB Sync:</b> {sync_label}</div>", unsafe_allow_html=True)
@@ -848,7 +939,6 @@ def main():
         if st.button("Reindex KB", use_container_width=True):
             st.session_state.pop("_kb_last_sig", None)
             st.session_state["_kb_last_index_ts"] = 0
-            # force rebuild immediately
             vs = auto_index_if_needed(status_placeholder=hero_status)
     with c3:
         st.session_state["chat_height"] = st.number_input("Chat height (px)", 420, 1200, st.session_state.get("chat_height", 560), step=20)
