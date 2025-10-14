@@ -43,6 +43,8 @@ from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_community.document_loaders import (
     PyPDFLoader, BSHTMLLoader, Docx2txtLoader, CSVLoader, UnstructuredPowerPointLoader
 )
+# Milvus admin / connections
+from pymilvus import connections as _milvus_connections, utility as _milvus_utility
 
 # ---- Anthropic (Claude only)
 try:
@@ -327,6 +329,46 @@ def sync_kb_from_azure_if_needed(status_placeholder=None) -> Tuple[Path, str]:
     label = f"Synced {downloaded} files from Azure · remote={remote_ver or 'unknown'} · {_azure_diag(cfg)}"
     return kb_root, label
 
+
+def _connect_milvus() -> None:
+    """Ensure a default Milvus connection is established once."""
+    try:
+        # if already connected, this is a no-op
+        _milvus_connections.get_connection_addr("default")
+        return
+    except Exception:
+        pass
+
+    args = _milvus_conn_args()
+    try:
+        if "uri" in args:
+            _milvus_connections.connect(
+                alias="default",
+                uri=args["uri"],
+                token=args.get("token"),
+            )
+        else:
+            _milvus_connections.connect(
+                alias="default",
+                host=args.get("host", "127.0.0.1"),
+                port=args.get("port", 19530),
+                user=args.get("user"),
+                password=args.get("password"),
+                secure=args.get("secure", False),
+                token=args.get("token"),
+            )
+    except Exception as e:
+        st.error(f"Milvus connect failed: {e}")
+
+
+def _milvus_collection_exists(name: str) -> bool:
+    try:
+        _connect_milvus()
+        return _milvus_utility.has_collection(name, using="default")
+    except Exception:
+        return False
+
+
 # ---------------- Milvus connection config
 
 def _milvus_cfg() -> Dict[str, Any]:
@@ -515,31 +557,40 @@ def _milvus_collection_exists(name: str) -> bool:
         return False
 
 def index_folder_milvus(folder: str, collection_name: str, chunk_cfg: ChunkingConfig) -> Tuple[int, int]:
-    """(re)build Milvus collection with fresh chunks. Returns (#raw_docs, #chunks)."""
+    """
+    (re)Build Milvus collection with fresh chunks from the local KB folder
+    (which was mirrored from Azure Blob). Returns (#raw_docs, #chunks).
+    """
+    # 0) Load docs from KB
     raw_docs = load_documents(folder)
     if not raw_docs:
-        # If nothing to index, drop any stale collection to avoid misleading search
-        if _milvus_collection_exists(collection_name):
-            try:
-                _milvus_utility.drop_collection(collection_name)
-            except Exception:
-                pass
+        # No text to index; drop any stale collection so searches don't silently "succeed"
+        try:
+            if _milvus_collection_exists(collection_name):
+                _connect_milvus()
+                _milvus_utility.drop_collection(collection_name, using="default")
+        except Exception:
+            pass
         return (0, 0)
 
+    # 1) Chunk + embed
     chunks = _split_docs(raw_docs, chunk_cfg)
     embeddings = _make_embeddings()
+
+    # 2) Connect once and rebuild
+    _connect_milvus()
     conn_args = _milvus_conn_args()
 
-    # drop_old=True ensures idempotent rebuilds
+    # drop_old=True ensures idempotent rebuilds when files change
     Milvus.from_documents(
         documents=chunks,
         embedding=embeddings,
         collection_name=collection_name,
         connection_args=conn_args,
         drop_old=True,
-        # NOTE: LangChain sets dim automatically from embeddings; IVF/PQ defaults are fine
     )
     return (len(raw_docs), len(chunks))
+
 
 def get_vectorstore(collection_name: str) -> Optional[Milvus]:
     try:
