@@ -39,7 +39,7 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 
-# Loaders (docx2txt optional; fallback to python-docx)
+# ---- Loaders (docx2txt optional; python-docx fallback)
 from langchain_community.document_loaders import (
     PyPDFLoader, BSHTMLLoader, CSVLoader, UnstructuredPowerPointLoader
 )
@@ -66,7 +66,7 @@ try:
 except Exception:
     _AnthropicClientOld = None
 
-# ---- Azure SDK (pull KB → ./KB)
+# ---- Azure SDK (pull KB → ./KB and store index snapshots)
 try:
     from azure.storage.blob import BlobServiceClient, ContainerClient
     try:
@@ -131,12 +131,9 @@ class ClaudeDirect(BaseChatModel):
             model=self.model, messages=amsgs, temperature=self.temperature, max_tokens=self.max_tokens
         )
         text = ""
-        content = getattr(resp, "content", []) or []
-        for blk in content:
+        for blk in getattr(resp, "content", []) or []:
             if getattr(blk, "type", None) == "text":
-                text += getattr(blk, "text", "") or ""
-            elif isinstance(blk, dict) and blk.get("type") == "text":
-                text += blk.get("text", "") or ""
+                text += getattr(blk, "text", "") or (blk.get("text", "") if isinstance(blk, dict) else "")
         ai = AIMessage(content=text)
         return ChatResult(generations=[ChatGeneration(message=ai)])
 
@@ -350,6 +347,7 @@ def _milvus_cfg() -> Dict[str, Any]:
         "db_name": mv.get("db_name") or os.getenv("MILVUS_DB_NAME", "default"),
         "collection": mv.get("collection"),
     }
+    # Default to Milvus-Lite local db file next to app if nothing provided
     if not (cfg["uri"] or cfg["host"]):
         cfg["uri"] = str(Path.cwd() / ".milvus" / "milvus.db")
     return cfg
@@ -357,21 +355,28 @@ def _milvus_cfg() -> Dict[str, Any]:
 def _milvus_conn_args() -> Dict[str, Any]:
     """
     Build connection args for LangChain Milvus.
-    - Local Milvus-Lite file paths are normalized to 'file:<abs-path>'
-    - HTTP(S) URIs and host/port configs are passed through
+    - Milvus-Lite: **plain absolute path** ending with `.db` (no `file:` scheme)
+    - Remote Milvus: host/port or full https:// URI + token
+    - If user accidentally provides `file:/...`, normalize back to plain path.
     """
     cfg = _milvus_cfg()
     args: Dict[str, Any] = {}
     uri = cfg.get("uri")
     if uri:
         s = str(uri)
-        if s.startswith("file:") or "://" in s:
+        # Strip an accidental file: prefix
+        if s.startswith("file:"):
+            s = s.replace("file:", "", 1)
+        # If it looks like http(s) or another scheme, pass as-is (remote)
+        if "://" in s and not s.endswith(".db"):
             args["uri"] = s
         else:
+            # Treat as filesystem path for Milvus-Lite
             p = Path(s).expanduser().resolve()
             p.parent.mkdir(parents=True, exist_ok=True)
-            args["uri"] = f"file:{p}"
+            args["uri"] = str(p)  # PLAIN PATH, e.g. /mount/.../milvus.db
     else:
+        # Host/port style (remote Milvus/Zilliz)
         args["host"] = cfg.get("host", "127.0.0.1")
         args["port"] = int(cfg["port"]) if cfg.get("port") else 19530
         if cfg.get("user"):
@@ -423,31 +428,29 @@ def _milvus_collection_exists(name: str) -> bool:
     except Exception:
         return False
 
-# ---------------- Milvus-Lite <-> Azure Blob backup/restore helpers
+# ---------------- Milvus-Lite <-> Azure Blob snapshot helpers
 
 def _milvus_local_file() -> Optional[Path]:
-    """Return the local filesystem path for Milvus-Lite when using a file: URI or plain path."""
+    """Return the local filesystem path for Milvus-Lite when using a local .db path."""
     args = _milvus_conn_args()
     uri = args.get("uri")
     if not uri:
         return None
     s = str(uri)
-    if s.startswith("file:"):
-        return Path(s.replace("file:", "", 1)).expanduser().resolve()
-    if "://" not in s:  # (Shouldn't happen after normalization, but keep for safety)
-        return Path(s).expanduser().resolve()
-    return None  # remote Milvus (not Lite)
+    if "://" in s and not s.endswith(".db"):
+        return None  # remote Milvus
+    return Path(s).expanduser().resolve()
 
 def _azure_index_blob_path() -> str:
     col = st.session_state.get("collection_name", "milvus")
-    return f"indexes/{col}.db"
+    return f"indexes/{col}.db"  # same container, separate folder
 
 def restore_milvus_db_from_blob_if_exists() -> str:
     if not _AZURE_OK:
         return "Azure SDK not available — skipping Milvus restore."
     local_path = _milvus_local_file()
     if not local_path:
-        return "Not using Milvus-Lite (no local file) — skipping restore."
+        return "Not using Milvus-Lite (no local .db) — skipping restore."
     cli = _azure_container_client()
     if not cli:
         return "Azure not configured — skipping Milvus restore."
@@ -547,7 +550,6 @@ def load_one(path: str) -> List[Document]:
         if p.endswith(".docx"):
             if _HAS_DOCX2TXT:
                 return Docx2txtLoader(path).load()
-            # Fallback to python-docx
             try:
                 if '._PyDocxDoc' in globals() and _PyDocxDoc is not None:
                     d = _PyDocxDoc(path)
@@ -916,14 +918,14 @@ def main():
     for k, v in settings_defaults().items():
         st.session_state.setdefault(k, v)
 
-    # 2) Sync KB from Azure
+    # 2) Sync KB from Azure (files that will be chunked & embedded)
     kb_dir, sync_label = sync_kb_from_azure_if_needed()
     st.session_state["base_folder"] = str(kb_dir)
     # Recompute collection name if not explicitly provided
     if not _milvus_cfg().get("collection"):
         st.session_state["collection_name"] = _milvus_collection_name(str(kb_dir))
 
-    # NEW: try to restore a previous Milvus-Lite snapshot from Azure
+    # Try to restore a previous Milvus-Lite snapshot from the SAME blob container
     restore_note = restore_milvus_db_from_blob_if_exists()
     st.markdown(f"<div class='status-inline'>{restore_note}</div>", unsafe_allow_html=True)
 
