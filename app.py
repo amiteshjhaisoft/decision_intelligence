@@ -43,7 +43,8 @@ from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_community.document_loaders import (
     PyPDFLoader, BSHTMLLoader, Docx2txtLoader, CSVLoader, UnstructuredPowerPointLoader
 )
-# Milvus admin / connections
+
+# ---- Milvus admin / connections
 from pymilvus import connections as _milvus_connections, utility as _milvus_utility
 
 # ---- Anthropic (Claude only)
@@ -67,13 +68,6 @@ try:
 except Exception:
     BlobServiceClient = ContainerClient = DefaultAzureCredential = None  # type: ignore
     _AZURE_OK = False
-
-# ---- Milvus admin helpers (via pymilvus utility)
-try:
-    from pymilvus import utility as _milvus_utility
-    _MILVUS_ADMIN = True
-except Exception:
-    _MILVUS_ADMIN = False
 
 # ---------------- Constants
 DEFAULT_CLAUDE = "claude-sonnet-4-5"
@@ -329,24 +323,72 @@ def sync_kb_from_azure_if_needed(status_placeholder=None) -> Tuple[Path, str]:
     label = f"Synced {downloaded} files from Azure · remote={remote_ver or 'unknown'} · {_azure_diag(cfg)}"
     return kb_root, label
 
+# ---------------- Milvus connection config + helpers
+
+def _milvus_cfg() -> Dict[str, Any]:
+    try:
+        mv = st.secrets.get("milvus", {})  # type: ignore
+    except Exception:
+        mv = {}
+
+    cfg: Dict[str, Any] = {
+        "uri":     mv.get("uri") or os.getenv("MILVUS_URI"),
+        "host":    mv.get("host") or os.getenv("MILVUS_HOST"),
+        "port":    mv.get("port") or os.getenv("MILVUS_PORT"),
+        "user":    mv.get("user") or os.getenv("MILVUS_USER"),
+        "password":mv.get("password") or os.getenv("MILVUS_PASSWORD"),
+        "token":   mv.get("token") or os.getenv("MILVUS_TOKEN"),
+        "secure":  mv.get("secure", False) if mv.get("secure") is not None else (os.getenv("MILVUS_SECURE","false").lower()=="true"),
+        "db_name": mv.get("db_name") or os.getenv("MILVUS_DB_NAME", "default"),
+        "collection": mv.get("collection"),
+    }
+
+    if not (cfg["uri"] or cfg["host"]):
+        cfg["uri"] = str(Path.cwd() / ".milvus" / "milvus.db")
+    return cfg
+
+def _milvus_conn_args() -> Dict[str, Any]:
+    cfg = _milvus_cfg()
+    args: Dict[str, Any] = {}
+    if cfg["uri"]:
+        if "://" not in str(cfg["uri"]):
+            p = Path(str(cfg["uri"])).expanduser().resolve()
+            p.parent.mkdir(parents=True, exist_ok=True)
+            args["uri"] = str(p)
+        else:
+            args["uri"] = cfg["uri"]
+    else:
+        args["host"] = cfg["host"]
+        args["port"] = int(cfg["port"]) if cfg["port"] else 19530
+        if cfg["user"]:
+            args["user"] = cfg["user"]
+        if cfg["password"]:
+            args["password"] = cfg["password"]
+        if cfg["secure"]:
+            args["secure"] = True
+        if cfg["token"]:
+            args["token"] = cfg["token"]
+    if cfg["db_name"]:
+        args["db_name"] = cfg["db_name"]
+    return args
+
+def _milvus_collection_name(base_kb_dir: str) -> str:
+    explicit = _milvus_cfg().get("collection")
+    if explicit and isinstance(explicit, str) and explicit.strip():
+        return explicit.strip()
+    return f"kb_{hashlib.sha1(base_kb_dir.encode('utf-8')).hexdigest()[:10]}"
 
 def _connect_milvus() -> None:
     """Ensure a default Milvus connection is established once."""
     try:
-        # if already connected, this is a no-op
         _milvus_connections.get_connection_addr("default")
         return
     except Exception:
         pass
-
     args = _milvus_conn_args()
     try:
         if "uri" in args:
-            _milvus_connections.connect(
-                alias="default",
-                uri=args["uri"],
-                token=args.get("token"),
-            )
+            _milvus_connections.connect(alias="default", uri=args["uri"], token=args.get("token"))
         else:
             _milvus_connections.connect(
                 alias="default",
@@ -360,77 +402,12 @@ def _connect_milvus() -> None:
     except Exception as e:
         st.error(f"Milvus connect failed: {e}")
 
-
 def _milvus_collection_exists(name: str) -> bool:
     try:
         _connect_milvus()
         return _milvus_utility.has_collection(name, using="default")
     except Exception:
         return False
-
-
-# ---------------- Milvus connection config
-
-def _milvus_cfg() -> Dict[str, Any]:
-    try:
-        mv = st.secrets.get("milvus", {})  # type: ignore
-    except Exception:
-        mv = {}
-
-    # Connection preference: uri → host/port → token
-    cfg: Dict[str, Any] = {
-        "uri":     mv.get("uri") or os.getenv("MILVUS_URI"),    # e.g., "milvus.db" for Milvus-Lite OR "http://host:19530"
-        "host":    mv.get("host") or os.getenv("MILVUS_HOST"),
-        "port":    mv.get("port") or os.getenv("MILVUS_PORT"),
-        "user":    mv.get("user") or os.getenv("MILVUS_USER"),
-        "password":mv.get("password") or os.getenv("MILVUS_PASSWORD"),
-        "token":   mv.get("token") or os.getenv("MILVUS_TOKEN"),
-        "secure":  mv.get("secure", False) if mv.get("secure") is not None else (os.getenv("MILVUS_SECURE","false").lower()=="true"),
-        "db_name": mv.get("db_name") or os.getenv("MILVUS_DB_NAME", "default"),
-        "collection": mv.get("collection"),  # optional; we fallback below
-    }
-
-    # Defaults: prefer local Milvus-Lite file
-    if not (cfg["uri"] or cfg["host"]):
-        cfg["uri"] = str(Path.cwd() / ".milvus" / "milvus.db")
-    return cfg
-
-def _milvus_conn_args() -> Dict[str, Any]:
-    """Return LangChain Milvus connection_args from secrets/env."""
-    cfg = _milvus_cfg()
-    args: Dict[str, Any] = {}
-    if cfg["uri"]:
-        # Works for Milvus-Lite (local file) and HTTP URIs as well
-        # Ensure parent dir exists when it's a local path
-        if "://" not in str(cfg["uri"]):
-            p = Path(str(cfg["uri"])).expanduser().resolve()
-            p.parent.mkdir(parents=True, exist_ok=True)
-            args["uri"] = str(p)
-        else:
-            args["uri"] = cfg["uri"]
-    else:
-        # Host/port style
-        args["host"] = cfg["host"]
-        args["port"] = int(cfg["port"]) if cfg["port"] else 19530
-        if cfg["user"]:
-            args["user"] = cfg["user"]
-        if cfg["password"]:
-            args["password"] = cfg["password"]
-        if cfg["secure"]:
-            args["secure"] = True
-        if cfg["token"]:
-            args["token"] = cfg["token"]
-    # Database name (if supported by server)
-    if cfg["db_name"]:
-        args["db_name"] = cfg["db_name"]
-    return args
-
-def _milvus_collection_name(base_kb_dir: str) -> str:
-    # Prefer explicit name from secrets; else stable name per KB folder
-    explicit = _milvus_cfg().get("collection")
-    if explicit and isinstance(explicit, str) and explicit.strip():
-        return explicit.strip()
-    return f"kb_{hashlib.sha1(base_kb_dir.encode('utf-8')).hexdigest()[:10]}"
 
 # ---------------- Utils
 
@@ -548,61 +525,49 @@ def _split_docs(docs: List[Document], cfg: ChunkingConfig) -> List[Document]:
     )
     return splitter.split_documents(docs)
 
-def _milvus_collection_exists(name: str) -> bool:
-    if not _MILVUS_ADMIN:
-        return False
-    try:
-        return _milvus_utility.has_collection(name)
-    except Exception:
-        return False
-
 def index_folder_milvus(folder: str, collection_name: str, chunk_cfg: ChunkingConfig) -> Tuple[int, int]:
     """
     (re)Build Milvus collection with fresh chunks from the local KB folder
     (which was mirrored from Azure Blob). Returns (#raw_docs, #chunks).
     """
-    # 0) Load docs from KB
     raw_docs = load_documents(folder)
     if not raw_docs:
         # No text to index; drop any stale collection so searches don't silently "succeed"
         try:
             if _milvus_collection_exists(collection_name):
-                _connect_milvus()
                 _milvus_utility.drop_collection(collection_name, using="default")
         except Exception:
             pass
         return (0, 0)
 
-    # 1) Chunk + embed
     chunks = _split_docs(raw_docs, chunk_cfg)
     embeddings = _make_embeddings()
 
-    # 2) Connect once and rebuild
     _connect_milvus()
     conn_args = _milvus_conn_args()
 
-    # drop_old=True ensures idempotent rebuilds when files change
     Milvus.from_documents(
         documents=chunks,
         embedding=embeddings,
         collection_name=collection_name,
         connection_args=conn_args,
-        drop_old=True,
+        drop_old=True,   # idempotent rebuilds on change
     )
     return (len(raw_docs), len(chunks))
 
-
 def get_vectorstore(collection_name: str) -> Optional[Milvus]:
     try:
+        _connect_milvus()
+        if not _milvus_collection_exists(collection_name):
+            return None
         conn_args = _milvus_conn_args()
-        # Instantiate a handle to an existing collection
         return Milvus(
             embedding_function=_make_embeddings(),
             collection_name=collection_name,
             connection_args=conn_args,
         )
     except Exception as e:
-        st.error(f"Failed to connect to Milvus collection '{collection_name}'. Error: {e}")
+        st.error(f"Failed to open Milvus collection '{collection_name}': {e}")
         return None
 
 # ---------------- Claude init
@@ -676,45 +641,43 @@ def settings_defaults() -> Dict[str, Any]:
     }
 
 def auto_index_if_needed(status_placeholder: Optional[object] = None) -> Optional[Milvus]:
-    folder = st.session_state.get("base_folder")
-    colname = st.session_state.get("collection_name")
-    min_gap = int(st.session_state.get("auto_index_min_interval_sec", 8))
+    folder   = st.session_state.get("base_folder")
+    colname  = st.session_state.get("collection_name")
+    min_gap  = int(st.session_state.get("auto_index_min_interval_sec", 8))
+    target   = status_placeholder if status_placeholder is not None else st
 
     sig_now, file_count = compute_kb_signature(folder)
-    last_sig = st.session_state.get("_kb_last_sig")
+    last_sig  = st.session_state.get("_kb_last_sig")
     last_time = float(st.session_state.get("_kb_last_index_ts", 0.0))
-    now = time.time()
+    now       = time.time()
 
     need_index = (last_sig != sig_now) or (last_sig is None)
-    throttled = (now - last_time) < min_gap
-    target = status_placeholder if status_placeholder is not None else st
+    throttled  = (now - last_time) < min_gap
 
-    # If collection missing, force index once
-    coll_missing = not _milvus_collection_exists(colname)
+    vs = get_vectorstore(colname)
+    coll_exists = vs is not None
 
-    if (need_index and not throttled) or coll_missing:
+    if (not coll_exists) or (need_index and not throttled):
         try:
             target.markdown('<div class="status-inline">Indexing into Milvus…</div>', unsafe_allow_html=True)
             n_docs, n_chunks = index_folder_milvus(folder, colname, st.session_state.get("chunk_cfg", ChunkingConfig()))
-            st.session_state["_kb_last_sig"] = sig_now
+            st.session_state["_kb_last_sig"]      = sig_now
             st.session_state["_kb_last_index_ts"] = now
-            st.session_state["_kb_last_counts"] = {"files": file_count, "docs": n_docs, "chunks": n_chunks}
+            st.session_state["_kb_last_counts"]   = {"files": file_count, "docs": n_docs, "chunks": n_chunks}
             label = f"Indexed: <b>{n_docs}</b> files → <b>{n_chunks}</b> chunks"
         except Exception as e:
             label = f"Auto-index failed: <b>{e}</b>"
         target.markdown(f'<div class="status-inline">{label}</div>', unsafe_allow_html=True)
+        vs = get_vectorstore(colname)  # reopen after (re)build
     else:
         ts = st.session_state.get("_kb_last_index_ts")
         when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts)) if ts else "—"
         target.markdown(
-            f'<div class="status-inline">Auto-index is <b>ON</b> · Files: <b>{file_count}</b> · Last indexed: <b>{when}</b> · Collection: <code>{colname}</code></div>',
+            f'<div class="status-inline">Auto-index <b>ON</b> · Files: <b>{file_count}</b> · Last indexed: <b>{when}</b> · Collection: <code>{colname}</code></div>',
             unsafe_allow_html=True
         )
 
-    try:
-        return get_vectorstore(colname)
-    except Exception:
-        return None
+    return vs
 
 # ---------------- UI helpers
 
@@ -819,9 +782,10 @@ def handle_user_input(query: str, vs: Optional[Milvus]):
 
         if len(full_text) > 8000:
             try:
-                llm, _ = make_llm_and_chain(vs or Milvus(embedding_function=_make_embeddings(),
-                                                         collection_name=st.session_state["collection_name"],
-                                                         connection_args=_milvus_conn_args()))
+                llm, _ = make_llm_and_chain(vs or Milvus(
+                    embedding_function=_make_embeddings(),
+                    collection_name=st.session_state["collection_name"],
+                    connection_args=_milvus_conn_args()))
                 summary = llm.predict(f"Summarize the following document concisely, focusing on key facts and numbers:\n\n{full_text[:180000]}")
                 reply = f"**Full-document summary for:** {', '.join(Path(p).name for p in files)}\n\n{summary}"
             except Exception as e:
@@ -837,7 +801,10 @@ def handle_user_input(query: str, vs: Optional[Milvus]):
         st.rerun(); return
 
     if vs is None:
-        st.session_state["messages"].append({"role": "assistant", "content": "Vector store unavailable. Ensure the Milvus collection exists."})
+        st.session_state["messages"].append({
+            "role": "assistant",
+            "content": "I couldn’t open a Milvus collection yet. Make sure your Azure KB has at least one readable text document (PDF, DOCX, CSV, etc.). I’ll auto-index as soon as files are available."
+        })
         st.rerun(); return
 
     t0 = time.time()
@@ -881,6 +848,8 @@ def main():
         if st.button("Reindex KB", use_container_width=True):
             st.session_state.pop("_kb_last_sig", None)
             st.session_state["_kb_last_index_ts"] = 0
+            # force rebuild immediately
+            vs = auto_index_if_needed(status_placeholder=hero_status)
     with c3:
         st.session_state["chat_height"] = st.number_input("Chat height (px)", 420, 1200, st.session_state.get("chat_height", 560), step=20)
 
