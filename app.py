@@ -1,6 +1,11 @@
 # Author: Amitesh Jha | iSoft | 2025-10-12
 # Streamlit RAG chat — Azure Blob → Weaviate (hybrid) → (optional) Cross-Encoder rerank → Claude (grounded-only)
 # Now with DI Agent: Plan → Retrieve → Validate → Act (KB-only skills) → Respond (+ exports)
+# FIXES:
+# - Single-render chat (no duplicate assistant/user bubbles)
+# - Stream once, then store to history (no second render)
+# - Removed "Recent conversation" recap that reprinted last turn
+# - LLM+KB fusion preserved (LLM answers strictly based on retrieved KB context)
 
 from __future__ import annotations
 
@@ -1021,10 +1026,6 @@ def _collect_numbers(texts: List[str]) -> List[float]:
     return vals
 
 def _collect_kv_candidates(texts: List[str]) -> Dict[str, Dict[str, str]]:
-    """
-    Extract naive key: value pairs (e.g., 'Cost: $1200', 'Latency = 50ms') grouped by 'option'
-    Heuristic: lines that start with a token capitalized may be option; else try to detect 'Option A' etc.
-    """
     options: Dict[str, Dict[str, str]] = {}
     cur = None
     for t in texts:
@@ -1050,7 +1051,6 @@ def _collect_dates(texts: List[str]) -> List[str]:
     ds = []
     for t in texts:
         ds.extend(DATE_PAT.findall(t or ""))
-    # flatten tuples, normalize
     flat = []
     for d in ds:
         if isinstance(d, tuple):
@@ -1064,7 +1064,6 @@ def skill_summary_bullets(passages: List[Dict[str, Any]]) -> str:
         txt = (p.get("text") or "").strip()
         if not txt:
             continue
-        # take first 1-2 sentences
         chunk = re.split(r"(?<=[.!?])\s+", txt)[:2]
         if chunk:
             bullets.append(f"• {chunk[0].strip()} [{i}]")
@@ -1075,12 +1074,10 @@ def skill_compare_table(passages: List[Dict[str, Any]]) -> Optional[str]:
     kv = _collect_kv_candidates(texts)
     if not kv:
         return None
-    # Collect columns
     all_keys = set()
     for d in kv.values():
         all_keys.update(d.keys())
     cols = ["Option"] + sorted(all_keys)
-    # Build markdown table
     lines = [" | ".join(cols), " | ".join(["---"] * len(cols))]
     for opt, vals in kv.items():
         row = [opt] + [vals.get(k, "") for k in sorted(all_keys)]
@@ -1096,7 +1093,6 @@ def skill_decision_matrix(passages: List[Dict[str, Any]]) -> Optional[str]:
     opts = sorted(kv.keys())
     if not crit or not opts:
         return None
-    # Simple unweighted presence matrix (✓ if value present)
     lines = ["Criteria \\ Option | " + " | ".join(opts),
              " | ".join(["---"] * (len(opts) + 1))]
     for c in crit:
@@ -1114,7 +1110,6 @@ def skill_fact_extract_json(passages: List[Dict[str, Any]]) -> Optional[str]:
     return json.dumps(kv, indent=2, ensure_ascii=False)
 
 def _au_date(s: str) -> Optional[str]:
-    # Normalize to ISO if possible; be liberal
     try:
         if "-" in s or "/" in s:
             for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%Y/%m/%d", "%d/%m/%Y", "%m/%d/%Y", "%d/%m/%y"):
@@ -1155,7 +1150,6 @@ def skill_calc(passages: List[Dict[str, Any]]) -> Optional[str]:
 
 # ====================== DI AGENT: Orchestration ======================
 def agent_plan(mode: str) -> List[str]:
-    """Return ordered skill names to run before/alongside LLM based on mode."""
     if mode == "Summary":
         return ["summary"]
     if mode == "Compare":
@@ -1169,7 +1163,6 @@ def agent_plan(mode: str) -> List[str]:
     return ["calc"]  # Direct Answer -> calc (optional)
 
 def agent_act(skills: List[str], passages: List[Dict[str, Any]]) -> Dict[str, str]:
-    """Run deterministic skills and return sidecar artifacts (added to final answer)."""
     artifacts: Dict[str, str] = {}
     if "summary" in skills:
         s = skill_summary_bullets(passages)
@@ -1194,23 +1187,50 @@ def agent_act(skills: List[str], passages: List[Dict[str, Any]]) -> Dict[str, st
 
 # ---------------------- CHAT (Decision-Intelligence Agent) ----------------------
 if "history" not in st.session_state:
-    st.session_state.history = []
+    st.session_state.history = []         # [{role, content, sources}]
 if "last_answer_payload" not in st.session_state:
     st.session_state.last_answer_payload = None  # for export
 
-def add_history(role: str, content: str, sources: Optional[List[str]] = None):
-    st.session_state.history.append({"role": role, "content": content, "sources": sources or []})
+def render_history():
+    """Render the full conversation from history exactly once."""
+    for msg in st.session_state.history:
+        css = "chat-bubble-user" if msg["role"] == "user" else "chat-bubble-assistant"
+        with st.chat_message(msg["role"]):
+            st.markdown(f"<div class='{css}'>{esc(msg['content'])}</div>", unsafe_allow_html=True)
+            if msg["role"] == "assistant" and msg.get("sources"):
+                chips = "".join([f"<span class='source-chip'>{esc(s)}</span>" for s in msg["sources"][:12]])
+                st.markdown(f"<div class='small-dim'>Sources: {chips}</div>", unsafe_allow_html=True)
 
-def render_msg(role: str, content: str, sources: Optional[List[str]] = None):
-    css = "chat-bubble-user" if role == "user" else "chat-bubble-assistant"
-    with st.chat_message(role):
-        st.markdown(f"<div class='{css}'>{esc(content)}</div>", unsafe_allow_html=True)
-        if role == "assistant" and sources:
-            chips = "".join([f"<span class='source-chip'>{esc(s)}</span>" for s in sources[:12]])
-            st.markdown(f"<div class='small-dim'>Sources: {chips}</div>", unsafe_allow_html=True)
+st.subheader("Chat")
+
+# Always render existing history once at the top (prevents duplicates)
+render_history()
+
+colL, colR = st.columns([4, 1])
+with colL:
+    user_q = st.chat_input("Ask about your Knowledge Base…")
+with colR:
+    export_md = st.button("⬇️ Export MD")
+    export_json = st.button("⬇️ Export JSON")
+
+if export_md and st.session_state.last_answer_payload:
+    payload = st.session_state.last_answer_payload
+    md = f"# Answer ({payload['mode']})\n\n{payload['final_text']}\n\n## Sources\n" + \
+         "\n".join([f"- {s}" for s in payload.get("sources", [])])
+    if payload.get("artifacts"):
+        md += "\n\n## Agent Artifacts\n"
+        for k, v in payload["artifacts"].items():
+            md += f"\n### {k}\n\n{v}\n"
+    fn = Path(tempfile.gettempdir())/"di_answer.md"
+    fn.write_text(md, encoding="utf-8")
+    st.success(f"Saved: {fn}")
+
+if export_json and st.session_state.last_answer_payload:
+    fn = Path(tempfile.gettempdir())/"di_answer.json"
+    Path(fn).write_text(json.dumps(st.session_state.last_answer_payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    st.success(f"Saved: {fn}")
 
 def retrieval_quality(hits: List[Dict[str, Any]]) -> Tuple[float, int, int]:
-    """Return (quality_score, total_chars, unique_sources)."""
     if not hits:
         return (0.0, 0, 0)
     total_chars = sum(len((h.get("text") or "")) for h in hits)
@@ -1249,45 +1269,36 @@ def build_followups(question: str, mode: str, quality: float) -> List[str]:
         sugs.append("Name the exact fields you want (as they appear in your docs).")
     return sugs[:3]
 
-st.subheader("Chat")
-colL, colR = st.columns([4, 1])
-with colL:
-    user_q = st.chat_input("Ask about your Knowledge Base…")
-with colR:
-    export_md = st.button("⬇️ Export MD")
-    export_json = st.button("⬇️ Export JSON")
-
-if export_md and st.session_state.last_answer_payload:
-    payload = st.session_state.last_answer_payload
-    md = f"# Answer ({payload['mode']})\n\n{payload['final_text']}\n\n## Sources\n" + \
-         "\n".join([f"- {s}" for s in payload.get("sources", [])])
-    if payload.get("artifacts"):
-        md += "\n\n## Agent Artifacts\n"
-        for k, v in payload["artifacts"].items():
-            md += f"\n### {k}\n\n{v}\n"
-    fn = Path(tempfile.gettempdir())/"di_answer.md"
-    fn.write_text(md, encoding="utf-8")
-    st.success(f"Saved: {fn}")
-
-if export_json and st.session_state.last_answer_payload:
-    fn = Path(tempfile.gettempdir())/"di_answer.json"
-    Path(fn).write_text(json.dumps(st.session_state.last_answer_payload, indent=2, ensure_ascii=False), encoding="utf-8")
-    st.success(f"Saved: {fn}")
-
+# Handle a new user query
 if user_q:
-    add_history("user", user_q)
-    render_msg("user", user_q)
+    # Append and render the user's message once
+    st.session_state.history.append({"role": "user", "content": user_q, "sources": []})
+    with st.chat_message("user"):
+        st.markdown(f"<div class='chat-bubble-user'>{esc(user_q)}</div>", unsafe_allow_html=True)
 
     # Ensure collection exists and is reachable
     try:
-        col = w_client.collections.get(CLASS_NAME, tenant=w_tenancy) if (V4 and w_tenancy) else w_client.collections.get(CLASS_NAME)
+        col = w_client.collections.get(CLASS_NAME, tenant=st.secrets.get("weaviate", {}).get("tenancy")) if (V4 and st.secrets.get("weaviate", {}).get("tenancy")) else w_client.collections.get(CLASS_NAME)
     except Exception as e:
         final_text = f"I can’t reach the '{CLASS_NAME}' collection. Try 'Sync / Rebuild Index' first. ({e})"
-        add_history("assistant", final_text, [])
-        render_msg("assistant", final_text, [])
+        with st.chat_message("assistant"):
+            st.markdown(f"<div class='chat-bubble-assistant'>{esc(final_text)}</div>", unsafe_allow_html=True)
+        st.session_state.history.append({"role": "assistant", "content": final_text, "sources": []})
+        st.session_state.last_answer_payload = {
+            "mode": None, "question": user_q, "final_text": final_text,
+            "sources": [], "artifacts": {}, "answerable": False
+        }
     else:
         # 1) Plan (agent)
-        plan = agent_plan(mode)
+        plan = agent_plan(st.session_state.get("mode_override", st.session_state.get("mode", "")) or st.session_state.get("mode") or "Direct Answer")
+
+        # Map current sidebar values (read once now)
+        cand_k  = st.session_state.get("cand_k")  or st.session_state.get("candidate_pool", CANDIDATES_K)
+        final_k = st.session_state.get("final_k") or st.session_state.get("final_passages", FINAL_K_DEFAULT)
+        use_reranker = st.session_state.get("use_reranker") if "use_reranker" in st.session_state else True
+        per_source_cap = st.session_state.get("per_source_cap") if "per_source_cap" in st.session_state else 3
+        neighbors = st.session_state.get("neighbors") if "neighbors" in st.session_state else 1
+        hide_csv_bias = st.session_state.get("hide_csv_bias") if "hide_csv_bias" in st.session_state else True
 
         # 2) Retrieve (strict non-LLM)
         q_vec = embed_texts([user_q])[0]
@@ -1307,6 +1318,10 @@ if user_q:
         qual, total_chars, uniq_src = retrieval_quality(hits)
         enough = gate_answerability(hits)
 
+        # Prepare prompts
+        # Read sidebar live (these exist in this scope)
+        mode = st.session_state.get("mode") or "Direct Answer"  # fallback
+        strictness = st.session_state.get("strictness") if "strictness" in st.session_state else 0.7
         system_prompt = build_system_prompt(strictness, mode)
         context_text, source_chips = format_context_for_prompt(hits)
 
@@ -1318,14 +1333,15 @@ if user_q:
                 f"- Distinct sources: {uniq_src}\n"
                 + ("\n".join(f"- {s}" for s in followups) if followups else "")
             ).strip()
-            add_history("assistant", final_text, source_chips)
-            render_msg("assistant", final_text, source_chips)
+            with st.chat_message("assistant"):
+                st.markdown(f"<div class='chat-bubble-assistant'>{esc(final_text)}</div>", unsafe_allow_html=True)
+            st.session_state.history.append({"role": "assistant", "content": final_text, "sources": source_chips})
             st.session_state.last_answer_payload = {
                 "mode": mode, "question": user_q, "final_text": final_text,
                 "sources": source_chips, "artifacts": {}, "answerable": False
             }
         else:
-            # 4) Act (run deterministic skills pre-LLM)
+            # 4) Act (deterministic skills)
             artifacts = agent_act(plan, hits)
 
             # 5) Compose LLM prompt and stream KB-grounded answer
@@ -1333,28 +1349,33 @@ if user_q:
             with st.chat_message("assistant"):
                 placeholder = st.empty()
                 try:
-                    with call_claude(anthropic_key, system_prompt, user_prompt, stream=True) as stream_resp:
+                    with call_claude(st.secrets.get("anthropic", {}).get("api_key", ""), system_prompt, user_prompt, stream=True) as stream_resp:
                         text_accum = ""
                         for event in stream_resp:
                             if event.type == "content_block_delta":
                                 delta_text = getattr(getattr(event, "delta", None), "text", None)
                                 if delta_text:
                                     text_accum += delta_text
+                                    # Only update the streaming bubble (no second render later)
                                     placeholder.markdown(
                                         f"<div class='chat-bubble-assistant'>{esc(text_accum)}</div>",
                                         unsafe_allow_html=True
                                     )
                         final_text = (text_accum or "").strip() or "I couldn't generate a response."
+
                         if not enforce_citations(final_text):
                             final_text = (
                                 "I don’t have enough information in the context to answer with citations. "
                                 "Please sync the KB or ask a narrower question."
                             )
-                        # If we produced artifacts, append them neatly
+
+                        # Append artifacts beneath the streamed answer (still the same single bubble)
                         if artifacts:
                             final_text += "\n\n---\n**Agent Artifacts (KB-only):**\n"
                             for k, v in artifacts.items():
                                 final_text += f"\n**{k}**\n\n{v}\n"
+
+                        # Finalize the single bubble
                         placeholder.markdown(
                             f"<div class='chat-bubble-assistant'>{esc(final_text)}</div>",
                             unsafe_allow_html=True
@@ -1366,18 +1387,12 @@ if user_q:
                         unsafe_allow_html=True
                     )
 
-            add_history("assistant", final_text, source_chips)
-            render_msg("assistant", final_text, source_chips)
+            # Store exactly once in history and payload (do NOT re-render)
+            st.session_state.history.append({"role": "assistant", "content": final_text, "sources": source_chips})
             st.session_state.last_answer_payload = {
                 "mode": mode, "question": user_q, "final_text": final_text,
                 "sources": source_chips, "artifacts": artifacts, "answerable": True
             }
-
-# History (last 8 turns)
-if st.session_state.history:
-    st.markdown("### Recent conversation")
-    for msg in st.session_state.history[-8:]:
-        render_msg(msg["role"], msg["content"], msg.get("sources"))
 
 # Clean up v4 client
 if V4:
