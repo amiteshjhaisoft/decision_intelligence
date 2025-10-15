@@ -458,7 +458,7 @@ if show_health:
         "client_version": getattr(weaviate, "__version__", "unknown"),
         "v4_mode": V4,
     })
-    st.write("**Anthropic**", {"ANTHROPIC_API_KEY": bool(anthropic_key)})
+    st.write("**Anthropic**", {"api_key": bool(anthropic_key)})
 
 # Guards
 if not w_url:
