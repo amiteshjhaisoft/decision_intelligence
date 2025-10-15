@@ -201,7 +201,7 @@ def _dsn_preview(conn_id: str, cfg: Dict[str, Any]) -> str:
 def _short_timeout_env():
     os.environ.setdefault("GRPC_VERBOSITY", "ERROR")
 
-# --- New: helpers to enforce Test-before-Save ---
+# --- Helpers: enforce Test-before-Save & cache statuses for table ---
 def _config_signature(cfg: Dict[str, Any]) -> str:
     try:
         return json.dumps(cfg, sort_keys=True, separators=(",", ":"))
@@ -214,6 +214,15 @@ def _get_state_keys(conn_id: str) -> Dict[str, str]:
         "msg": f"{conn_id}_last_test_msg",
         "sig": f"{conn_id}_last_test_sig",
     }
+
+def _status_cache_key(conn_id: str, profile: str) -> str:
+    return f"status::{conn_id}::{profile}"
+
+def _cache_status_set(conn_id: str, profile: str, ok: Optional[bool], msg: str) -> None:
+    st.session_state[_status_cache_key(conn_id, profile)] = {"ok": ok, "msg": msg}
+
+def _cache_status_get(conn_id: str, profile: str) -> Dict[str, Any]:
+    return st.session_state.get(_status_cache_key(conn_id, profile), {"ok": None, "msg": "Not tested"})
 
 # ---------------------- Schema / Registry ----------------------
 @dataclass
@@ -229,11 +238,11 @@ class Field:
 class Connector:
     id: str
     name: str
-    icon: str              # emoji used in all labels
+    icon: str
     fields: List[Field]
     secret_keys: List[str]
     category: str
-    logo_key: Optional[str] = None  # for optional thumbnail (./assets/{logo_key}.svg|png)
+    logo_key: Optional[str] = None
 
 def F(key: str, label: str, **kw) -> Field:
     return Field(key=key, label=label, **kw)
@@ -434,7 +443,6 @@ CATEGORIES = sorted(REG_BY_CAT.keys())
 
 # ---------------------- Sidebar ----------------------
 with st.sidebar:
-    # ---- Branding ----------------------------------------------------
     logo_path = ASSETS_DIR / "logo.png"
     if logo_path.is_file():
         st.image(str(logo_path), caption="iSOFT ANZ Pvt Ltd", use_container_width=True)
@@ -442,10 +450,7 @@ with st.sidebar:
         st.caption("")
 
     st.markdown("### 🔎 Search")
-    q = st.text_input(
-        "Search connectors",
-        placeholder="snowflake, postgres, blob, kafka..."
-    ).strip().lower()
+    q = st.text_input("Search connectors", placeholder="snowflake, postgres, blob, kafka...").strip().lower()
 
     st.markdown('<div class="sidebar-caption">Filter by category</div>', unsafe_allow_html=True)
     cat = st.selectbox("Category", CATEGORIES, index=0, label_visibility="collapsed")
@@ -616,9 +621,9 @@ def test_snowflake(cfg):
         return False, f"{e}"
 
 def _google_creds_from_json(txt):
-    import json
+    import json as _json
     from google.oauth2 import service_account
-    info = json.loads(txt)
+    info = _json.loads(txt)
     return service_account.Credentials.from_service_account_info(info)
 
 def test_bigquery(cfg):
@@ -1086,7 +1091,6 @@ with left:
             if f.required and (val is None or str(val).strip() == ""):
                 missing_required.append(f.label)
 
-        # Actions inside the form (so testing uses the current inputs)
         c1, c2, c3, c4 = st.columns([1,1,1,1])
         submitted = c1.form_submit_button("💾 Save Profile", use_container_width=True)
         preview   = c2.form_submit_button("🧪 Preview DSN", use_container_width=True)
@@ -1143,6 +1147,8 @@ with left:
             all_profiles.setdefault(conn.id, {})
             all_profiles[conn.id][profile_name] = values
             _save_all(all_profiles)
+            # Update status cache for table view
+            _cache_status_set(conn.id, profile_name, st.session_state.get(_keys["ok"]), st.session_state.get(_keys["msg"]) or "")
             st.success(f"Saved **{profile_name}** for {conn.icon} {conn.name}.")
 
 # ---------------------- Right: Profiles for Selected Connector ----------------------
@@ -1157,26 +1163,62 @@ with right:
             redacted = masked_view(cfg, conn.secret_keys)
             with st.expander(f"{conn.icon} {conn.name} — **{pname}**", expanded=False):
                 st.json(redacted)
-                cc1, cc2, cc3 = st.columns([1,1,2])
+                cc1, cc2, cc3, cc4 = st.columns([1,1,1,2])
                 if cc1.button("📝 Load to form", key=f"load_{conn.id}_{pname}"):
                     st.session_state[f"{conn.id}_profile_name"] = pname
                     for f in conn.fields:
                         st.session_state[f"{conn.id}_{f.key}"] = cfg.get(f.key, "")
                     st.success(f"Loaded **{pname}** into the form above.")
-                if cc2.button("🗑️ Delete", key=f"del_{conn.id}_{pname}"):
+                if cc2.button("🧪 Test", key=f"quicktest_{conn.id}_{pname}"):
+                    handler = TEST_HANDLERS.get(conn.id)
+                    if handler:
+                        _short_timeout_env()
+                        with st.spinner("Testing connection..."):
+                            ok, msg = handler(cfg)
+                        if ok:
+                            st.success(msg)
+                        else:
+                            st.error(msg)
+                        _cache_status_set(conn.id, pname, bool(ok), msg)
+                    else:
+                        st.warning("No test implemented.")
+                if cc3.button("🗑️ Delete", key=f"del_{conn.id}_{pname}"):
                     all_profiles[conn.id].pop(pname, None)
                     if not all_profiles[conn.id]:
                         all_profiles.pop(conn.id, None)
                     _save_all(all_profiles)
+                    # clear cached status
+                    st.session_state.pop(_status_cache_key(conn.id, pname), None)
                     st.warning(f"Deleted profile **{pname}**.")
                     st.rerun()
-                cc3.caption("Secrets are masked in this view. Raw values remain local in `connections.json`.")
+                cc4.caption("Secrets are masked in this view. Raw values remain local in `connections.json`.")
     st.markdown('</div>', unsafe_allow_html=True)
 
 # ---------------------- All Configured Connections (Table) ----------------------
 st.write("")
 st.markdown("### 📚 All configured connections")
 st.markdown('<div class="card">', unsafe_allow_html=True)
+
+def _run_status_check_for_all():
+    _short_timeout_env()
+    for cid, items in (_load_all() or {}).items():
+        handler = TEST_HANDLERS.get(cid)
+        for pname, cfg in (items or {}).items():
+            if handler:
+                try:
+                    ok, msg = handler(cfg)
+                except Exception as e:
+                    ok, msg = False, str(e)
+            else:
+                ok, msg = None, "No test implemented."
+            _cache_status_set(cid, pname, ok, msg)
+
+# Controls for table
+cA, cB = st.columns([1,3])
+with cA:
+    if st.button("🔁 Test all saved connections now", use_container_width=True):
+        with st.spinner("Running status checks..."):
+            _run_status_check_for_all()
 
 if not all_profiles:
     st.info("You haven’t saved any connections yet.")
@@ -1185,10 +1227,21 @@ else:
     for cid, items in all_profiles.items():
         meta = REG_BY_ID.get(cid)
         for pname, cfg in items.items():
+            status_info = _cache_status_get(cid, pname)
+            ok = status_info.get("ok")
+            msg = status_info.get("msg") or ""
+            if ok is True:
+                status_text = "✅ Successful"
+            elif ok is False:
+                status_text = "❌ Failed"
+            else:
+                status_text = "⏳ Not tested"
             rows.append({
                 "Connector": f"{meta.icon if meta else '🔌'} {meta.name if meta else cid}",
                 "Profile": pname,
-                "Fields": ", ".join(cfg.keys())
+                "Fields": ", ".join(cfg.keys()),
+                "Status": status_text,
+                "Details": msg,
             })
     df = pd.DataFrame(rows).sort_values(["Connector", "Profile"])
     st.dataframe(df, hide_index=True, use_container_width=True)
