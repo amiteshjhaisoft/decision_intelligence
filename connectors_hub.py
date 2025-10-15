@@ -1,977 +1,647 @@
 # Author: Amitesh Jha | iSoft | 2025-10-12
-# deci_int.py — Streamlit RAG chat (Claude-only, no sidebar, hardcoded settings)
-# Milvus rewrite:
-# - Vector DB: Milvus / Milvus-Lite (via LangChain Milvus)
-# - Chunking: RecursiveCharacterTextSplitter
-# - Embeddings: sentence-transformers/all-MiniLM-L6-v2
-# Forecast360 customizations preserved:
-# - Azure Blob is source of truth (mirror to ./KB even if meta missing)
-# - Secrets-first config with diagnostics
-# - Auto-index with signature-based change detection
-# - Clean chat UI; no sidebar; compact controls
-
+# connectors_hub.py
+# Professional Connectors Hub (Streamlit)
+# - Sidebar: categorized connectors with labels like "❄️ Snowflake"
+# - Dynamic forms by connector; required field validation
+# - Persist profiles to ./connections.json (secrets masked in UI)
+# - Import/Export JSON; DSN preview; Env-var snippet
+# - Optional logos in ./assets (e.g., snowflake.svg, postgres.png)
 from __future__ import annotations
 
-import os, glob, time, base64, hashlib, json, shutil, re
+import base64
+import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Tuple, Optional, Dict, Any
+from typing import Any, Dict, List, Optional, Tuple
 
-import streamlit as st
 import pandas as pd
+import streamlit as st
 
-# ---- Runtime hygiene
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
-os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+APP_TITLE = "🔌 Data Connectors Hub"
+APP_TAGLINE = "Configure and organize connection profiles for databases, warehouses, NoSQL, storage, streaming, and more."
+CONN_STORE = Path("./connections.json")
+ASSETS_DIR = Path("./assets")  # optional logo files
 
-# ---- LangChain / Vector (Milvus)
-from langchain_community.vectorstores import Milvus
-try:
-    from langchain_huggingface import HuggingFaceEmbeddings
-except Exception:
-    from langchain_community.embeddings import HuggingFaceEmbeddings
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.schema import Document
-from langchain.chains import ConversationalRetrievalChain
-from langchain.memory import ConversationBufferMemory
-from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.messages import AIMessage, BaseMessage
-from langchain_core.outputs import ChatGeneration, ChatResult
+# ---------------------- Page Config & Global Style ----------------------
+st.set_page_config(page_title="Connectors Hub", layout="wide", page_icon="🔌")
 
-# ---- Loaders (docx2txt optional; python-docx fallback)
-from langchain_community.document_loaders import (
-    PyPDFLoader, BSHTMLLoader, CSVLoader, UnstructuredPowerPointLoader
-)
-try:
-    from langchain_community.document_loaders import Docx2txtLoader  # requires docx2txt
-    _HAS_DOCX2TXT = True
-except Exception:
-    _HAS_DOCX2TXT = False
-    try:
-        from docx import Document as _PyDocxDoc  # from python-docx
-    except Exception:
-        _PyDocxDoc = None
-
-# ---- Milvus admin / connections
-from pymilvus import connections as _milvus_connections, utility as _milvus_utility
-
-# ---- Anthropic (Claude only)
-try:
-    from anthropic import Anthropic as _AnthropicClientNew
-except Exception:
-    _AnthropicClientNew = None
-try:
-    from anthropic import Client as _AnthropicClientOld
-except Exception:
-    _AnthropicClientOld = None
-
-# ---- Azure SDK (pull KB → ./KB and store index snapshots)
-try:
-    from azure.storage.blob import BlobServiceClient, ContainerClient
-    try:
-        from azure.identity import DefaultAzureCredential
-    except Exception:
-        DefaultAzureCredential = None  # type: ignore
-    _AZURE_OK = True
-except Exception:
-    BlobServiceClient = ContainerClient = DefaultAzureCredential = None  # type: ignore
-    _AZURE_OK = False
-
-# ---------------- Constants
-DEFAULT_CLAUDE = "claude-sonnet-4-5"
-_EMB_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
-_EMB_MODEL_KW = {"device": "cpu", "trust_remote_code": False}
-_ENCODE_KW = {"normalize_embeddings": True}
-
-TEXT_EXTS = {".txt", ".md", ".rtf", ".html", ".htm", ".json", ".xml"}
-DOC_EXTS  = {".pdf", ".docx", ".csv", ".tsv", ".pptx", ".pptm", ".doc", ".odt"}
-SPREADSHEET_EXTS = {".xlsx", ".xlsm", ".xltx"}
-SUPPORTED_TEXT_DOCS = TEXT_EXTS | DOC_EXTS | SPREADSHEET_EXTS
-IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".tiff"}
-AUDIO_EXTS = {".mp3", ".wav", ".m4a"}
-VIDEO_EXTS = {".mp4", ".mov", ".avi"}
-SUPPORTED_EXTS = SUPPORTED_TEXT_DOCS | IMAGE_EXTS | AUDIO_EXTS | VIDEO_EXTS
-
-GREETING_RE = re.compile(
-    r"""^\s*(hi|hello|hey|hiya|yo|hola|namaste|namaskar|g'day|good\s+(morning|afternoon|evening))[\s!,.?]*$""",
-    re.IGNORECASE,
+# Professional styling (neutral, subtle cards, consistent paddings)
+st.markdown(
+    """
+    <style>
+      .main > div { padding-top: 1rem; }
+      .app-title { font-size: 1.9rem; font-weight: 700; letter-spacing: .2px; }
+      .app-tag { color: #6b7280; margin-top: .35rem; }
+      .card {
+        border: 1px solid #E5E7EB; border-radius: 10px; padding: 1rem 1.1rem;
+        background: #FFFFFF; box-shadow: 0 1px 2px rgba(0,0,0,.04);
+      }
+      .muted { color: #6b7280; }
+      .small { font-size: .92rem; }
+      .kpi {
+        display: inline-flex; align-items: center; gap:.5rem; padding:.45rem .7rem;
+        border:1px solid #E5E7EB; border-radius: 999px; background:#F9FAFB; margin-right: .5rem;
+      }
+      .pill { display:inline-block; padding:.18rem .55rem; border-radius: 999px;
+              background:#EEF2FF; color:#3730A3; font-weight:600; font-size:.8rem; }
+      .logo-wrap { display:flex; align-items:center; gap:.6rem; }
+      .logo-wrap img { border-radius: 4px; }
+      .footer-tip { color:#6b7280; font-size:.9rem; }
+      /* Sidebar polish */
+      section[data-testid="stSidebar"] { width: 340px !important; }
+      .sidebar-caption { margin: .3rem 0 1rem 0; color:#6b7280; font-size:.92rem; }
+      .sidebar-section { margin-top:.6rem; padding-top:.6rem; border-top:1px dashed #E5E7EB; }
+    </style>
+    """,
+    unsafe_allow_html=True,
 )
 
-# ---------------- Minimal Claude wrapper
-class ClaudeDirect(BaseChatModel):
-    model: str = DEFAULT_CLAUDE
-    temperature: float = 0.2
-    max_tokens: int = 800
-    _client: object = None
+st.markdown(f'<div class="app-title">{APP_TITLE}</div>', unsafe_allow_html=True)
+st.markdown(f'<div class="app-tag">{APP_TAGLINE}</div>', unsafe_allow_html=True)
+st.write("")
 
-    def __init__(self, client, **kwargs):
-        super().__init__(**kwargs)
-        object.__setattr__(self, "_client", client)
-
-    @property
-    def _llm_type(self) -> str:
-        return "claude_direct"
-
-    def _convert_msgs(self, messages: list[BaseMessage]):
-        out = []
-        for m in messages:
-            role = "user" if m.type == "human" else ("assistant" if m.type == "ai" else "user")
-            if isinstance(m.content, str):
-                text = m.content
-            else:
-                parts = m.content or []
-                text = "".join(p.get("text", "") if isinstance(p, dict) else str(p) for p in parts)
-            out.append({"role": role, "content": [{"type": "text", "text": text}]})
-        return out
-
-    def _generate(self, messages: list[BaseMessage], stop=None, run_manager=None, **kwargs) -> ChatResult:
-        amsgs = self._convert_msgs(messages)
-        resp = self._client.messages.create(
-            model=self.model, messages=amsgs, temperature=self.temperature, max_tokens=self.max_tokens
-        )
-        text = ""
-        for blk in getattr(resp, "content", []) or []:
-            if getattr(blk, "type", None) == "text":
-                text += getattr(blk, "text", "") or (blk.get("text", "") if isinstance(blk, dict) else "")
-        ai = AIMessage(content=text)
-        return ChatResult(generations=[ChatGeneration(message=ai)])
-
-# ---------------- Theme / CSS
-try:
-    st.set_page_config(page_title="Forecast360 • Chat", page_icon="💬", layout="wide")
-except Exception:
-    pass
-
-USER_AVATAR_PATH: Optional[Path] = None
-ASSIST_AVATAR_PATH: Optional[Path] = None
-
-def _first_existing(paths: list[Optional[Path]]) -> Optional[Path]:
-    for p in paths:
-        if p and p.exists():
-            return p
-    return None
-
-def _resolve_avatar_paths() -> Tuple[Optional[Path], Optional[Path]]:
-    user_env = os.getenv("USER_AVATAR_PATH")
-    asst_env = os.getenv("ASSISTANT_AVATAR_PATH")
-    user = _first_existing([
-        Path(user_env).expanduser().resolve() if user_env else None,
-        Path.cwd() / "assets" / "avatar.png",
-        Path.cwd() / "assets" / "user.png",
-        Path.cwd() / "assets" / "me.png",
-    ])
-    asst = _first_existing([
-        Path(asst_env).expanduser().resolve() if asst_env else None,
-        Path.cwd() / "assets" / "llm.png",
-        Path.cwd() / "assets" / "assistant.png",
-        Path.cwd() / "assets" / "bot.png",
-        Path.cwd() / "assets" / "robot.png",
-    ])
-    return user, asst
-
-USER_AVATAR_PATH, ASSIST_AVATAR_PATH = _resolve_avatar_paths()
-
-def _img_to_data_uri(path: Optional[Path]) -> Optional[str]:
-    if not path or not path.exists():
-        return None
-    b64 = base64.b64encode(path.read_bytes()).decode("ascii")
-    ext = (path.suffix.lower().lstrip(".") or "png")
-    mime = "image/png" if ext in ("png", "apng") else ("image/jpeg" if ext in ("jpg", "jpeg") else "image/svg+xml")
-    return f"data:{mime};base64,{b64}"
-
-USER_AVATAR_URI = _img_to_data_uri(USER_AVATAR_PATH)
-ASSIST_AVATAR_URI = _img_to_data_uri(ASSIST_AVATAR_PATH)
-user_bg = f"background-image:url('{USER_AVATAR_URI}');" if USER_AVATAR_URI else ""
-asst_bg = f"background-image:url('{ASSIST_AVATAR_URI}');" if ASSIST_AVATAR_URI else ""
-
-st.markdown(f"""
-<style>
-:root{{ --bg:#f7f8fb; --panel:#fff; --text:#0b1220; --border:#e7eaf2;
-       --bubble-user:#eef4ff; --bubble-assist:#f6f7fb; --accent:#2563eb; }}
-.chat-card{{ background:var(--panel); border:1px solid var(--border); border-radius:14px;
-            box-shadow:0 6px 16px rgba(16,24,40,.05); overflow:hidden; }}
-.msg{{ display:flex; align-items:flex-start; gap:.65rem; margin:.45rem 0; }}
-.avatar{{ width:32px; height:32px; border-radius:50%; border:1px solid var(--border);
-          background-size:cover; background-position:center; background-repeat:no-repeat; flex:0 0 32px; }}
-.avatar.user {{ {user_bg} }}
-.avatar.assistant {{ {asst_bg} }}
-.bubble{{ border:1px solid var(--border); background:var(--bubble-assist);
-         padding:.8rem .95rem; border-radius:12px; max-width:960px; white-space:pre-wrap; line-height:1.45; }}
-.msg.user .bubble{{ background:var(--bubble-user); }}
-.status-inline{{ width:100%; border:1px solid var(--border); background:#fafcff; border-radius:10px;
-                padding:.5rem .7rem; font-size:.9rem; color:#111827; margin:.5rem 0 .8rem; }}
-.small-note{{opacity:.85;font-size:.85rem}}
-</style>
-""", unsafe_allow_html=True)
-
-# ---------------- KB + Azure helpers
-
-def _local_kb_dir() -> Path:
-    p = Path.cwd() / "KB"
-    p.mkdir(parents=True, exist_ok=True)
-    return p
-
-def _kb_local_version() -> Optional[str]:
-    vf = _local_kb_dir() / "meta" / "version.json"
-    if vf.exists():
-        try:
-            return json.loads(vf.read_text(encoding="utf-8")).get("version")
-        except Exception:
-            return None
-    return None
-
-def _azure_cfg() -> Dict[str, Any]:
-    try:
-        az = st.secrets.get("azure", {})  # type: ignore
-    except Exception:
-        az = {}
-    return {
-        "account_url":       az.get("account_url")         or os.getenv("AZURE_ACCOUNT_URL"),
-        "connection_string": az.get("connection_string")   or os.getenv("AZURE_STORAGE_CONNECTION_STRING"),
-        "container":         az.get("container")           or os.getenv("AZURE_BLOB_CONTAINER", "forecast360-kb"),
-        "prefix":            az.get("prefix", "KB"),
-        "sas_url":           az.get("container_sas_url")   or os.getenv("AZURE_BLOB_CONTAINER_URL"),
-    }
-
-def _azure_diag(cfg: Dict[str, Any]) -> str:
-    flags = []
-    flags.append("sas_url" if cfg.get("sas_url") else "-")
-    flags.append("conn_str" if cfg.get("connection_string") else "-")
-    flags.append("acct_url" if cfg.get("account_url") else "-")
-    return "/".join(flags) + f" · container='{cfg.get('container')}' · prefix='{cfg.get('prefix')}'"
-
-def _azure_container_client() -> Optional["ContainerClient"]:
-    if not _AZURE_OK:
-        return None
-    cfg = _azure_cfg()
-    if cfg["sas_url"]:
-        try:
-            return ContainerClient.from_container_url(cfg["sas_url"])
-        except Exception:
-            return None
-    if cfg["connection_string"]:
-        try:
-            svc = BlobServiceClient.from_connection_string(cfg["connection_string"])
-            return svc.get_container_client(cfg["container"])
-        except Exception:
-            return None
-    if cfg["account_url"] and DefaultAzureCredential is not None:
-        try:
-            cred = DefaultAzureCredential(exclude_interactive_browser_credential=True)
-            svc = BlobServiceClient(account_url=cfg["account_url"], credential=cred)
-            return svc.get_container_client(cfg["container"])
-        except Exception:
-            return None
-    return None
-
-def _azure_kb_version() -> Optional[str]:
-    if not _AZURE_OK:
-        return None
-    try:
-        cli = _azure_container_client()
-        if not cli:
-            return None
-        pref = _azure_cfg()["prefix"].rstrip("/") + "/"
-        blob = pref + "meta/version.json"
-        txt = cli.download_blob(blob).readall().decode("utf-8")
-        return json.loads(txt).get("version")
-    except Exception:
-        return None
-
-def _download_entire_prefix(cli: "ContainerClient", prefix: str, dest: Path) -> int:
-    count = 0
-    prefix = prefix.rstrip("/") + "/" if prefix else ""
-    for blob in cli.list_blobs(name_starts_with=prefix or None):
-        rel = blob.name[len(prefix):] if prefix else blob.name
-        if not rel or rel.endswith("/"):
-            continue
-        target = dest / rel
-        target.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            data = cli.download_blob(blob.name).readall()
-            with open(target, "wb") as f:
-                f.write(data)
-            count += 1
-        except Exception:
-            pass
-    return count
-
-def sync_kb_from_azure_if_needed(status_placeholder=None) -> Tuple[Path, str]:
-    kb_root = _local_kb_dir()
-    if not _AZURE_OK:
-        return kb_root, "Azure SDK missing — using local KB only."
-
-    cli = _azure_container_client()
-    if not cli:
-        return kb_root, "Azure not configured — using local KB only."
-
-    cfg  = _azure_cfg()
-    pref = cfg["prefix"].rstrip("/") if cfg["prefix"] else ""
-
-    remote_ver = _azure_kb_version()
-    local_ver  = _kb_local_version()
-    local_empty = len(list(kb_root.rglob("*"))) == 0
-
-    should_mirror = (remote_ver is not None and remote_ver != local_ver) or (remote_ver is None and local_empty)
-
-    if not should_mirror:
-        label = f"KB sync OK · remote={remote_ver or 'unknown'} · local={local_ver or 'unknown'} · {_azure_diag(cfg)}"
-        return kb_root, label
-
-    try:
-        shutil.rmtree(kb_root, ignore_errors=True)
-    except Exception:
-        pass
-    kb_root.mkdir(parents=True, exist_ok=True)
-
-    downloaded = _download_entire_prefix(cli, pref, kb_root)
-    label = f"Synced {downloaded} files from Azure · remote={remote_ver or 'unknown'} · {_azure_diag(cfg)}"
-    return kb_root, label
-
-# ---------------- Milvus connection config + helpers
-
-def _milvus_cfg() -> Dict[str, Any]:
-    try:
-        mv = st.secrets.get("milvus", {})  # type: ignore
-    except Exception:
-        mv = {}
-    cfg: Dict[str, Any] = {
-        "uri":     mv.get("uri") or os.getenv("MILVUS_URI"),
-        "host":    mv.get("host") or os.getenv("MILVUS_HOST"),
-        "port":    mv.get("port") or os.getenv("MILVUS_PORT"),
-        "user":    mv.get("user") or os.getenv("MILVUS_USER"),
-        "password":mv.get("password") or os.getenv("MILVUS_PASSWORD"),
-        "token":   mv.get("token") or os.getenv("MILVUS_TOKEN"),
-        "secure":  mv.get("secure", False) if mv.get("secure") is not None else (os.getenv("MILVUS_SECURE","false").lower()=="true"),
-        "db_name": mv.get("db_name") or os.getenv("MILVUS_DB_NAME", "default"),
-        "collection": mv.get("collection"),
-    }
-    # Default to Milvus-Lite local db file next to app if nothing provided
-    if not (cfg["uri"] or cfg["host"]):
-        cfg["uri"] = str(Path.cwd() / ".milvus" / "milvus.db")  # we will convert to sqlite:// later
-    return cfg
-
-def _to_sqlite_uri(abs_path: Path) -> str:
+# ---------------------- Utilities ----------------------
+def _load_all() -> Dict[str, Dict[str, Dict[str, Any]]]:
     """
-    Convert filesystem path to sqlite URI acceptable by Milvus-Lite/pymilvus.
-    - Linux/Unix absolute: sqlite:////abs/path/to.db
-    - Windows absolute:    sqlite:///C:/path/to.db
+    Returns: {connector_id: {profile_name: {field: value, ...}}}
     """
-    p = abs_path.expanduser().resolve()
-    posix = p.as_posix()
-    if p.is_absolute() and posix.startswith("/"):  # Unix
-        return f"sqlite:////{posix.lstrip('/')}"
-    return f"sqlite:///{posix}"
-
-def _milvus_conn_args() -> Dict[str, Any]:
-    """
-    Build connection args for LangChain Milvus.
-    - Milvus-Lite: **sqlite://** URI to a local .db file
-    - Remote Milvus: host/port or full https:// URI + token
-    - If user provides plain '/path/milvus.db' or 'file:/...', normalize to sqlite://
-    """
-    cfg = _milvus_cfg()
-    args: Dict[str, Any] = {}
-    uri = cfg.get("uri")
-    if uri:
-        s = str(uri).strip()
-        # Handle 'file:/path' → '/path'
-        if s.startswith("file:"):
-            s = s.replace("file:", "", 1)
-        if s.endswith(".db") and "://" not in s:
-            args["uri"] = _to_sqlite_uri(Path(s))
-        elif s.startswith("sqlite://"):
-            args["uri"] = s
-        else:
-            # remote Milvus (http(s) or grpc), pass-through
-            args["uri"] = s
-    else:
-        # Host/port style (remote Milvus/Zilliz)
-        args["host"] = cfg.get("host", "127.0.0.1")
-        args["port"] = int(cfg.get("port") or 19530)
-        if cfg.get("user"):
-            args["user"] = cfg["user"]
-        if cfg.get("password"):
-            args["password"] = cfg["password"]
-        if cfg.get("secure"):
-            args["secure"] = True
-        if cfg.get("token"):
-            args["token"] = cfg["token"]
-    if cfg.get("db_name"):
-        args["db_name"] = cfg["db_name"]
-    return args
-
-def _milvus_collection_name(base_kb_dir: str) -> str:
-    explicit = _milvus_cfg().get("collection")
-    if explicit and isinstance(explicit, str) and explicit.strip():
-        return explicit.strip()
-    return f"kb_{hashlib.sha1(base_kb_dir.encode('utf-8')).hexdigest()[:10]}"
-
-def _connect_milvus() -> None:
-    """Ensure a default Milvus connection is established once."""
+    if not CONN_STORE.exists():
+        return {}
     try:
-        _milvus_connections.get_connection_addr("default")
-        return
+        return json.loads(CONN_STORE.read_text(encoding="utf-8"))
     except Exception:
-        pass
-    args = _milvus_conn_args()
-    try:
-        if "uri" in args:
-            _milvus_connections.connect(alias="default", uri=args["uri"], token=args.get("token"))
-        else:
-            _milvus_connections.connect(
-                alias="default",
-                host=args.get("host", "127.0.0.1"),
-                port=args.get("port", 19530),
-                user=args.get("user"),
-                password=args.get("password"),
-                secure=args.get("secure", False),
-                token=args.get("token"),
-            )
-    except Exception as e:
-        st.error(f"Milvus connect failed: {e}")
+        return {}
 
-def _milvus_collection_exists(name: str) -> bool:
-    try:
-        _connect_milvus()
-        return _milvus_utility.has_collection(name, using="default")
-    except Exception:
-        return False
+def _save_all(data: Dict[str, Dict[str, Dict[str, Any]]]) -> None:
+    CONN_STORE.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
-# ---------------- Milvus-Lite <-> Azure Blob snapshot helpers
+def _mask(val: Any) -> Any:
+    if not isinstance(val, str) or not val:
+        return val
+    if len(val) <= 6:
+        return "•" * len(val)
+    return f"{val[:2]}{'•' * (len(val)-4)}{val[-2:]}"
 
-def _milvus_local_file() -> Optional[Path]:
-    """Return the local filesystem path for Milvus-Lite when using sqlite:// URI."""
-    args = _milvus_conn_args()
-    uri = args.get("uri")
-    if not uri:
+def masked_view(d: Dict[str, Any], secret_keys: List[str]) -> Dict[str, Any]:
+    return {k: (_mask(v) if k in secret_keys else v) for k, v in d.items()}
+
+def _logo_html(basename: str, size: int = 20) -> Optional[str]:
+    """If ./assets/{basename}.(png|svg|jpg|jpeg|webp) exists, return base64 <img> tag."""
+    if not ASSETS_DIR.exists():
         return None
-    s = str(uri)
-    if s.startswith("sqlite://"):
-        # strip prefix: sqlite:///, sqlite://// (support both)
-        path = s.replace("sqlite:///", "", 1)
-        if path.startswith("/"):  # handle quadruple slash case
-            # After replacement of 'sqlite:///', Linux absolute becomes '/abs/path' already
-            pass
-        return Path(path)
-    # remote Milvus
-    return None
-
-def _azure_index_blob_path() -> str:
-    col = st.session_state.get("collection_name", "milvus")
-    return f"indexes/{col}.db"  # same container, separate folder
-
-def restore_milvus_db_from_blob_if_exists() -> str:
-    if not _AZURE_OK:
-        return "Azure SDK not available — skipping Milvus restore."
-    local_path = _milvus_local_file()
-    if not local_path:
-        return "Not using Milvus-Lite (no sqlite:// URI) — skipping restore."
-    cli = _azure_container_client()
-    if not cli:
-        return "Azure not configured — skipping Milvus restore."
-    blob_name = _azure_index_blob_path()
-    try:
-        props = cli.get_blob_client(blob_name).get_blob_properties()  # raises if missing
-        local_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(local_path, "wb") as f:
-            data = cli.download_blob(blob_name).readall()
-            f.write(data)
-        return f"Restored Milvus DB from Azure blob ‘{blob_name}’ ({props.size} bytes)."
-    except Exception:
-        return "No Milvus snapshot found in Azure — fresh index will be created."
-
-def backup_milvus_db_to_blob() -> str:
-    if not _AZURE_OK:
-        return "Azure SDK not available — skipping Milvus backup."
-    local_path = _milvus_local_file()
-    if not local_path or not local_path.exists():
-        return "No local Milvus DB file to back up — skipping."
-    cli = _azure_container_client()
-    if not cli:
-        return "Azure not configured — skipping Milvus backup."
-    blob_name = _azure_index_blob_path()
-    try:
-        with open(local_path, "rb") as f:
-            cli.upload_blob(name=blob_name, data=f, overwrite=True)
-        return f"Backed up Milvus DB to Azure blob ‘{blob_name}’."
-    except Exception as e:
-        return f"Milvus backup failed: {e}"
-
-# ---------------- Utils
-
-def human_time(ms: float) -> str:
-    return f"{ms:.0f} ms" if ms < 1000 else f"{ms/1000:.2f} s"
-
-def stable_hash(s: str) -> str:
-    return hashlib.sha256(s.encode("utf-8")).hexdigest()[:12]
-
-def iter_files(folder: str) -> List[str]:
-    paths: List[str] = []
-    for ext in SUPPORTED_EXTS:
-        paths.extend(glob.glob(os.path.join(folder, f"**/*{ext}"), recursive=True))
-    return sorted(list(set(paths)))
-
-def compute_kb_signature(folder: str) -> Tuple[str, int]:
-    files = iter_files(folder)
-    lines = []
-    base = os.path.abspath(folder)
-    for p in files:
-        try:
-            stt = os.stat(p)
-            rel = os.path.relpath(os.path.abspath(p), base)
-            lines.append(f"{rel}|{stt.st_size}|{int(stt.st_mtime)}")
-        except Exception:
-            continue
-    lines.sort()
-    raw = "\n".join(lines) + str(SUPPORTED_TEXT_DOCS)
-    return stable_hash(raw if raw else f"EMPTY-{time.time()}"), len(files)
-
-# ---------------- Loading
-
-def _fallback_read(path: str) -> str:
-    try:
-        if path.lower().endswith(tuple(SPREADSHEET_EXTS)):
-            df = pd.read_excel(path).astype(str).iloc[:1000, :50]
-            header = " | ".join(df.columns.tolist())
-            body = "\n".join(" | ".join(row) for row in df.values.tolist())
-            return f"Spreadsheet content from {Path(path).name}:\nColumns: {header}\nData:\n{body}"
-        if path.lower().endswith((".csv", ".tsv")):
-            sep = "\t" if path.lower().endswith(".tsv") else ","
-            df = pd.read_csv(path, sep=sep).astype(str).iloc[:1000, :50]
-            header = " | ".join(df.columns.tolist())
-            body = "\n".join(" | ".join(row) for row in df.values.tolist())
-            return f"CSV/TSV content from {Path(path).name}:\nColumns: {header}\nData:\n{body}"
-        return Path(path).read_text(encoding="utf-8", errors="ignore")
-    except Exception as e:
-        st.error(f"Error reading file {Path(path).name}: {e}")
-        return ""
-
-def load_one(path: str) -> List[Document]:
-    p = path.lower()
-    if p.endswith(tuple(IMAGE_EXTS | AUDIO_EXTS | VIDEO_EXTS)):
-        doc_type = "Image" if p.endswith(tuple(IMAGE_EXTS)) else ("Audio" if p.endswith(tuple(AUDIO_EXTS)) else "Video")
-        placeholder_content = (
-            f"This document is a {doc_type} file. "
-            f"Text content unavailable (requires OCR/transcription). "
-            f"Metadata: {Path(path).name}."
-        )
-        return [Document(page_content=placeholder_content, metadata={"source": path, "type": doc_type, "status": "placeholder"})]
-
-    try:
-        if p.endswith(".pdf"):
-            return PyPDFLoader(path).load()
-        if p.endswith((".html", ".htm")):
-            return BSHTMLLoader(path).load()
-        if p.endswith(".docx"):
-            if _HAS_DOCX2TXT:
-                return Docx2txtLoader(path).load()
+    base = basename.lower().replace(" ", "").replace("/", "").replace("-", "")
+    for ext in (".svg", ".png", ".jpg", ".jpeg", ".webp"):
+        p = ASSETS_DIR / f"{base}{ext}"
+        if p.exists():
             try:
-                if '._PyDocxDoc' in globals() and _PyDocxDoc is not None:
-                    d = _PyDocxDoc(path)
-                    text = "\n".join([para.text for para in d.paragraphs]) or ""
-                    return [Document(page_content=text, metadata={"source": path})] if text.strip() else []
-            except Exception as e:
-                st.warning(f"python-docx fallback failed for {Path(path).name}: {e}")
-                return []
-        if p.endswith((".pptx", ".pptm")):
-            return UnstructuredPowerPointLoader(path).load()
-        if p.endswith(".csv"):
-            return CSVLoader(path).load()
-        if p.endswith(".tsv"):
-            return CSVLoader(path, csv_args={"delimiter": "\t"}).load()
-        if p.endswith(tuple(TEXT_EXTS | SPREADSHEET_EXTS | {".doc", ".odt"})):
-            txt = _fallback_read(path)
-            return [Document(page_content=txt, metadata={"source": path})] if txt.strip() else []
-        txt = _fallback_read(path)
-        return [Document(page_content=txt, metadata={"source": path})] if txt.strip() else []
-    except Exception as e:
-        st.warning(f"Failed to load/process {Path(path).name}. Error: {e}")
-        return []
+                b64 = base64.b64encode(p.read_bytes()).decode("utf-8")
+                mime = "svg+xml" if ext == ".svg" else ext[1:]
+                return f'<img src="data:image/{mime};base64,{b64}" width="{size}" height="{size}" />'
+            except Exception:
+                return None
+    return None
 
-def load_documents(folder: str) -> List[Document]:
-    docs: List[Document] = []
-    files_to_load = [p for p in iter_files(folder) if Path(p).suffix.lower() in SUPPORTED_EXTS]
-    for path in files_to_load:
-        docs.extend(load_one(path))
-    return docs
+def _env_snippet(conn_id: str, profile: str, cfg: Dict[str, Any], secret_keys: List[str]) -> str:
+    """
+    Produce an ENV export snippet. Secrets are masked in preview.
+    """
+    lines = []
+    prefix = f"{conn_id}_{profile}".upper().replace("-", "_").replace(" ", "_")
+    for k, v in cfg.items():
+        key = f"{prefix}_{k.upper()}"
+        shown = _mask(v) if k in secret_keys else v
+        lines.append(f'export {key}="{shown}"')
+    return "\n".join(lines)
 
-# ---------------- Embeddings
+def _dsn_preview(conn_id: str, cfg: Dict[str, Any]) -> str:
+    """
+    Human-friendly DSN-like previews (no guarantees; for visual check only).
+    """
+    try:
+        if conn_id == "postgres":
+            h, p, d, u = cfg.get("host"), cfg.get("port", 5432), cfg.get("database"), cfg.get("user")
+            return f"postgresql://{u}:***@{h}:{p}/{d}"
+        if conn_id == "mysql":
+            h, p, d, u = cfg.get("host"), cfg.get("port", 3306), cfg.get("database"), cfg.get("user")
+            return f"mysql://{u}:***@{h}:{p}/{d}"
+        if conn_id == "mssql":
+            s, d, u = cfg.get("server"), cfg.get("database"), cfg.get("user")
+            return f"mssql+pyodbc://{u}:***@{s}/{d}?driver={cfg.get('driver','ODBC Driver 18 for SQL Server')}"
+        if conn_id == "oracle":
+            return f"oracle+oracledb://{cfg.get('user')}:***@{cfg.get('dsn')}"
+        if conn_id == "sqlite":
+            return f"sqlite:///{cfg.get('filepath')}"
+        if conn_id == "trino":
+            return f"trino://{cfg.get('user')}@{cfg.get('host')}:{cfg.get('port')}/{cfg.get('catalog')}/{cfg.get('schema')}"
+        if conn_id == "duckdb":
+            return f"duckdb:///{cfg.get('filepath')}"
+        if conn_id == "snowflake":
+            return f"snowflake://{cfg.get('user')}:***@{cfg.get('account')}/{cfg.get('database')}/{cfg.get('schema')}?warehouse={cfg.get('warehouse')}&role={cfg.get('role')}"
+        if conn_id == "bigquery":
+            return f"bigquery://{cfg.get('project_id')} (Service Account JSON provided)"
+        if conn_id == "redshift":
+            h, p, d, u = cfg.get("host"), cfg.get("port", 5439), cfg.get("database"), cfg.get("user")
+            return f"redshift+psycopg2://{u}:***@{h}:{p}/{d}"
+        if conn_id == "synapse":
+            return f"mssql+pyodbc://{cfg.get('user')}:***@{cfg.get('server')}/{cfg.get('database')}?driver=ODBC+Driver+18+for+SQL+Server"
+        if conn_id == "mongodb":
+            return f"{cfg.get('uri')}"
+        if conn_id == "cassandra":
+            return f"cassandra://{cfg.get('contact_points')}:{cfg.get('port')}/{cfg.get('keyspace')}"
+        if conn_id == "redis":
+            return f"redis://{cfg.get('host')}:{cfg.get('port')}/{cfg.get('db','0')}"
+        if conn_id == "dynamodb":
+            return f"dynamodb://{cfg.get('region_name') or 'region'} (keys provided)"
+        if conn_id == "neo4j":
+            return f"{cfg.get('uri')} (neo4j user provided)"
+        if conn_id == "elasticsearch":
+            return f"elasticsearch://{cfg.get('hosts')}"
+        if conn_id == "cosmos":
+            return f"cosmos://{cfg.get('endpoint')}"
+        if conn_id == "firestore":
+            return f"firestore://{cfg.get('project_id')} (Service Account JSON provided)"
+        if conn_id == "bigtable":
+            return f"bigtable://{cfg.get('project_id')}/{cfg.get('instance_id')} (SA JSON provided)"
+        if conn_id == "s3":
+            return f"s3://{cfg.get('bucket') or ''} ({'region ' + cfg.get('region_name') if cfg.get('region_name') else 'region not set'})"
+        if conn_id == "azureblob":
+            return f"azblob://{cfg.get('account_name') or 'account'} / {cfg.get('sas_url') or 'SAS or conn string provided'}"
+        if conn_id == "adls":
+            return f"abfs://{cfg.get('filesystem') or ''}@{cfg.get('account_name') or 'account'}.dfs.core.windows.net"
+        if conn_id == "gcs":
+            return f"gcs://{cfg.get('bucket') or ''} (project {cfg.get('project_id')})"
+        if conn_id == "hdfs":
+            return f"webhdfs://{cfg.get('host')}:{cfg.get('port')}"
+        if conn_id == "kafka":
+            return f"kafka://{cfg.get('bootstrap_servers')} (security={cfg.get('security_protocol')})"
+        if conn_id == "rabbitmq":
+            return f"{cfg.get('amqp_url')}"
+        if conn_id == "eventhubs":
+            return f"eventhubs://{cfg.get('eventhub') or ''} (conn str provided)"
+        if conn_id == "pubsub":
+            return f"pubsub://{cfg.get('project_id')} (SA JSON provided)"
+        if conn_id == "kinesis":
+            return f"kinesis://{cfg.get('region_name') or ''} (keys provided)"
+        if conn_id == "spark":
+            return f"spark://{cfg.get('master')} (app_name={cfg.get('app_name')})"
+        if conn_id == "dask":
+            return f"dask://{cfg.get('scheduler_address')}"
+        if conn_id == "salesforce":
+            return f"salesforce://{cfg.get('domain') or 'login' } (username provided)"
+        if conn_id == "servicenow":
+            return f"servicenow://{cfg.get('instance')}"
+        if conn_id == "jira":
+            return f"jira://{cfg.get('server')}"
+        if conn_id == "sharepoint":
+            return f"msgraph://tenant={cfg.get('tenant_id')}"
+        if conn_id == "tableau":
+            return f"tableau://{cfg.get('server')}/{cfg.get('site_id') or ''}"
+        if conn_id == "gmail":
+            return "gmail:// (OAuth/Service Account JSON provided)"
+        if conn_id == "msgraph":
+            return f"msgraph://tenant={cfg.get('tenant_id')}"
+    except Exception:
+        pass
+    return "(preview unavailable)"
+
+# ---------------------- Schema / Registry ----------------------
+@dataclass
+class Field:
+    key: str
+    label: str
+    required: bool = False
+    kind: str = "text"  # text | password | int | textarea | select
+    placeholder: str = ""
+    options: Optional[List[str]] = None
 
 @dataclass
-class ChunkingConfig:
-    chunk_size: int = 1200
-    chunk_overlap: int = 200
+class Connector:
+    id: str
+    name: str
+    icon: str              # emoji used in all labels
+    fields: List[Field]
+    secret_keys: List[str]
+    category: str
+    logo_key: Optional[str] = None  # for optional thumbnail (./assets/{logo_key}.svg|png)
 
-@st.cache_resource(show_spinner=False)
-def _cached_embeddings() -> HuggingFaceEmbeddings:
-    return HuggingFaceEmbeddings(
-        model_name=_EMB_MODEL,
-        model_kwargs=_EMB_MODEL_KW,
-        encode_kwargs=_ENCODE_KW,
+def F(key: str, label: str, **kw) -> Field:
+    return Field(key=key, label=label, **kw)
+
+REGISTRY: List[Connector] = [
+    # --- SQL ---
+    Connector("postgres", "PostgreSQL", "🐘",
+              [F("host","Host",True), F("port","Port",kind="int"),
+               F("database","Database",True), F("user","User",True),
+               F("password","Password",True,kind="password")],
+              ["password"], "SQL", "postgres"),
+    Connector("mysql", "MySQL / MariaDB", "🐬",
+              [F("host","Host",True), F("port","Port",kind="int"),
+               F("database","Database",True), F("user","User",True),
+               F("password","Password",True,kind="password")],
+              ["password"], "SQL", "mysql"),
+    Connector("mssql", "SQL Server / Azure SQL", "🪟",
+              [F("driver","ODBC Driver",placeholder="ODBC Driver 18 for SQL Server"),
+               F("server","Server",True), F("database","Database",True),
+               F("user","User",True), F("password","Password",True,kind="password")],
+              ["password"], "SQL", "mssql"),
+    Connector("oracle", "Oracle", "🏺",
+              [F("dsn","DSN",True,placeholder="host:port/service_name"),
+               F("user","User",True), F("password","Password",True,kind="password")],
+              ["password"], "SQL", "oracle"),
+    Connector("sqlite", "SQLite", "🗂️",
+              [F("filepath","DB File Path",True,placeholder="./my.db")],
+              [], "SQL", "sqlite"),
+    Connector("trino", "Trino / Presto", "🚀",
+              [F("host","Host",True), F("port","Port",kind="int"),
+               F("catalog","Catalog",True), F("schema","Schema",True),
+               F("user","User",True)],
+              [], "SQL", "trino"),
+    Connector("duckdb", "DuckDB", "🦆",
+              [F("filepath","DB File Path",True,placeholder="./warehouse.duckdb")],
+              [], "SQL", "duckdb"),
+
+    # --- Cloud DW / Analytics ---
+    Connector("snowflake","Snowflake","❄️",
+              [F("account","Account",True,placeholder="xy12345.ap-southeast-2"),
+               F("user","User",True), F("password","Password",True,kind="password"),
+               F("warehouse","Warehouse"), F("database","Database"),
+               F("schema","Schema"), F("role","Role")],
+              ["password"], "Cloud DW / Analytics", "snowflake"),
+    Connector("bigquery","BigQuery","🧮",
+              [F("project_id","Project ID",True),
+               F("credentials_json","Service Account JSON",True,kind="textarea",placeholder="{...}")],
+              ["credentials_json"], "Cloud DW / Analytics", "bigquery"),
+    Connector("redshift","Amazon Redshift","🧊",
+              [F("host","Host",True), F("port","Port",kind="int"),
+               F("database","Database",True), F("user","User",True),
+               F("password","Password",True,kind="password")],
+              ["password"], "Cloud DW / Analytics", "redshift"),
+    Connector("synapse","Azure Synapse (SQL)","🔷",
+              [F("server","Server",True,placeholder="yourserver.database.windows.net"),
+               F("database","Database",True), F("user","User",True),
+               F("password","Password",True,kind="password")],
+              ["password"], "Cloud DW / Analytics", "synapse"),
+
+    # --- NoSQL / Graph / Search ---
+    Connector("mongodb","MongoDB","🍃",
+              [F("uri","Mongo URI",True,placeholder="mongodb+srv://user:pass@cluster/db")],
+              ["uri"], "NoSQL / Graph / Search", "mongodb"),
+    Connector("cassandra","Cassandra","💠",
+              [F("contact_points","Contact Points",True,placeholder="host1,host2"),
+               F("port","Port",kind="int"), F("username","Username"),
+               F("password","Password",kind="password"), F("keyspace","Keyspace")],
+              ["password"], "NoSQL / Graph / Search", "cassandra"),
+    Connector("redis","Redis","🔴",
+              [F("host","Host",True), F("port","Port",kind="int"),
+               F("password","Password",kind="password"), F("db","DB Index")],
+              ["password"], "NoSQL / Graph / Search", "redis"),
+    Connector("dynamodb","DynamoDB","🌀",
+              [F("aws_access_key_id","AWS Access Key ID"),
+               F("aws_secret_access_key","AWS Secret",kind="password"),
+               F("region_name","Region",placeholder="ap-southeast-2")],
+              ["aws_secret_access_key"], "NoSQL / Graph / Search", "dynamodb"),
+    Connector("neo4j","Neo4j (Graph)","🕸️",
+              [F("uri","Bolt URI",True,placeholder="bolt://localhost:7687"),
+               F("user","User",True), F("password","Password",True,kind="password")],
+              ["password"], "NoSQL / Graph / Search", "neo4j"),
+    Connector("elasticsearch","Elasticsearch / OpenSearch","🔎",
+              [F("hosts","Hosts",True,placeholder="http://localhost:9200,http://node2:9200"),
+               F("username","Username"), F("password","Password",kind="password")],
+              ["password"], "NoSQL / Graph / Search", "elasticsearch"),
+    Connector("cosmos","Azure Cosmos DB","🪐",
+              [F("endpoint","Endpoint",True,placeholder="https://<acct>.documents.azure.com:443/"),
+               F("key","Key",True,kind="password")],
+              ["key"], "NoSQL / Graph / Search", "cosmos"),
+    Connector("firestore","Firestore","🔥",
+              [F("project_id","Project ID",True),
+               F("credentials_json","Service Account JSON",True,kind="textarea")],
+              ["credentials_json"], "NoSQL / Graph / Search", "firestore"),
+    Connector("bigtable","Bigtable","📚",
+              [F("project_id","Project ID",True), F("instance_id","Instance ID",True),
+               F("credentials_json","Service Account JSON",True,kind="textarea")],
+              ["credentials_json"], "NoSQL / Graph / Search", "bigtable"),
+
+    # --- Object Storage / Data Lake ---
+    Connector("s3","Amazon S3","🪣",
+              [F("aws_access_key_id","AWS Access Key ID"),
+               F("aws_secret_access_key","AWS Secret",kind="password"),
+               F("region_name","Region"), F("bucket","Bucket")],
+              ["aws_secret_access_key"], "Object Storage / Data Lake", "s3"),
+    Connector("azureblob","Azure Blob Storage","☁️",
+              [F("connection_string","Connection String",placeholder="DefaultEndpointsProtocol=..."),
+               F("account_name","Account Name"), F("account_key","Account Key",kind="password"),
+               F("sas_url","Container SAS URL",placeholder="https://.../container?...")],
+              ["connection_string","account_key","sas_url"], "Object Storage / Data Lake", "azureblob"),
+    Connector("adls","Azure Data Lake Gen2","📁",
+              [F("account_name","Account Name"), F("account_key","Account Key",kind="password"),
+               F("filesystem","Filesystem/Container"), F("tenant_id","Tenant ID"),
+               F("client_id","Client ID"), F("client_secret","Client Secret",kind="password")],
+              ["account_key","client_secret"], "Object Storage / Data Lake", "adls"),
+    Connector("gcs","Google Cloud Storage","☁️",
+              [F("project_id","Project ID"), F("bucket","Bucket"),
+               F("credentials_json","Service Account JSON",kind="textarea")],
+              ["credentials_json"], "Object Storage / Data Lake", "gcs"),
+    Connector("hdfs","HDFS (WebHDFS)","🗄️",
+              [F("host","Host",True), F("port","Port",kind="int"), F("user","User")],
+              [], "Object Storage / Data Lake", "hdfs"),
+
+    # --- Streaming / Messaging ---
+    Connector("kafka","Apache Kafka","📡",
+              [F("bootstrap_servers","Bootstrap Servers",True,placeholder="host1:9092,host2:9092"),
+               F("security_protocol","Security Protocol",kind="select",
+                 options=["PLAINTEXT","SASL_PLAINTEXT","SASL_SSL","SSL"]),
+               F("sasl_mechanism","SASL Mechanism",kind="select",
+                 options=["","PLAIN","SCRAM-SHA-256","SCRAM-SHA-512"]),
+               F("sasl_username","SASL Username"),
+               F("sasl_password","SASL Password",kind="password")],
+              ["sasl_password"], "Streaming / Messaging", "kafka"),
+    Connector("rabbitmq","RabbitMQ","🐇",
+              [F("amqp_url","AMQP URL",True,placeholder="amqp://user:pass@host:5672/vhost")],
+              ["amqp_url"], "Streaming / Messaging", "rabbitmq"),
+    Connector("eventhubs","Azure Event Hubs","⚡",
+              [F("connection_str","Connection String",True,placeholder="Endpoint=sb://...;SharedAccessKeyName=...;SharedAccessKey=..."),
+               F("eventhub","Event Hub Name")],
+              ["connection_str"], "Streaming / Messaging", "eventhubs"),
+    Connector("pubsub","Google Pub/Sub","📣",
+              [F("project_id","Project ID",True),
+               F("credentials_json","Service Account JSON",True,kind="textarea")],
+              ["credentials_json"], "Streaming / Messaging", "pubsub"),
+    Connector("kinesis","AWS Kinesis","🌊",
+              [F("aws_access_key_id","AWS Access Key ID"),
+               F("aws_secret_access_key","AWS Secret",kind="password"),
+               F("region_name","Region")],
+              ["aws_secret_access_key"], "Streaming / Messaging", "kinesis"),
+
+    # --- Big Data / Compute ---
+    Connector("spark","Apache Spark","🔥",
+              [F("master","Master URL",True,placeholder="local[*] or spark://host:7077"),
+               F("app_name","App Name",placeholder="ConnectorsHub")],
+              [], "Big Data / Compute", "spark"),
+    Connector("dask","Dask","🐍",
+              [F("scheduler_address","Scheduler Address",placeholder="tcp://127.0.0.1:8786")],
+              [], "Big Data / Compute", "dask"),
+
+    # --- BI / SaaS ---
+    Connector("salesforce","Salesforce","☁️",
+              [F("username","Username",True),
+               F("password","Password",True,kind="password"),
+               F("security_token","Security Token",True,kind="password"),
+               F("domain","Domain",placeholder="login or test")],
+              ["password","security_token"], "BI / SaaS", "salesforce"),
+    Connector("servicenow","ServiceNow","🧰",
+              [F("instance","Instance",True,placeholder="dev12345"),
+               F("user","User",True), F("password","Password",True,kind="password")],
+              ["password"], "BI / SaaS", "servicenow"),
+    Connector("jira","Jira","🧩",
+              [F("server","Server URL",True,placeholder="https://yourdomain.atlassian.net"),
+               F("email","Email",True), F("api_token","API Token",True,kind="password")],
+              ["api_token"], "BI / SaaS", "jira"),
+    Connector("sharepoint","SharePoint / Microsoft Graph","🗂️",
+              [F("tenant_id","Tenant ID",True), F("client_id","Client ID",True),
+               F("client_secret","Client Secret",True,kind="password")],
+              ["client_secret"], "BI / SaaS", "sharepoint"),
+    Connector("tableau","Tableau Server/Online","📊",
+              [F("server","Server",True), F("site_id","Site ID"), F("token_name","Token Name",True),
+               F("token_secret","Token Secret",True,kind="password")],
+              ["token_secret"], "BI / SaaS", "tableau"),
+
+    # --- Email / Collaboration ---
+    Connector("gmail","Gmail API","✉️",
+              [F("credentials_json","OAuth Client/Service Account JSON",True,kind="textarea")],
+              ["credentials_json"], "Email / Collaboration", "gmail"),
+    Connector("msgraph","Microsoft Graph (Mail/Drive)","📧",
+              [F("tenant_id","Tenant ID",True), F("client_id","Client ID",True),
+               F("client_secret","Client Secret",True,kind="password")],
+              ["client_secret"], "Email / Collaboration", "msgraph"),
+]
+
+# Lookups
+REG_BY_ID: Dict[str, Connector] = {c.id: c for c in REGISTRY}
+REG_BY_CAT: Dict[str, List[Connector]] = {}
+for c in REGISTRY:
+    REG_BY_CAT.setdefault(c.category, []).append(c)
+CATEGORIES = sorted(REG_BY_CAT.keys())
+
+# ---------------------- Sidebar (Search, Category, Picker) ----------------------
+st.sidebar.markdown("### 🔎 Search")
+q = st.sidebar.text_input("Search connectors", placeholder="snowflake, postgres, blob, kafka...").strip().lower()
+
+st.sidebar.markdown('<div class="sidebar-caption">Filter by category</div>', unsafe_allow_html=True)
+cat = st.sidebar.selectbox("Category", CATEGORIES, index=0, label_visibility="collapsed")
+
+def _filter_conns(items: List[Connector], q: str) -> List[Connector]:
+    if not q:
+        return sorted(items, key=lambda x: x.name.lower())
+    return sorted(
+        [c for c in items if q in c.name.lower() or q in c.id.lower() or q in c.category.lower()],
+        key=lambda x: x.name.lower()
     )
 
-def _make_embeddings():
-    return _cached_embeddings()
+choices = _filter_conns(REG_BY_CAT.get(cat, []), q)
+label_for = lambda c: f"{c.icon} {c.name}"  # enforce "emoji + space + name"
 
-# ---------------- Milvus indexing & retrieval
+st.sidebar.markdown('<div class="sidebar-section"></div>', unsafe_allow_html=True)
+selected_label = st.sidebar.radio(
+    "Connectors",
+    [label_for(c) for c in choices],
+    key="connector_radio",
+    label_visibility="collapsed",
+)
 
-def _split_docs(docs: List[Document], cfg: ChunkingConfig) -> List[Document]:
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=cfg.chunk_size, chunk_overlap=cfg.chunk_overlap,
-        separators=["\n\n", "\n", ". ", " "]
-    )
-    return splitter.split_documents(docs)
+# Resolve selected connector by name suffix
+def resolve_selected(lbl: str) -> Connector:
+    name = lbl.split(" ", 1)[1] if " " in lbl else lbl
+    for c in choices:
+        if c.name == name:
+            return c
+    return choices[0]
 
-def index_folder_milvus(folder: str, collection_name: str, chunk_cfg: ChunkingConfig) -> Tuple[int, int]:
-    """
-    (re)Build Milvus collection with fresh chunks from the local KB folder
-    (which was mirrored from Azure Blob). Returns (#raw_docs, #chunks).
-    """
-    raw_docs = load_documents(folder)
-    if not raw_docs:
-        try:
-            if _milvus_collection_exists(collection_name):
-                _milvus_utility.drop_collection(collection_name, using="default")
-        except Exception:
-            pass
-    else:
-        chunks = _split_docs(raw_docs, chunk_cfg)
-        embeddings = _make_embeddings()
+conn = resolve_selected(selected_label)
 
-        _connect_milvus()
-        conn_args = _milvus_conn_args()
+# ---------------------- Load / Save storage ----------------------
+all_profiles = _load_all()                            # {cid: {pname: cfg}}
+profiles_for = all_profiles.get(conn.id, {})          # {pname: cfg}
 
-        Milvus.from_documents(
-            documents=chunks,
-            embedding=embeddings,
-            collection_name=collection_name,
-            connection_args=conn_args,
-            drop_old=True,   # idempotent rebuilds on change
-        )
-
-        # After successful (re)index, back up Milvus-Lite DB to Azure (if configured)
-        try:
-            note = backup_milvus_db_to_blob()
-            st.markdown(f'<div class="status-inline">{note}</div>', unsafe_allow_html=True)
-        except Exception:
-            pass
-
-    return (len(raw_docs), len(_split_docs(raw_docs, chunk_cfg)) if raw_docs else 0)
-
-def get_vectorstore(collection_name: str) -> Optional[Milvus]:
-    try:
-        _connect_milvus()
-        if not _milvus_collection_exists(collection_name):
-            return None
-        conn_args = _milvus_conn_args()
-        return Milvus(
-            embedding_function=_make_embeddings(),
-            collection_name=collection_name,
-            connection_args=conn_args,
-        )
-    except Exception as e:
-        st.error(f"Failed to open Milvus collection '{collection_name}': {e}")
-        return None
-
-# ---------------- Claude init
-
-def _strip_proxy_env() -> None:
-    for v in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy", "NO_PROXY", "no_proxy"):
-        os.environ.pop(v, None)
-
-def _get_secret_api_key() -> Optional[str]:
-    try:
-        s = st.secrets
-    except Exception:
-        s = None
-    if s:
-        for k in ("ANTHROPIC_API_KEY","anthropic_api_key","CLAUDE_API_KEY","claude_api_key"):
-            v = s.get(k)
-            if isinstance(v, str) and v.strip():
-                return v.strip()
-        for parent in ("anthropic","claude","secrets"):
-            if parent in s and isinstance(s[parent], dict):
-                ns = s[parent]
-                for k in ("api_key","ANTHROPIC_API_KEY","key","token"):
-                    v = ns.get(k)
-                    if isinstance(v, str) and v.strip():
-                        return v.strip()
-    for k in ("ANTHROPIC_API_KEY","anthropic_api_key","CLAUDE_API_KEY","claude_api_key"):
-        v = os.getenv(k)
-        if isinstance(v, str) and v.strip():
-            return v.strip()
-    return None
-
-@st.cache_resource(show_spinner=False)
-def _anthropic_client_from_secrets_cached():
-    _strip_proxy_env()
-    api_key = _get_secret_api_key()
-    if not api_key:
-        raise RuntimeError("Missing ANTHROPIC_API_KEY. Put it in .streamlit/secrets.toml under [anthropic] api_key=\"...\" or env.")
-    os.environ["ANTHROPIC_API_KEY"] = api_key
-    if _AnthropicClientNew is not None:
-        return _AnthropicClientNew(api_key=api_key)
-    if _AnthropicClientOld is not None:
-        return _AnthropicClientOld(api_key=api_key)
-    raise RuntimeError("Anthropic SDK not installed correctly.")
-
-def make_llm(model_name: str, temperature: float):
-    client = _anthropic_client_from_secrets_cached()
-    return ClaudeDirect(client=client, model=model_name or DEFAULT_CLAUDE,
-                        temperature=temperature, max_tokens=800)
-
-def make_chain(vs: Milvus, llm: BaseChatModel, k: int):
-    retriever = vs.as_retriever(search_kwargs={"k": k})
-    memory = ConversationBufferMemory(memory_key="chat_history", output_key="answer", return_messages=True)
-    return ConversationalRetrievalChain.from_llm(
-        llm=llm, retriever=retriever, memory=memory, return_source_documents=True, verbose=False
-    )
-
-# ---------------- Defaults + auto-index
-
-def settings_defaults() -> Dict[str, Any]:
-    kb_dir = str(_local_kb_dir())
-    return {
-        "base_folder": kb_dir,
-        "collection_name": _milvus_collection_name(kb_dir),
-        "emb_model": _EMB_MODEL,
-        "chunk_cfg": ChunkingConfig(),
-        "claude_model": DEFAULT_CLAUDE,
-        "temperature": 0.2,
-        "top_k": 5,
-        "auto_index_min_interval_sec": 8,
-        "chat_height": 560,
-    }
-
-def auto_index_if_needed(status_placeholder: Optional[object] = None) -> Optional[Milvus]:
-    folder   = st.session_state.get("base_folder")
-    colname  = st.session_state.get("collection_name")
-    min_gap  = int(st.session_state.get("auto_index_min_interval_sec", 8))
-    target   = status_placeholder if status_placeholder is not None else st
-
-    sig_now, file_count = compute_kb_signature(folder)
-    last_sig  = st.session_state.get("_kb_last_sig")
-    last_time = float(st.session_state.get("_kb_last_index_ts", 0.0))
-    now       = time.time()
-
-    need_index = (last_sig != sig_now) or (last_sig is None)
-    throttled  = (now - last_time) < min_gap
-
-    vs = get_vectorstore(colname)
-    coll_exists = vs is not None
-
-    if (not coll_exists) or (need_index and not throttled):
-        try:
-            target.markdown('<div class="status-inline">Indexing into Milvus…</div>', unsafe_allow_html=True)
-            n_docs, n_chunks = index_folder_milvus(folder, colname, st.session_state.get("chunk_cfg", ChunkingConfig()))
-            st.session_state["_kb_last_sig"]      = sig_now
-            st.session_state["_kb_last_index_ts"] = now
-            st.session_state["_kb_last_counts"]   = {"files": file_count, "docs": n_docs, "chunks": n_chunks}
-            label = f"Indexed: <b>{n_docs}</b> files → <b>{n_chunks}</b> chunks"
-        except Exception as e:
-            label = f"Auto-index failed: <b>{e}</b>"
-        target.markdown(f'<div class="status-inline">{label}</div>', unsafe_allow_html=True)
-        vs = get_vectorstore(colname)  # reopen after (re)build
-    else:
-        ts = st.session_state.get("_kb_last_index_ts")
-        when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts)) if ts else "—"
-        target.markdown(
-            f'<div class="status-inline">Auto-index <b>ON</b> · Files: <b>{file_count}</b> · Last indexed: <b>{when}</b> · Collection: <code>{colname}</code></div>',
+# ---------------------- Header / Overview ----------------------
+k1, k2, k3 = st.columns([2,1,1])
+with k1:
+    # Optional logo thumbnail (does not change "emoji + name" label)
+    thumb = _logo_html(conn.logo_key or conn.id, size=22)
+    if thumb:
+        st.markdown(
+            f'<div class="logo-wrap">{thumb}<h2 style="margin:0;">{conn.icon} {conn.name}</h2></div>',
             unsafe_allow_html=True
         )
+    else:
+        st.markdown(f"## {conn.icon} {conn.name}")
+    st.caption(f"Category: **{conn.category}** · ID: `{conn.id}`")
+with k2:
+    st.markdown(f'<div class="kpi">🧩 Connectors: <b>{len(REGISTRY)}</b></div>', unsafe_allow_html=True)
+with k3:
+    total_profiles = sum(len(v) for v in all_profiles.values())
+    st.markdown(f'<div class="kpi">🗂️ Profiles: <b>{total_profiles}</b></div>', unsafe_allow_html=True)
 
-    return vs
+st.write("")
 
-# ---------------- UI helpers
+left, right = st.columns([7, 5], gap="large")
 
-def _avatar_for_role(role: str) -> Optional[str]:
-    if role == "user":
-        return USER_AVATAR_URI or (str(USER_AVATAR_PATH) if USER_AVATAR_PATH else "👤")
-    if role == "assistant":
-        return ASSIST_AVATAR_URI or (str(ASSIST_AVATAR_PATH) if ASSIST_AVATAR_PATH else "🤖")
-    return None
+# ---------------------- Left: Create / Update Form ----------------------
+with left:
+    st.markdown("#### Configure connection profile")
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    with st.form(key=f"form_{conn.id}", clear_on_submit=False):
+        profile_name = st.text_input("Profile Name", placeholder="dev / staging / prod", key=f"{conn.id}_profile_name")
 
-def render_chat_history():
-    for message in st.session_state.get("messages", []):
-        role = message["role"]
-        with st.chat_message(role, avatar=_avatar_for_role(role)):
-            st.markdown(message["content"])
+        values: Dict[str, Any] = {}
+        missing_required: List[str] = []
+        # Render dynamic fields
+        for f in conn.fields:
+            ikey = f"{conn.id}_{f.key}"
+            if f.kind == "password":
+                val = st.text_input(f.label, type="password", placeholder=f.placeholder or "", key=ikey)
+            elif f.kind == "int":
+                val = st.number_input(f.label, min_value=0, step=1, value=0, key=ikey)
+            elif f.kind == "textarea":
+                val = st.text_area(f.label, placeholder=f.placeholder or "", height=120, key=ikey)
+            elif f.kind == "select":
+                opts = f.options or [""]
+                val = st.selectbox(f.label, opts, index=0, key=ikey)
+            else:
+                val = st.text_input(f.label, placeholder=f.placeholder or "", key=ikey)
+            values[f.key] = val
+            if f.required and (val is None or str(val).strip() == ""):
+                missing_required.append(f.label)
 
-def build_citation_block(source_docs: List[Document], kb_root: str | None = None) -> str:
-    if not source_docs:
-        return ""
-    from collections import Counter
-    names = []
-    for d in source_docs:
-        meta = getattr(d, "metadata", {}) or {}
-        src = meta.get("source", "unknown")
-        try:
-            display = str(Path(src).resolve().relative_to(Path(kb_root).resolve())) if kb_root else Path(src).name
-        except Exception:
-            display = Path(src).name
-        names.append(display)
-    counts = Counter(names)
-    lines = [f"- {name}" + (f" ×{n}" if n > 1 else "") for name, n in counts.items()]
-    return "\n\n**Sources**\n" + "\n".join(lines)
+        c1, c2, c3 = st.columns([1,1,1])
+        submitted = c1.form_submit_button("💾 Save Profile", use_container_width=True)
+        preview = c2.form_submit_button("🧪 Preview DSN", use_container_width=True)
+        envvars = c3.form_submit_button("🔐 Env-Vars Snippet", use_container_width=True)
 
-def read_whole_file_from_disk(path: str) -> str:
-    docs = load_one(path)
-    return "".join(
-        (f"\n\n--- [{i}] {Path((d.metadata or {}).get('source','')).name} ---\n") + (d.page_content or "")
-        for i, d in enumerate(docs, 1)
-    ).strip()
+    st.markdown('</div>', unsafe_allow_html=True)
 
-def read_whole_doc_by_name(name_or_stem: str, base_folder: str) -> Tuple[str, List[str]]:
-    name_or_stem = name_or_stem.lower().strip()
-    candidates = [p for p in iter_files(base_folder) if name_or_stem in os.path.basename(p).lower()]
-    texts = []
-    for p in candidates:
-        try:
-            texts.append(read_whole_file_from_disk(p))
-        except Exception as e:
-            texts.append(f"[Error reading {os.path.basename(p)}: {e}]")
-    return ("\n\n".join(t for t in texts if t.strip()) or ""), candidates
-
-# ---------------- LLM & Chain
-
-def make_llm_and_chain(vs: Milvus):
-    llm = make_llm(st.session_state["claude_model"], float(st.session_state["temperature"]))
-    chain = make_chain(vs, llm, int(st.session_state["top_k"]))
-    return llm, chain
-
-_SLASH_SET_RE = re.compile(r"/set\s+(.+)$", re.IGNORECASE)
-_KV_RE = re.compile(r"(\w+)\s*=\s*([\w\.\-]+)")
-
-def _apply_settings_kv(s: str) -> str:
-    changed = []
-    for k, v in _KV_RE.findall(s):
-        try:
-            if k in {"top_k", "chat_height"}:
-                st.session_state[k] = int(v)
-            elif k in {"temperature"}:
-                st.session_state[k] = float(v)
-            elif k in {"claude_model"}:
-                st.session_state[k] = v
-            elif k in {"chunk_size", "chunk_overlap"}:
-                cfg = st.session_state.get("chunk_cfg", ChunkingConfig())
-                if k == "chunk_size":
-                    cfg.chunk_size = int(v)
-                else:
-                    cfg.chunk_overlap = int(v)
-                st.session_state["chunk_cfg"] = cfg
-            changed.append(f"{k}→{st.session_state[k]}")
-        except Exception:
-            pass
-    return ", ".join(changed) if changed else "No changes applied."
-
-def handle_user_input(query: str, vs: Optional[Milvus]):
-    st.session_state.setdefault("messages", [])
-
-    mset = _SLASH_SET_RE.search(query)
-    if mset:
-        applied = _apply_settings_kv(mset.group(1))
-        st.session_state["messages"].append({"role": "assistant", "content": f"Applied settings: {applied}"})
-        st.rerun(); return
-
-    st.session_state["messages"].append({"role": "user", "content": query})
-
-    m = re.match(r"^\s*(read|open|show)\s+(.+)$", query, flags=re.IGNORECASE)
-    if m:
-        target = m.group(2).strip().strip('"').strip("'")
-        full_text, files = read_whole_doc_by_name(target, st.session_state["base_folder"])
-        if not files:
-            st.session_state["messages"].append({"role": "assistant", "content": f"Couldn't find a file containing “{target}” in the Knowledge Base folder."})
-            st.rerun(); return
-
-        if len(full_text) > 8000:
-            try:
-                llm, _ = make_llm_and_chain(vs or Milvus(
-                    embedding_function=_make_embeddings(),
-                    collection_name=st.session_state["collection_name"],
-                    connection_args=_milvus_conn_args()))
-                summary = llm.predict(f"Summarize the following document concisely, focusing on key facts and numbers:\n\n{full_text[:180000]}")
-                reply = f"**Full-document summary for:** {', '.join(Path(p).name for p in files)}\n\n{summary}"
-            except Exception as e:
-                reply = f"Loaded the full document but failed to summarize: {e}\n\n--- RAW BEGIN ---\n{full_text[:20000]}\n--- RAW TRUNCATED ---"
+    if submitted:
+        if not profile_name.strip():
+            st.error("Please provide a **Profile Name**.")
+        elif missing_required:
+            st.error("Missing required fields: " + ", ".join(missing_required))
         else:
-            reply = f"**Full document content:**\n\n{full_text}"
+            all_profiles.setdefault(conn.id, {})
+            all_profiles[conn.id][profile_name] = values
+            _save_all(all_profiles)
+            st.success(f"Saved **{profile_name}** for {conn.icon} {conn.name}.")
 
-        st.session_state["messages"].append({"role": "assistant", "content": reply})
-        st.rerun(); return
+    if preview:
+        st.info("Indicative DSN/URI preview (no network calls):")
+        st.code(_dsn_preview(conn.id, values), language="text")
 
-    if GREETING_RE.match(query):
-        st.session_state["messages"].append({"role": "assistant", "content": "Hello"})
-        st.rerun(); return
+    if envvars:
+        st.info("Copy/paste into your shell (masked preview):")
+        st.code(_env_snippet(conn.id, profile_name or "PROFILE", values, conn.secret_keys), language="bash")
 
-    if vs is None:
-        st.session_state["messages"].append({
-            "role": "assistant",
-            "content": "I couldn’t open a Milvus collection yet. Make sure your Azure KB has at least one readable text document (PDF, DOCX, CSV, etc.). I’ll auto-index as soon as files are available."
-        })
-        st.rerun(); return
+# ---------------------- Right: Profiles for Selected Connector ----------------------
+with right:
+    st.markdown("#### Saved profiles")
+    st.markdown('<div class="card">', unsafe_allow_html=True)
 
-    t0 = time.time()
-    try:
-        _, chain = make_llm_and_chain(vs)
-        with st.spinner("Querying Claude with RAG..."):
-            result = chain.invoke({"question": query})
-            answer = result.get("answer", "").strip() or "Not found in Knowledge Base."
-            sources = result.get("source_documents", []) or []
-        citation_block = build_citation_block(sources, kb_root=st.session_state.get("base_folder"))
-        msg = f"{answer}{citation_block}\n\n_(Answered in {human_time((time.time()-t0)*1000)})_"
-    except Exception as e:
-        msg = f"RAG error: {e}"
+    if not profiles_for:
+        st.info("No profiles saved yet for this connector.")
+    else:
+        for pname, cfg in sorted(profiles_for.items()):
+            redacted = masked_view(cfg, conn.secret_keys)
+            with st.expander(f"{conn.icon} {conn.name} — **{pname}**", expanded=False):
+                st.json(redacted)
+                cc1, cc2, cc3 = st.columns([1,1,2])
+                if cc1.button("📝 Load to form", key=f"load_{conn.id}_{pname}"):
+                    # Pre-fill form inputs
+                    st.session_state[f"{conn.id}_profile_name"] = pname
+                    for f in conn.fields:
+                        st.session_state[f"{conn.id}_{f.key}"] = cfg.get(f.key, "")
+                    st.success(f"Loaded **{pname}** into the form above.")
+                if cc2.button("🗑️ Delete", key=f"del_{conn.id}_{pname}"):
+                    all_profiles[conn.id].pop(pname, None)
+                    if not all_profiles[conn.id]:
+                        all_profiles.pop(conn.id, None)
+                    _save_all(all_profiles)
+                    st.warning(f"Deleted profile **{pname}**.")
+                    st.rerun()
+                cc3.caption("Secrets are masked in this view. Raw values remain local in `connections.json`.")
 
-    st.session_state["messages"].append({"role": "assistant", "content": msg})
-    st.rerun()
+    st.markdown('</div>', unsafe_allow_html=True)
 
-# ---------------- Main
+# ---------------------- All Configured Connections (Table) ----------------------
+st.write("")
+st.markdown("### 📚 All configured connections")
+st.markdown('<div class="card">', unsafe_allow_html=True)
 
-def main():
-    # 1) Defaults
-    for k, v in settings_defaults().items():
-        st.session_state.setdefault(k, v)
+if not all_profiles:
+    st.info("You haven’t saved any connections yet.")
+else:
+    rows: List[Dict[str, Any]] = []
+    for cid, items in all_profiles.items():
+        meta = REG_BY_ID.get(cid)
+        for pname, cfg in items.items():
+            rows.append({
+                "Connector": f"{meta.icon if meta else '🔌'} {meta.name if meta else cid}",
+                "Profile": pname,
+                "Fields": ", ".join(cfg.keys())
+            })
+    df = pd.DataFrame(rows).sort_values(["Connector", "Profile"])
+    st.dataframe(df, hide_index=True, use_container_width=True)
 
-    # 2) Sync KB from Azure (files that will be chunked & embedded)
-    kb_dir, sync_label = sync_kb_from_azure_if_needed()
-    st.session_state["base_folder"] = str(kb_dir)
-    # Recompute collection name if not explicitly provided
-    if not _milvus_cfg().get("collection"):
-        st.session_state["collection_name"] = _milvus_collection_name(str(kb_dir))
+st.markdown('</div>', unsafe_allow_html=True)
 
-    # Try to restore a previous Milvus-Lite snapshot from the SAME blob container
-    restore_note = restore_milvus_db_from_blob_if_exists()
-    st.markdown(f"<div class='status-inline'>{restore_note}</div>", unsafe_allow_html=True)
+# ---------------------- Import / Export JSON ----------------------
+st.write("")
+st.markdown("### 🔄 Import / Export")
+cA, cB = st.columns([1,1])
 
-    # 3) Header + controls
-    st.markdown("### 💬 Chat with Forecast360")
-    st.markdown(f"<div class='status-inline'><b>KB Sync:</b> {sync_label}</div>", unsafe_allow_html=True)
+with cA:
+    st.markdown("#### Export connections")
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    if all_profiles:
+        export_json = json.dumps(all_profiles, indent=2).encode("utf-8")
+        st.download_button(
+            "⬇️ Download connections.json",
+            data=export_json,
+            file_name="connections.json",
+            mime="application/json",
+            use_container_width=True,
+        )
+    else:
+        st.caption("Nothing to export yet.")
+    st.markdown('</div>', unsafe_allow_html=True)
 
-    c1, c2, c3 = st.columns([1,2,1], vertical_alignment="center")
-    with c1:
-        hero_status = st.container()
-        vs = auto_index_if_needed(status_placeholder=hero_status)
-    with c2:
-        if st.button("Reindex KB", use_container_width=True):
-            st.session_state.pop("_kb_last_sig", None)
-            st.session_state["_kb_last_index_ts"] = 0
-            vs = auto_index_if_needed(status_placeholder=hero_status)
-    with c3:
-        st.session_state["chat_height"] = st.number_input("Chat height (px)", 420, 1200, st.session_state.get("chat_height", 560), step=20)
+with cB:
+    st.markdown("#### Import connections")
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    up = st.file_uploader("Upload a connections.json", type=["json"])
+    if up:
+        try:
+            data = json.loads(up.read().decode("utf-8"))
+            if isinstance(data, dict):
+                # shallow merge (import overwrites existing profiles with same keys)
+                merged = _load_all()
+                for cid, profs in data.items():
+                    merged.setdefault(cid, {})
+                    merged[cid].update(profs or {})
+                _save_all(merged)
+                st.success("Imported connections successfully.")
+                st.rerun()
+            else:
+                st.error("Invalid format. Expected a JSON object.")
+        except Exception as e:
+            st.error(f"Failed to import: {e}")
+    st.markdown('</div>', unsafe_allow_html=True)
 
-    # 4) Chat UI
-    st.session_state.setdefault("messages", [{"role": "assistant", "content": "Hi! Ask me anything about Forecast360."}])
-    st.markdown('<div class="chat-card">', unsafe_allow_html=True)
-    chat_area = st.container(height=int(st.session_state.get("chat_height", 560)), border=False)
-    with chat_area:
-        render_chat_history()
-    user_text = st.chat_input("Type your question… ")
-    st.markdown("</div>", unsafe_allow_html=True)
-
-    if user_text and user_text.strip():
-        handle_user_input(user_text.strip(), vs)
-
-if __name__ == "__main__":
-    main()
+# ---------------------- Footer Tip ----------------------
+st.write("")
+st.markdown(
+    """
+    <div class="footer-tip">
+      Tip: To show official logos, drop files into <code>./assets</code> with simple names
+      (e.g., <code>snowflake.svg</code>, <code>postgres.png</code>, <code>azureblob.png</code>).
+      Names in the UI always remain in the format <b>“emoji + space + name”</b> (e.g., <code>❄️ Snowflake</code>).
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
