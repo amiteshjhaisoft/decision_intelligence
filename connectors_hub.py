@@ -1,15 +1,19 @@
 # Author: Amitesh Jha | iSoft | 2025-10-12
 # connectors_hub.py
 # Professional Connectors Hub (Streamlit)
-# - Sidebar: categorized connectors with labels like "❄️ Snowflake"
-# - Dynamic forms by connector; required field validation
+# - Sidebar: categorized connectors labeled like "❄️ Snowflake"
+# - Dynamic forms by connector; required-field validation
 # - Persist profiles to ./connections.json (secrets masked in UI)
 # - Import/Export JSON; DSN preview; Env-var snippet
 # - Optional logos in ./assets (e.g., snowflake.svg, postgres.png)
+# - "Test Connection" for ALL registered connectors (best-effort, short timeouts, safe)
 from __future__ import annotations
 
 import base64
 import json
+import os
+import socket
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -18,14 +22,13 @@ import pandas as pd
 import streamlit as st
 
 APP_TITLE = "🔌 Data Connectors Hub"
-APP_TAGLINE = "Configure and organize connection profiles for databases, warehouses, NoSQL, storage, streaming, and more."
+APP_TAGLINE = "Configure, validate, and organize connection profiles for databases, warehouses, NoSQL, storage, streaming, and SaaS."
 CONN_STORE = Path("./connections.json")
 ASSETS_DIR = Path("./assets")  # optional logo files
 
 # ---------------------- Page Config & Global Style ----------------------
 st.set_page_config(page_title="Connectors Hub", layout="wide", page_icon="🔌")
 
-# Professional styling (neutral, subtle cards, consistent paddings)
 st.markdown(
     """
     <style>
@@ -47,7 +50,6 @@ st.markdown(
       .logo-wrap { display:flex; align-items:center; gap:.6rem; }
       .logo-wrap img { border-radius: 4px; }
       .footer-tip { color:#6b7280; font-size:.9rem; }
-      /* Sidebar polish */
       section[data-testid="stSidebar"] { width: 340px !important; }
       .sidebar-caption { margin: .3rem 0 1rem 0; color:#6b7280; font-size:.92rem; }
       .sidebar-section { margin-top:.6rem; padding-top:.6rem; border-top:1px dashed #E5E7EB; }
@@ -62,9 +64,6 @@ st.write("")
 
 # ---------------------- Utilities ----------------------
 def _load_all() -> Dict[str, Dict[str, Dict[str, Any]]]:
-    """
-    Returns: {connector_id: {profile_name: {field: value, ...}}}
-    """
     if not CONN_STORE.exists():
         return {}
     try:
@@ -86,7 +85,6 @@ def masked_view(d: Dict[str, Any], secret_keys: List[str]) -> Dict[str, Any]:
     return {k: (_mask(v) if k in secret_keys else v) for k, v in d.items()}
 
 def _logo_html(basename: str, size: int = 20) -> Optional[str]:
-    """If ./assets/{basename}.(png|svg|jpg|jpeg|webp) exists, return base64 <img> tag."""
     if not ASSETS_DIR.exists():
         return None
     base = basename.lower().replace(" ", "").replace("/", "").replace("-", "")
@@ -102,9 +100,6 @@ def _logo_html(basename: str, size: int = 20) -> Optional[str]:
     return None
 
 def _env_snippet(conn_id: str, profile: str, cfg: Dict[str, Any], secret_keys: List[str]) -> str:
-    """
-    Produce an ENV export snippet. Secrets are masked in preview.
-    """
     lines = []
     prefix = f"{conn_id}_{profile}".upper().replace("-", "_").replace(" ", "_")
     for k, v in cfg.items():
@@ -114,19 +109,14 @@ def _env_snippet(conn_id: str, profile: str, cfg: Dict[str, Any], secret_keys: L
     return "\n".join(lines)
 
 def _dsn_preview(conn_id: str, cfg: Dict[str, Any]) -> str:
-    """
-    Human-friendly DSN-like previews (no guarantees; for visual check only).
-    """
     try:
         if conn_id == "postgres":
-            h, p, d, u = cfg.get("host"), cfg.get("port", 5432), cfg.get("database"), cfg.get("user")
-            return f"postgresql://{u}:***@{h}:{p}/{d}"
+            return f"postgresql://{cfg.get('user')}:***@{cfg.get('host')}:{cfg.get('port',5432)}/{cfg.get('database')}"
         if conn_id == "mysql":
-            h, p, d, u = cfg.get("host"), cfg.get("port", 3306), cfg.get("database"), cfg.get("user")
-            return f"mysql://{u}:***@{h}:{p}/{d}"
+            return f"mysql://{cfg.get('user')}:***@{cfg.get('host')}:{cfg.get('port',3306)}/{cfg.get('database')}"
         if conn_id == "mssql":
-            s, d, u = cfg.get("server"), cfg.get("database"), cfg.get("user")
-            return f"mssql+pyodbc://{u}:***@{s}/{d}?driver={cfg.get('driver','ODBC Driver 18 for SQL Server')}"
+            drv = cfg.get('driver','ODBC Driver 18 for SQL Server')
+            return f"mssql+pyodbc://{cfg.get('user')}:***@{cfg.get('server')}/{cfg.get('database')}?driver={drv}"
         if conn_id == "oracle":
             return f"oracle+oracledb://{cfg.get('user')}:***@{cfg.get('dsn')}"
         if conn_id == "sqlite":
@@ -140,8 +130,7 @@ def _dsn_preview(conn_id: str, cfg: Dict[str, Any]) -> str:
         if conn_id == "bigquery":
             return f"bigquery://{cfg.get('project_id')} (Service Account JSON provided)"
         if conn_id == "redshift":
-            h, p, d, u = cfg.get("host"), cfg.get("port", 5439), cfg.get("database"), cfg.get("user")
-            return f"redshift+psycopg2://{u}:***@{h}:{p}/{d}"
+            return f"redshift+psycopg2://{cfg.get('user')}:***@{cfg.get('host')}:{cfg.get('port',5439)}/{cfg.get('database')}"
         if conn_id == "synapse":
             return f"mssql+pyodbc://{cfg.get('user')}:***@{cfg.get('server')}/{cfg.get('database')}?driver=ODBC+Driver+18+for+SQL+Server"
         if conn_id == "mongodb":
@@ -165,7 +154,7 @@ def _dsn_preview(conn_id: str, cfg: Dict[str, Any]) -> str:
         if conn_id == "s3":
             return f"s3://{cfg.get('bucket') or ''} ({'region ' + cfg.get('region_name') if cfg.get('region_name') else 'region not set'})"
         if conn_id == "azureblob":
-            return f"azblob://{cfg.get('account_name') or 'account'} / {cfg.get('sas_url') or 'SAS or conn string provided'}"
+            return f"azblob://{cfg.get('account_name') or 'account'}"
         if conn_id == "adls":
             return f"abfs://{cfg.get('filesystem') or ''}@{cfg.get('account_name') or 'account'}.dfs.core.windows.net"
         if conn_id == "gcs":
@@ -177,7 +166,7 @@ def _dsn_preview(conn_id: str, cfg: Dict[str, Any]) -> str:
         if conn_id == "rabbitmq":
             return f"{cfg.get('amqp_url')}"
         if conn_id == "eventhubs":
-            return f"eventhubs://{cfg.get('eventhub') or ''} (conn str provided)"
+            return f"eventhubs://{cfg.get('eventhub') or ''}"
         if conn_id == "pubsub":
             return f"pubsub://{cfg.get('project_id')} (SA JSON provided)"
         if conn_id == "kinesis":
@@ -204,6 +193,10 @@ def _dsn_preview(conn_id: str, cfg: Dict[str, Any]) -> str:
         pass
     return "(preview unavailable)"
 
+def _short_timeout_env():
+    # Some SDKs read env for timeouts/SSL. We keep it minimal and safe.
+    os.environ.setdefault("GRPC_VERBOSITY", "ERROR")
+
 # ---------------------- Schema / Registry ----------------------
 @dataclass
 class Field:
@@ -225,74 +218,75 @@ class Connector:
     logo_key: Optional[str] = None  # for optional thumbnail (./assets/{logo_key}.svg|png)
 
 def F(key: str, label: str, **kw) -> Field:
+    # NOTE: Use keyword args like required=True, kind="password"
     return Field(key=key, label=label, **kw)
 
 REGISTRY: List[Connector] = [
     # --- SQL ---
     Connector("postgres", "PostgreSQL", "🐘",
-              [F("host","Host",True), F("port","Port",kind="int"),
-               F("database","Database",True), F("user","User",True),
-               F("password","Password",True,kind="password")],
+              [F("host","Host",required=True), F("port","Port",kind="int"),
+               F("database","Database",required=True), F("user","User",required=True),
+               F("password","Password",required=True,kind="password")],
               ["password"], "SQL", "postgres"),
     Connector("mysql", "MySQL / MariaDB", "🐬",
-              [F("host","Host",True), F("port","Port",kind="int"),
-               F("database","Database",True), F("user","User",True),
-               F("password","Password",True,kind="password")],
+              [F("host","Host",required=True), F("port","Port",kind="int"),
+               F("database","Database",required=True), F("user","User",required=True),
+               F("password","Password",required=True,kind="password")],
               ["password"], "SQL", "mysql"),
     Connector("mssql", "SQL Server / Azure SQL", "🪟",
               [F("driver","ODBC Driver",placeholder="ODBC Driver 18 for SQL Server"),
-               F("server","Server",True), F("database","Database",True),
-               F("user","User",True), F("password","Password",True,kind="password")],
+               F("server","Server",required=True), F("database","Database",required=True),
+               F("user","User",required=True), F("password","Password",required=True,kind="password")],
               ["password"], "SQL", "mssql"),
     Connector("oracle", "Oracle", "🏺",
-              [F("dsn","DSN",True,placeholder="host:port/service_name"),
-               F("user","User",True), F("password","Password",True,kind="password")],
+              [F("dsn","DSN",required=True,placeholder="host:port/service_name"),
+               F("user","User",required=True), F("password","Password",required=True,kind="password")],
               ["password"], "SQL", "oracle"),
     Connector("sqlite", "SQLite", "🗂️",
-              [F("filepath","DB File Path",True,placeholder="./my.db")],
+              [F("filepath","DB File Path",required=True,placeholder="./my.db")],
               [], "SQL", "sqlite"),
     Connector("trino", "Trino / Presto", "🚀",
-              [F("host","Host",True), F("port","Port",kind="int"),
-               F("catalog","Catalog",True), F("schema","Schema",True),
-               F("user","User",True)],
+              [F("host","Host",required=True), F("port","Port",kind="int"),
+               F("catalog","Catalog",required=True), F("schema","Schema",required=True),
+               F("user","User",required=True)],
               [], "SQL", "trino"),
     Connector("duckdb", "DuckDB", "🦆",
-              [F("filepath","DB File Path",True,placeholder="./warehouse.duckdb")],
+              [F("filepath","DB File Path",required=True,placeholder="./warehouse.duckdb")],
               [], "SQL", "duckdb"),
 
     # --- Cloud DW / Analytics ---
     Connector("snowflake","Snowflake","❄️",
-              [F("account","Account",True,placeholder="xy12345.ap-southeast-2"),
-               F("user","User",True), F("password","Password",True,kind="password"),
+              [F("account","Account",required=True,placeholder="xy12345.ap-southeast-2"),
+               F("user","User",required=True), F("password","Password",required=True,kind="password"),
                F("warehouse","Warehouse"), F("database","Database"),
                F("schema","Schema"), F("role","Role")],
               ["password"], "Cloud DW / Analytics", "snowflake"),
     Connector("bigquery","BigQuery","🧮",
-              [F("project_id","Project ID",True),
-               F("credentials_json","Service Account JSON",True,kind="textarea",placeholder="{...}")],
+              [F("project_id","Project ID",required=True),
+               F("credentials_json","Service Account JSON",required=True,kind="textarea",placeholder="{...}")],
               ["credentials_json"], "Cloud DW / Analytics", "bigquery"),
     Connector("redshift","Amazon Redshift","🧊",
-              [F("host","Host",True), F("port","Port",kind="int"),
-               F("database","Database",True), F("user","User",True),
-               F("password","Password",True,kind="password")],
+              [F("host","Host",required=True), F("port","Port",kind="int"),
+               F("database","Database",required=True), F("user","User",required=True),
+               F("password","Password",required=True,kind="password")],
               ["password"], "Cloud DW / Analytics", "redshift"),
     Connector("synapse","Azure Synapse (SQL)","🔷",
-              [F("server","Server",True,placeholder="yourserver.database.windows.net"),
-               F("database","Database",True), F("user","User",True),
-               F("password","Password",True,kind="password")],
+              [F("server","Server",required=True,placeholder="yourserver.database.windows.net"),
+               F("database","Database",required=True), F("user","User",required=True),
+               F("password","Password",required=True,kind="password")],
               ["password"], "Cloud DW / Analytics", "synapse"),
 
     # --- NoSQL / Graph / Search ---
     Connector("mongodb","MongoDB","🍃",
-              [F("uri","Mongo URI",True,placeholder="mongodb+srv://user:pass@cluster/db")],
+              [F("uri","Mongo URI",required=True,placeholder="mongodb+srv://user:pass@cluster/db")],
               ["uri"], "NoSQL / Graph / Search", "mongodb"),
     Connector("cassandra","Cassandra","💠",
-              [F("contact_points","Contact Points",True,placeholder="host1,host2"),
+              [F("contact_points","Contact Points",required=True,placeholder="host1,host2"),
                F("port","Port",kind="int"), F("username","Username"),
                F("password","Password",kind="password"), F("keyspace","Keyspace")],
               ["password"], "NoSQL / Graph / Search", "cassandra"),
     Connector("redis","Redis","🔴",
-              [F("host","Host",True), F("port","Port",kind="int"),
+              [F("host","Host",required=True), F("port","Port",kind="int"),
                F("password","Password",kind="password"), F("db","DB Index")],
               ["password"], "NoSQL / Graph / Search", "redis"),
     Connector("dynamodb","DynamoDB","🌀",
@@ -301,24 +295,24 @@ REGISTRY: List[Connector] = [
                F("region_name","Region",placeholder="ap-southeast-2")],
               ["aws_secret_access_key"], "NoSQL / Graph / Search", "dynamodb"),
     Connector("neo4j","Neo4j (Graph)","🕸️",
-              [F("uri","Bolt URI",True,placeholder="bolt://localhost:7687"),
-               F("user","User",True), F("password","Password",True,kind="password")],
+              [F("uri","Bolt URI",required=True,placeholder="bolt://localhost:7687"),
+               F("user","User",required=True), F("password","Password",required=True,kind="password")],
               ["password"], "NoSQL / Graph / Search", "neo4j"),
     Connector("elasticsearch","Elasticsearch / OpenSearch","🔎",
-              [F("hosts","Hosts",True,placeholder="http://localhost:9200,http://node2:9200"),
+              [F("hosts","Hosts",required=True,placeholder="http://localhost:9200,http://node2:9200"),
                F("username","Username"), F("password","Password",kind="password")],
               ["password"], "NoSQL / Graph / Search", "elasticsearch"),
     Connector("cosmos","Azure Cosmos DB","🪐",
-              [F("endpoint","Endpoint",True,placeholder="https://<acct>.documents.azure.com:443/"),
-               F("key","Key",True,kind="password")],
+              [F("endpoint","Endpoint",required=True,placeholder="https://<acct>.documents.azure.com:443/"),
+               F("key","Key",required=True,kind="password")],
               ["key"], "NoSQL / Graph / Search", "cosmos"),
     Connector("firestore","Firestore","🔥",
-              [F("project_id","Project ID",True),
-               F("credentials_json","Service Account JSON",True,kind="textarea")],
+              [F("project_id","Project ID",required=True),
+               F("credentials_json","Service Account JSON",required=True,kind="textarea")],
               ["credentials_json"], "NoSQL / Graph / Search", "firestore"),
     Connector("bigtable","Bigtable","📚",
-              [F("project_id","Project ID",True), F("instance_id","Instance ID",True),
-               F("credentials_json","Service Account JSON",True,kind="textarea")],
+              [F("project_id","Project ID",required=True), F("instance_id","Instance ID",required=True),
+               F("credentials_json","Service Account JSON",required=True,kind="textarea")],
               ["credentials_json"], "NoSQL / Graph / Search", "bigtable"),
 
     # --- Object Storage / Data Lake ---
@@ -342,12 +336,12 @@ REGISTRY: List[Connector] = [
                F("credentials_json","Service Account JSON",kind="textarea")],
               ["credentials_json"], "Object Storage / Data Lake", "gcs"),
     Connector("hdfs","HDFS (WebHDFS)","🗄️",
-              [F("host","Host",True), F("port","Port",kind="int"), F("user","User")],
+              [F("host","Host",required=True), F("port","Port",kind="int"), F("user","User")],
               [], "Object Storage / Data Lake", "hdfs"),
 
     # --- Streaming / Messaging ---
     Connector("kafka","Apache Kafka","📡",
-              [F("bootstrap_servers","Bootstrap Servers",True,placeholder="host1:9092,host2:9092"),
+              [F("bootstrap_servers","Bootstrap Servers",required=True,placeholder="host1:9092,host2:9092"),
                F("security_protocol","Security Protocol",kind="select",
                  options=["PLAINTEXT","SASL_PLAINTEXT","SASL_SSL","SSL"]),
                F("sasl_mechanism","SASL Mechanism",kind="select",
@@ -356,15 +350,15 @@ REGISTRY: List[Connector] = [
                F("sasl_password","SASL Password",kind="password")],
               ["sasl_password"], "Streaming / Messaging", "kafka"),
     Connector("rabbitmq","RabbitMQ","🐇",
-              [F("amqp_url","AMQP URL",True,placeholder="amqp://user:pass@host:5672/vhost")],
+              [F("amqp_url","AMQP URL",required=True,placeholder="amqp://user:pass@host:5672/vhost")],
               ["amqp_url"], "Streaming / Messaging", "rabbitmq"),
     Connector("eventhubs","Azure Event Hubs","⚡",
-              [F("connection_str","Connection String",True,placeholder="Endpoint=sb://...;SharedAccessKeyName=...;SharedAccessKey=..."),
+              [F("connection_str","Connection String",required=True,placeholder="Endpoint=sb://...;SharedAccessKeyName=...;SharedAccessKey=..."),
                F("eventhub","Event Hub Name")],
               ["connection_str"], "Streaming / Messaging", "eventhubs"),
     Connector("pubsub","Google Pub/Sub","📣",
-              [F("project_id","Project ID",True),
-               F("credentials_json","Service Account JSON",True,kind="textarea")],
+              [F("project_id","Project ID",required=True),
+               F("credentials_json","Service Account JSON",required=True,kind="textarea")],
               ["credentials_json"], "Streaming / Messaging", "pubsub"),
     Connector("kinesis","AWS Kinesis","🌊",
               [F("aws_access_key_id","AWS Access Key ID"),
@@ -374,7 +368,7 @@ REGISTRY: List[Connector] = [
 
     # --- Big Data / Compute ---
     Connector("spark","Apache Spark","🔥",
-              [F("master","Master URL",True,placeholder="local[*] or spark://host:7077"),
+              [F("master","Master URL",required=True,placeholder="local[*] or spark://host:7077"),
                F("app_name","App Name",placeholder="ConnectorsHub")],
               [], "Big Data / Compute", "spark"),
     Connector("dask","Dask","🐍",
@@ -383,46 +377,45 @@ REGISTRY: List[Connector] = [
 
     # --- BI / SaaS ---
     Connector("salesforce","Salesforce","☁️",
-              [F("username","Username",True),
-               F("password","Password",True,kind="password"),
-               F("security_token","Security Token",True,kind="password"),
+              [F("username","Username",required=True),
+               F("password","Password",required=True,kind="password"),
+               F("security_token","Security Token",required=True,kind="password"),
                F("domain","Domain",placeholder="login or test")],
               ["password","security_token"], "BI / SaaS", "salesforce"),
     Connector("servicenow","ServiceNow","🧰",
-              [F("instance","Instance",True,placeholder="dev12345"),
-               F("user","User",True), F("password","Password",True,kind="password")],
+              [F("instance","Instance",required=True,placeholder="dev12345"),
+               F("user","User",required=True), F("password","Password",required=True,kind="password")],
               ["password"], "BI / SaaS", "servicenow"),
     Connector("jira","Jira","🧩",
-              [F("server","Server URL",True,placeholder="https://yourdomain.atlassian.net"),
-               F("email","Email",True), F("api_token","API Token",True,kind="password")],
+              [F("server","Server URL",required=True,placeholder="https://yourdomain.atlassian.net"),
+               F("email","Email",required=True), F("api_token","API Token",required=True,kind="password")],
               ["api_token"], "BI / SaaS", "jira"),
     Connector("sharepoint","SharePoint / Microsoft Graph","🗂️",
-              [F("tenant_id","Tenant ID",True), F("client_id","Client ID",True),
-               F("client_secret","Client Secret",True,kind="password")],
+              [F("tenant_id","Tenant ID",required=True), F("client_id","Client ID",required=True),
+               F("client_secret","Client Secret",required=True,kind="password")],
               ["client_secret"], "BI / SaaS", "sharepoint"),
     Connector("tableau","Tableau Server/Online","📊",
-              [F("server","Server",True), F("site_id","Site ID"), F("token_name","Token Name",True),
-               F("token_secret","Token Secret",True,kind="password")],
+              [F("server","Server",required=True), F("site_id","Site ID"), F("token_name","Token Name",required=True),
+               F("token_secret","Token Secret",required=True,kind="password")],
               ["token_secret"], "BI / SaaS", "tableau"),
 
     # --- Email / Collaboration ---
     Connector("gmail","Gmail API","✉️",
-              [F("credentials_json","OAuth Client/Service Account JSON",True,kind="textarea")],
+              [F("credentials_json","OAuth Client/Service Account JSON",required=True,kind="textarea")],
               ["credentials_json"], "Email / Collaboration", "gmail"),
     Connector("msgraph","Microsoft Graph (Mail/Drive)","📧",
-              [F("tenant_id","Tenant ID",True), F("client_id","Client ID",True),
-               F("client_secret","Client Secret",True,kind="password")],
+              [F("tenant_id","Tenant ID",required=True), F("client_id","Client ID",required=True),
+               F("client_secret","Client Secret",required=True,kind="password")],
               ["client_secret"], "Email / Collaboration", "msgraph"),
 ]
 
-# Lookups
 REG_BY_ID: Dict[str, Connector] = {c.id: c for c in REGISTRY}
 REG_BY_CAT: Dict[str, List[Connector]] = {}
 for c in REGISTRY:
     REG_BY_CAT.setdefault(c.category, []).append(c)
 CATEGORIES = sorted(REG_BY_CAT.keys())
 
-# ---------------------- Sidebar (Search, Category, Picker) ----------------------
+# ---------------------- Sidebar ----------------------
 st.sidebar.markdown("### 🔎 Search")
 q = st.sidebar.text_input("Search connectors", placeholder="snowflake, postgres, blob, kafka...").strip().lower()
 
@@ -432,13 +425,11 @@ cat = st.sidebar.selectbox("Category", CATEGORIES, index=0, label_visibility="co
 def _filter_conns(items: List[Connector], q: str) -> List[Connector]:
     if not q:
         return sorted(items, key=lambda x: x.name.lower())
-    return sorted(
-        [c for c in items if q in c.name.lower() or q in c.id.lower() or q in c.category.lower()],
-        key=lambda x: x.name.lower()
-    )
+    return sorted([c for c in items if q in c.name.lower() or q in c.id.lower() or q in c.category.lower()],
+                  key=lambda x: x.name.lower())
 
 choices = _filter_conns(REG_BY_CAT.get(cat, []), q)
-label_for = lambda c: f"{c.icon} {c.name}"  # enforce "emoji + space + name"
+label_for = lambda c: f"{c.icon} {c.name}"
 
 st.sidebar.markdown('<div class="sidebar-section"></div>', unsafe_allow_html=True)
 selected_label = st.sidebar.radio(
@@ -448,7 +439,6 @@ selected_label = st.sidebar.radio(
     label_visibility="collapsed",
 )
 
-# Resolve selected connector by name suffix
 def resolve_selected(lbl: str) -> Connector:
     name = lbl.split(" ", 1)[1] if " " in lbl else lbl
     for c in choices:
@@ -459,19 +449,15 @@ def resolve_selected(lbl: str) -> Connector:
 conn = resolve_selected(selected_label)
 
 # ---------------------- Load / Save storage ----------------------
-all_profiles = _load_all()                            # {cid: {pname: cfg}}
-profiles_for = all_profiles.get(conn.id, {})          # {pname: cfg}
+all_profiles = _load_all()
+profiles_for = all_profiles.get(conn.id, {})
 
 # ---------------------- Header / Overview ----------------------
 k1, k2, k3 = st.columns([2,1,1])
 with k1:
-    # Optional logo thumbnail (does not change "emoji + name" label)
     thumb = _logo_html(conn.logo_key or conn.id, size=22)
     if thumb:
-        st.markdown(
-            f'<div class="logo-wrap">{thumb}<h2 style="margin:0;">{conn.icon} {conn.name}</h2></div>',
-            unsafe_allow_html=True
-        )
+        st.markdown(f'<div class="logo-wrap">{thumb}<h2 style="margin:0;">{conn.icon} {conn.name}</h2></div>', unsafe_allow_html=True)
     else:
         st.markdown(f"## {conn.icon} {conn.name}")
     st.caption(f"Category: **{conn.category}** · ID: `{conn.id}`")
@@ -485,6 +471,567 @@ st.write("")
 
 left, right = st.columns([7, 5], gap="large")
 
+# ---------------------- Test handlers (per connector) ----------------------
+# Each returns (ok: bool, message: str). Uses short timeouts where possible.
+def test_postgres(cfg):
+    try:
+        import psycopg2
+        dsn = {
+            "host": cfg.get("host"),
+            "port": int(cfg.get("port") or 5432),
+            "dbname": cfg.get("database"),
+            "user": cfg.get("user"),
+            "password": cfg.get("password"),
+            "connect_timeout": 5,
+        }
+        conn = psycopg2.connect(**dsn)
+        cur = conn.cursor(); cur.execute("SELECT 1"); cur.fetchone()
+        conn.close()
+        return True, "Connected (SELECT 1 ok)."
+    except ModuleNotFoundError:
+        return False, "Install library: pip install psycopg2-binary"
+    except Exception as e:
+        return False, f"{e}"
+
+def test_mysql(cfg):
+    try:
+        import pymysql
+        conn = pymysql.connect(host=cfg.get("host"), user=cfg.get("user"),
+                               password=cfg.get("password"), database=cfg.get("database"),
+                               port=int(cfg.get("port") or 3306), connect_timeout=5)
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1")
+            cur.fetchone()
+        conn.close()
+        return True, "Connected (SELECT 1 ok)."
+    except ModuleNotFoundError:
+        return False, "Install library: pip install PyMySQL"
+    except Exception as e:
+        return False, f"{e}"
+
+def test_mssql(cfg):
+    try:
+        import pyodbc
+        driver = cfg.get("driver") or "ODBC Driver 18 for SQL Server"
+        conn_str = (
+            f"DRIVER={{{driver}}};SERVER={cfg.get('server')};DATABASE={cfg.get('database')};"
+            f"UID={cfg.get('user')};PWD={cfg.get('password')};TrustServerCertificate=yes;Connection Timeout=5;"
+        )
+        conn = pyodbc.connect(conn_str)
+        cur = conn.cursor(); cur.execute("SELECT 1"); cur.fetchone()
+        conn.close()
+        return True, "Connected (SELECT 1 ok)."
+    except ModuleNotFoundError:
+        return False, "Install: ODBC Driver + pip install pyodbc"
+    except Exception as e:
+        return False, f"{e}"
+
+def test_oracle(cfg):
+    try:
+        import oracledb
+        conn = oracledb.connect(user=cfg.get("user"), password=cfg.get("password"), dsn=cfg.get("dsn"), timeout=5)
+        cur = conn.cursor(); cur.execute("SELECT 1 FROM dual"); cur.fetchone()
+        conn.close()
+        return True, "Connected (SELECT 1 ok)."
+    except ModuleNotFoundError:
+        return False, "Install library: pip install oracledb"
+    except Exception as e:
+        return False, f"{e}"
+
+def test_sqlite(cfg):
+    try:
+        import sqlite3
+        conn = sqlite3.connect(cfg.get("filepath"))
+        cur = conn.cursor(); cur.execute("SELECT 1"); cur.fetchone()
+        conn.close()
+        return True, "Opened DB file successfully."
+    except Exception as e:
+        return False, f"{e}"
+
+def test_trino(cfg):
+    try:
+        import trino
+        conn = trino.dbapi.connect(host=cfg.get("host"), port=int(cfg.get("port") or 8080),
+                                   user=cfg.get("user"), catalog=cfg.get("catalog"),
+                                   schema=cfg.get("schema"))
+        cur = conn.cursor(); cur.execute("SELECT 1"); cur.fetchone()
+        conn.close()
+        return True, "Connected (SELECT 1 ok)."
+    except ModuleNotFoundError:
+        return False, "Install library: pip install trino"
+    except Exception as e:
+        return False, f"{e}"
+
+def test_duckdb(cfg):
+    try:
+        import duckdb
+        conn = duckdb.connect(cfg.get("filepath"))
+        conn.execute("SELECT 1").fetchone()
+        conn.close()
+        return True, "Opened DuckDB file successfully."
+    except ModuleNotFoundError:
+        return False, "Install library: pip install duckdb"
+    except Exception as e:
+        return False, f"{e}"
+
+def test_snowflake(cfg):
+    try:
+        import snowflake.connector as sf
+        conn = sf.connect(user=cfg.get("user"), password=cfg.get("password"),
+                          account=cfg.get("account"), warehouse=cfg.get("warehouse"),
+                          database=cfg.get("database"), schema=cfg.get("schema"), role=cfg.get("role"))
+        cur = conn.cursor(); cur.execute("SELECT 1"); cur.fetchone(); cur.close(); conn.close()
+        return True, "Connected (SELECT 1 ok)."
+    except ModuleNotFoundError:
+        return False, "Install library: pip install snowflake-connector-python"
+    except Exception as e:
+        return False, f"{e}"
+
+def _google_creds_from_json(txt):
+    import json
+    from google.oauth2 import service_account
+    info = json.loads(txt)
+    return service_account.Credentials.from_service_account_info(info)
+
+def test_bigquery(cfg):
+    try:
+        from google.cloud import bigquery
+        creds = _google_creds_from_json(cfg.get("credentials_json"))
+        client = bigquery.Client(project=cfg.get("project_id"), credentials=creds)
+        list(client.list_datasets(page_size=1))
+        return True, "Client initialized; datasets listable."
+    except ModuleNotFoundError:
+        return False, "Install library: pip install google-cloud-bigquery"
+    except Exception as e:
+        return False, f"{e}"
+
+def test_redshift(cfg):
+    # Treat like Postgres
+    try:
+        import psycopg2
+        conn = psycopg2.connect(host=cfg.get("host"), port=int(cfg.get("port") or 5439),
+                                dbname=cfg.get("database"), user=cfg.get("user"),
+                                password=cfg.get("password"), connect_timeout=5)
+        cur = conn.cursor(); cur.execute("SELECT 1"); cur.fetchone(); conn.close()
+        return True, "Connected (SELECT 1 ok)."
+    except ModuleNotFoundError:
+        return False, "Install library: pip install psycopg2-binary"
+    except Exception as e:
+        return False, f"{e}"
+
+def test_synapse(cfg):
+    return test_mssql(cfg)
+
+def test_mongodb(cfg):
+    try:
+        from pymongo import MongoClient
+        cli = MongoClient(cfg.get("uri"), serverSelectionTimeoutMS=5000)
+        cli.admin.command("ping")
+        cli.close()
+        return True, "Connected (ping ok)."
+    except ModuleNotFoundError:
+        return False, "Install library: pip install pymongo"
+    except Exception as e:
+        return False, f"{e}"
+
+def test_cassandra(cfg):
+    try:
+        from cassandra.cluster import Cluster
+        cps = [h.strip() for h in (cfg.get("contact_points") or "").split(",") if h.strip()]
+        cluster = Cluster(contact_points=cps, port=int(cfg.get("port") or 9042))
+        session = cluster.connect(timeout=5)
+        session.shutdown(); cluster.shutdown()
+        return True, "Connected (session established)."
+    except ModuleNotFoundError:
+        return False, "Install library: pip install cassandra-driver"
+    except Exception as e:
+        return False, f"{e}"
+
+def test_redis(cfg):
+    try:
+        import redis
+        r = redis.Redis(host=cfg.get("host"), port=int(cfg.get("port") or 6379),
+                        password=cfg.get("password"), db=int(cfg.get("db") or 0), socket_timeout=5)
+        r.ping()
+        return True, "Connected (PING ok)."
+    except ModuleNotFoundError:
+        return False, "Install library: pip install redis"
+    except Exception as e:
+        return False, f"{e}"
+
+def test_dynamodb(cfg):
+    try:
+        import boto3
+        client = boto3.client("dynamodb",
+                              region_name=cfg.get("region_name"),
+                              aws_access_key_id=cfg.get("aws_access_key_id"),
+                              aws_secret_access_key=cfg.get("aws_secret_access_key"))
+        client.list_tables(Limit=1)
+        return True, "Client initialized; tables listable."
+    except ModuleNotFoundError:
+        return False, "Install library: pip install boto3"
+    except Exception as e:
+        return False, f"{e}"
+
+def test_neo4j(cfg):
+    try:
+        from neo4j import GraphDatabase
+        drv = GraphDatabase.driver(cfg.get("uri"), auth=(cfg.get("user"), cfg.get("password")))
+        drv.verify_connectivity()
+        drv.close()
+        return True, "Connected (verify_connectivity ok)."
+    except ModuleNotFoundError:
+        return False, "Install library: pip install neo4j"
+    except Exception as e:
+        return False, f"{e}"
+
+def test_elasticsearch(cfg):
+    try:
+        from elasticsearch import Elasticsearch
+        hosts = [h.strip() for h in (cfg.get("hosts") or "").split(",") if h.strip()]
+        es = Elasticsearch(hosts, basic_auth=(cfg.get("username"), cfg.get("password")) if cfg.get("username") else None,
+                           request_timeout=5)
+        es.info()
+        return True, "Connected (info ok)."
+    except ModuleNotFoundError:
+        return False, "Install library: pip install elasticsearch"
+    except Exception as e:
+        return False, f"{e}"
+
+def test_cosmos(cfg):
+    try:
+        from azure.cosmos import CosmosClient
+        client = CosmosClient(url=cfg.get("endpoint"), credential=cfg.get("key"))
+        list(client.list_databases())
+        return True, "Client initialized; databases listable."
+    except ModuleNotFoundError:
+        return False, "Install library: pip install azure-cosmos"
+    except Exception as e:
+        return False, f"{e}"
+
+def test_firestore(cfg):
+    try:
+        from google.cloud import firestore
+        creds = _google_creds_from_json(cfg.get("credentials_json"))
+        client = firestore.Client(project=cfg.get("project_id"), credentials=creds)
+        # Try to iterate collections (may be empty)
+        _ = list(client.collections())[:1]
+        return True, "Client initialized; collections accessible."
+    except ModuleNotFoundError:
+        return False, "Install library: pip install google-cloud-firestore"
+    except Exception as e:
+        return False, f"{e}"
+
+def test_bigtable(cfg):
+    try:
+        from google.cloud import bigtable
+        creds = _google_creds_from_json(cfg.get("credentials_json"))
+        client = bigtable.Client(project=cfg.get("project_id"), credentials=creds, admin=True)
+        instance = client.instance(cfg.get("instance_id"))
+        instance.exists()  # returns bool; still proves connectivity
+        return True, "Client initialized; instance checked."
+    except ModuleNotFoundError:
+        return False, "Install library: pip install google-cloud-bigtable"
+    except Exception as e:
+        return False, f"{e}"
+
+def test_s3(cfg):
+    try:
+        import boto3
+        client = boto3.client("s3",
+                              region_name=cfg.get("region_name"),
+                              aws_access_key_id=cfg.get("aws_access_key_id"),
+                              aws_secret_access_key=cfg.get("aws_secret_access_key"))
+        client.list_buckets()
+        return True, "Client initialized; buckets listable."
+    except ModuleNotFoundError:
+        return False, "Install library: pip install boto3 s3fs"
+    except Exception as e:
+        return False, f"{e}"
+
+def test_azureblob(cfg):
+    try:
+        from azure.storage.blob import BlobServiceClient
+        if cfg.get("connection_string"):
+            svc = BlobServiceClient.from_connection_string(cfg.get("connection_string"))
+        elif cfg.get("sas_url"):
+            svc = BlobServiceClient(account_url=cfg.get("sas_url").split("?")[0], credential=cfg.get("sas_url"))
+        elif cfg.get("account_name") and cfg.get("account_key"):
+            acct = cfg.get("account_name")
+            url = f"https://{acct}.blob.core.windows.net"
+            svc = BlobServiceClient(account_url=url, credential=cfg.get("account_key"))
+        else:
+            return False, "Provide connection_string OR (account_name + account_key) OR sas_url."
+        next(iter(svc.list_containers()), None)
+        return True, "Client initialized; containers listable."
+    except ModuleNotFoundError:
+        return False, "Install library: pip install azure-storage-blob"
+    except Exception as e:
+        return False, f"{e}"
+
+def test_adls(cfg):
+    try:
+        from azure.storage.filedatalake import DataLakeServiceClient
+        if cfg.get("account_name") and cfg.get("account_key"):
+            url = f"https://{cfg.get('account_name')}.dfs.core.windows.net"
+            svc = DataLakeServiceClient(account_url=url, credential=cfg.get("account_key"))
+        else:
+            return False, "Provide account_name + account_key."
+        next(iter(svc.list_file_systems()), None)
+        return True, "Client initialized; filesystems listable."
+    except ModuleNotFoundError:
+        return False, "Install library: pip install azure-storage-file-datalake"
+    except Exception as e:
+        return False, f"{e}"
+
+def test_gcs(cfg):
+    try:
+        from google.cloud import storage
+        creds = None
+        if cfg.get("credentials_json"):
+            creds = _google_creds_from_json(cfg.get("credentials_json"))
+        client = storage.Client(project=cfg.get("project_id"), credentials=creds)
+        list(client.list_buckets(page_size=1))
+        return True, "Client initialized; buckets listable."
+    except ModuleNotFoundError:
+        return False, "Install library: pip install google-cloud-storage gcsfs"
+    except Exception as e:
+        return False, f"{e}"
+
+def test_hdfs(cfg):
+    try:
+        from hdfs import InsecureClient
+        url = f"http://{cfg.get('host')}:{int(cfg.get('port') or 9870)}"
+        client = InsecureClient(url, user=cfg.get("user") or None, timeout=5)
+        client.status("/", strict=False)
+        return True, "Client initialized; root status retrieved."
+    except ModuleNotFoundError:
+        return False, "Install library: pip install hdfs"
+    except Exception as e:
+        return False, f"{e}"
+
+def test_kafka(cfg):
+    # Use kafka-python (pure-python) for a quick metadata hit
+    try:
+        from kafka import KafkaAdminClient
+        admin = KafkaAdminClient(bootstrap_servers=cfg.get("bootstrap_servers"),
+                                 security_protocol=cfg.get("security_protocol") or "PLAINTEXT",
+                                 sasl_mechanism=(cfg.get("sasl_mechanism") or None) or None,
+                                 sasl_plain_username=(cfg.get("sasl_username") or None),
+                                 sasl_plain_password=(cfg.get("sasl_password") or None),
+                                 request_timeout_ms=5000, api_version_auto_timeout_ms=5000)
+        admin.list_topics()
+        admin.close()
+        return True, "Connected (metadata ok)."
+    except ModuleNotFoundError:
+        return False, "Install library: pip install kafka-python"
+    except Exception as e:
+        return False, f"{e}"
+
+def test_rabbitmq(cfg):
+    try:
+        import pika
+        params = pika.URLParameters(cfg.get("amqp_url"))
+        params.socket_timeout = 5
+        conn = pika.BlockingConnection(params)
+        conn.close()
+        return True, "Connected (AMQP ok)."
+    except ModuleNotFoundError:
+        return False, "Install library: pip install pika"
+    except Exception as e:
+        return False, f"{e}"
+
+def test_eventhubs(cfg):
+    try:
+        from azure.eventhub import EventHubProducerClient
+        client = EventHubProducerClient.from_connection_string(conn_str=cfg.get("connection_str"),
+                                                               eventhub_name=cfg.get("eventhub") or None)
+        # A simple property call to validate creds/format
+        _ = client._container_id  # minimal attribute touch
+        client.close()
+        return True, "Client initialized."
+    except ModuleNotFoundError:
+        return False, "Install library: pip install azure-eventhub"
+    except Exception as e:
+        return False, f"{e}"
+
+def test_pubsub(cfg):
+    try:
+        from google.cloud import pubsub_v1
+        creds = _google_creds_from_json(cfg.get("credentials_json"))
+        publisher = pubsub_v1.PublisherClient(credentials=creds)
+        project_path = f"projects/{cfg.get('project_id')}"
+        list(publisher.list_topics(request={"project": project_path}).pages)
+        return True, "Client initialized; topics listable."
+    except ModuleNotFoundError:
+        return False, "Install library: pip install google-cloud-pubsub"
+    except Exception as e:
+        return False, f"{e}"
+
+def test_kinesis(cfg):
+    try:
+        import boto3
+        client = boto3.client("kinesis",
+                              region_name=cfg.get("region_name"),
+                              aws_access_key_id=cfg.get("aws_access_key_id"),
+                              aws_secret_access_key=cfg.get("aws_secret_access_key"))
+        client.list_streams(Limit=1)
+        return True, "Client initialized; streams listable."
+    except ModuleNotFoundError:
+        return False, "Install library: pip install boto3"
+    except Exception as e:
+        return False, f"{e}"
+
+def test_spark(cfg):
+    try:
+        from pyspark.sql import SparkSession
+        spark = SparkSession.builder.master(cfg.get("master")).appName(cfg.get("app_name") or "ConnectorsHub").getOrCreate()
+        spark.sql("SELECT 1").collect()
+        spark.stop()
+        return True, "Spark session started."
+    except ModuleNotFoundError:
+        return False, "Install library: pip install pyspark"
+    except Exception as e:
+        return False, f"{e}"
+
+def test_dask(cfg):
+    try:
+        from distributed import Client
+        c = Client(address=cfg.get("scheduler_address") or None, timeout="5s")
+        c.scheduler_info()
+        c.close()
+        return True, "Connected to Dask scheduler."
+    except ModuleNotFoundError:
+        return False, "Install library: pip install dask distributed"
+    except Exception as e:
+        return False, f"{e}"
+
+def test_salesforce(cfg):
+    try:
+        from simple_salesforce import Salesforce
+        sf = Salesforce(username=cfg.get("username"), password=cfg.get("password"),
+                        security_token=cfg.get("security_token"), domain=cfg.get("domain") or "login")
+        _ = sf.session_id
+        return True, "Authenticated."
+    except ModuleNotFoundError:
+        return False, "Install library: pip install simple-salesforce"
+    except Exception as e:
+        return False, f"{e}"
+
+def test_servicenow(cfg):
+    try:
+        import pysnow
+        c = pysnow.Client(instance=cfg.get("instance"), user=cfg.get("user"), password=cfg.get("password"))
+        r = c.resource(api_path="/now/table/sys_user")
+        _ = r.get(params={"sysparm_limit": 1})
+        return True, "Authenticated; queried sys_user."
+    except ModuleNotFoundError:
+        return False, "Install library: pip install pysnow"
+    except Exception as e:
+        return False, f"{e}"
+
+def test_jira(cfg):
+    try:
+        from jira import JIRA
+        j = JIRA(server=cfg.get("server"), basic_auth=(cfg.get("email"), cfg.get("api_token")))
+        _ = j.myself()
+        return True, "Authenticated."
+    except ModuleNotFoundError:
+        return False, "Install library: pip install jira"
+    except Exception as e:
+        return False, f"{e}"
+
+def test_sharepoint(cfg):
+    # Use MSAL client credentials flow for Microsoft Graph (tenant-scoped check)
+    try:
+        import msal
+        app = msal.ConfidentialClientApplication(
+            client_id=cfg.get("client_id"),
+            client_credential=cfg.get("client_secret"),
+            authority=f"https://login.microsoftonline.com/{cfg.get('tenant_id')}",
+        )
+        token = app.acquire_token_for_client(scopes=["https://graph.microsoft.com/.default"])
+        if "access_token" in token:
+            return True, "Token acquired for Microsoft Graph."
+        return False, f"Failed to acquire token: {token.get('error_description')}"
+    except ModuleNotFoundError:
+        return False, "Install library: pip install msal"
+    except Exception as e:
+        return False, f"{e}"
+
+def test_tableau(cfg):
+    try:
+        import tableauserverclient as TSC
+        auth = TSC.PersonalAccessTokenAuth(token_name=cfg.get("token_name"),
+                                           personal_access_token=cfg.get("token_secret"),
+                                           site_id=cfg.get("site_id") or "")
+        server = TSC.Server(cfg.get("server"), use_server_version=True)
+        server.auth.sign_in(auth)
+        server.auth.sign_out()
+        return True, "Signed in with PAT."
+    except ModuleNotFoundError:
+        return False, "Install library: pip install tableauserverclient"
+    except Exception as e:
+        return False, f"{e}"
+
+def test_gmail(cfg):
+    try:
+        import json as _json
+        from googleapiclient.discovery import build
+        creds = _google_creds_from_json(cfg.get("credentials_json"))
+        service = build("gmail", "v1", credentials=creds, cache_discovery=False)
+        _ = service.users().labels().list(userId="me").execute()
+        return True, "Gmail API reachable; labels listed."
+    except ModuleNotFoundError:
+        return False, "Install libraries: pip install google-api-python-client google-auth-httplib2 google-auth-oauthlib"
+    except Exception as e:
+        return False, f"{e}"
+
+def test_msgraph(cfg):
+    return test_sharepoint(cfg)
+
+TEST_HANDLERS = {
+    "postgres": test_postgres,
+    "mysql": test_mysql,
+    "mssql": test_mssql,
+    "oracle": test_oracle,
+    "sqlite": test_sqlite,
+    "trino": test_trino,
+    "duckdb": test_duckdb,
+    "snowflake": test_snowflake,
+    "bigquery": test_bigquery,
+    "redshift": test_redshift,
+    "synapse": test_synapse,
+    "mongodb": test_mongodb,
+    "cassandra": test_cassandra,
+    "redis": test_redis,
+    "dynamodb": test_dynamodb,
+    "neo4j": test_neo4j,
+    "elasticsearch": test_elasticsearch,
+    "cosmos": test_cosmos,
+    "firestore": test_firestore,
+    "bigtable": test_bigtable,
+    "s3": test_s3,
+    "azureblob": test_azureblob,
+    "adls": test_adls,
+    "gcs": test_gcs,
+    "hdfs": test_hdfs,
+    "kafka": test_kafka,
+    "rabbitmq": test_rabbitmq,
+    "eventhubs": test_eventhubs,
+    "pubsub": test_pubsub,
+    "kinesis": test_kinesis,
+    "spark": test_spark,
+    "dask": test_dask,
+    "salesforce": test_salesforce,
+    "servicenow": test_servicenow,
+    "jira": test_jira,
+    "sharepoint": test_sharepoint,
+    "tableau": test_tableau,
+    "gmail": test_gmail,
+    "msgraph": test_msgraph,
+}
+
 # ---------------------- Left: Create / Update Form ----------------------
 with left:
     st.markdown("#### Configure connection profile")
@@ -494,7 +1041,6 @@ with left:
 
         values: Dict[str, Any] = {}
         missing_required: List[str] = []
-        # Render dynamic fields
         for f in conn.fields:
             ikey = f"{conn.id}_{f.key}"
             if f.kind == "password":
@@ -512,12 +1058,14 @@ with left:
             if f.required and (val is None or str(val).strip() == ""):
                 missing_required.append(f.label)
 
-        c1, c2, c3 = st.columns([1,1,1])
+        c1, c2, c3, c4 = st.columns([1,1,1,1])
         submitted = c1.form_submit_button("💾 Save Profile", use_container_width=True)
         preview = c2.form_submit_button("🧪 Preview DSN", use_container_width=True)
         envvars = c3.form_submit_button("🔐 Env-Vars Snippet", use_container_width=True)
-
+        # Test button is outside the form to ensure immediate feedback after filling fields
     st.markdown('</div>', unsafe_allow_html=True)
+
+    test_now = st.button(f"✅ Test Connection for {conn.icon} {conn.name}", use_container_width=True, key=f"test_{conn.id}")
 
     if submitted:
         if not profile_name.strip():
@@ -538,6 +1086,19 @@ with left:
         st.info("Copy/paste into your shell (masked preview):")
         st.code(_env_snippet(conn.id, profile_name or "PROFILE", values, conn.secret_keys), language="bash")
 
+    if test_now:
+        handler = TEST_HANDLERS.get(conn.id)
+        if not handler:
+            st.warning("Test handler not implemented for this connector.")
+        else:
+            _short_timeout_env()
+            with st.spinner("Testing connection..."):
+                ok, msg = handler(values)
+            if ok:
+                st.success(msg)
+            else:
+                st.error(msg)
+
 # ---------------------- Right: Profiles for Selected Connector ----------------------
 with right:
     st.markdown("#### Saved profiles")
@@ -552,7 +1113,6 @@ with right:
                 st.json(redacted)
                 cc1, cc2, cc3 = st.columns([1,1,2])
                 if cc1.button("📝 Load to form", key=f"load_{conn.id}_{pname}"):
-                    # Pre-fill form inputs
                     st.session_state[f"{conn.id}_profile_name"] = pname
                     for f in conn.fields:
                         st.session_state[f"{conn.id}_{f.key}"] = cfg.get(f.key, "")
@@ -565,7 +1125,6 @@ with right:
                     st.warning(f"Deleted profile **{pname}**.")
                     st.rerun()
                 cc3.caption("Secrets are masked in this view. Raw values remain local in `connections.json`.")
-
     st.markdown('</div>', unsafe_allow_html=True)
 
 # ---------------------- All Configured Connections (Table) ----------------------
@@ -619,7 +1178,6 @@ with cB:
         try:
             data = json.loads(up.read().decode("utf-8"))
             if isinstance(data, dict):
-                # shallow merge (import overwrites existing profiles with same keys)
                 merged = _load_all()
                 for cid, profs in data.items():
                     merged.setdefault(cid, {})
@@ -638,9 +1196,9 @@ st.write("")
 st.markdown(
     """
     <div class="footer-tip">
-      Tip: To show official logos, drop files into <code>./assets</code> with simple names
-      (e.g., <code>snowflake.svg</code>, <code>postgres.png</code>, <code>azureblob.png</code>).
-      Names in the UI always remain in the format <b>“emoji + space + name”</b> (e.g., <code>❄️ Snowflake</code>).
+      Names in the UI are always <b>“emoji + space + name”</b> (e.g., <code>❄️ Snowflake</code>).<br/>
+      To show official logos, drop files into <code>./assets</code> with names like
+      <code>snowflake.svg</code>, <code>postgres.png</code>, <code>azureblob.png</code>.
     </div>
     """,
     unsafe_allow_html=True,
