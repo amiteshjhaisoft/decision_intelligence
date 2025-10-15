@@ -64,6 +64,11 @@ try:
 except Exception:
     Tenant = None
 
+# add near the top with other v4 imports
+try:
+    from weaviate.classes.query import MetadataQuery
+except Exception:
+    MetadataQuery = None
 
 
 # ---------------------- App constants ----------------------
@@ -410,41 +415,58 @@ def upsert_chunks(client: Any, class_name: str, items: List[Dict[str, Any]], vec
 
 def vector_search(client: Any, class_name: str, query_vec: List[float], top_k: int, tenancy: Optional[str] = None) -> List[Dict[str, Any]]:
     if V4:
-        # Bind tenant here; do NOT pass tenant= into near_vector
+        # bind tenant on the handle (don’t pass tenant= to methods)
         col = client.collections.get(class_name, tenant=tenancy) if tenancy else client.collections.get(class_name)
-        res = col.query.near_vector(
-            vector=query_vec,
-            limit=top_k,
-            return_metadata=["distance"],
-            return_properties=["doc_id", "source", "chunk_index", "text"],
-        )
-        out = []
+
+        # build metadata request in a way all v4 minors accept
+        meta = MetadataQuery(distance=True) if MetadataQuery else None
+
+        # some v4.x expect `vector=`, others `near_vector=`; try both
+        try:
+            res = col.query.near_vector(
+                vector=query_vec,
+                limit=top_k,
+                return_properties=["doc_id", "source", "chunk_index", "text"],
+                return_metadata=meta,
+            )
+        except TypeError:
+            # fallback signature
+            res = col.query.near_vector(
+                near_vector=query_vec,
+                limit=top_k,
+                return_properties=["doc_id", "source", "chunk_index", "text"],
+                return_metadata=meta,
+            )
+
+        out: List[Dict[str, Any]] = []
         for o in res.objects:
             props = o.properties or {}
-            dist = o.metadata.distance if getattr(o, "metadata", None) else None
+            dist = getattr(getattr(o, "metadata", None), "distance", None)
             out.append({
                 "doc_id": props.get("doc_id"),
                 "source": props.get("source"),
                 "chunk_index": props.get("chunk_index"),
                 "text": props.get("text"),
-                "score": 1.0 - dist if dist is not None else None,
+                "score": (1.0 - dist) if isinstance(dist, (float, int)) else None,
             })
         return out
-    else:
-        res = (
-            client.query
-            .get(class_name, ["doc_id", "source", "chunk_index", "text"])
-            .with_near_vector({"vector": query_vec})
-            .with_limit(top_k)
-            .do()
-        )
-        hits = res.get("data", {}).get("Get", {}).get(class_name, []) or []
-        return [
-            {"doc_id": h.get("doc_id"), "source": h.get("source"),
-             "chunk_index": h.get("chunk_index"), "text": h.get("text"),
-             "score": None}
-            for h in hits
-        ]
+
+    # ---- v3 fallback ----
+    res = (
+        client.query
+        .get(class_name, ["doc_id", "source", "chunk_index", "text"])
+        .with_near_vector({"vector": query_vec})
+        .with_limit(top_k)
+        .do()
+    )
+    hits = res.get("data", {}).get("Get", {}).get(class_name, []) or []
+    return [
+        {"doc_id": h.get("doc_id"), "source": h.get("source"),
+         "chunk_index": h.get("chunk_index"), "text": h.get("text"),
+         "score": None}
+        for h in hits
+    ]
+
 
 
 # ---------------------- Embeddings ----------------------
