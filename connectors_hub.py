@@ -416,6 +416,9 @@ for c in REGISTRY:
 CATEGORIES = sorted(REG_BY_CAT.keys())
 
 # ---------------------- Sidebar ----------------------
+# ---- Branding --------------------------------------------------------
+if Path("assets/logo.png").exists():
+    st.image("assets/logo.png", caption="iSOFT ANZ Pvt Ltd", use_container_width=True)
 st.sidebar.markdown("### 🔎 Search")
 q = st.sidebar.text_input("Search connectors", placeholder="snowflake, postgres, blob, kafka...").strip().lower()
 
