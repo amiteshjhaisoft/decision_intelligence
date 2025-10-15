@@ -1,14 +1,10 @@
 # Author: Amitesh Jha | iSoft | 2025-10-12
 # Streamlit RAG chat — Azure Blob → Weaviate (hybrid) → (optional) Cross-Encoder rerank → Claude (grounded-only)
-# - No LLM-aided retrieval (no Query Expansion, no HyDE). Retrieval is strictly from your KB.
-# - Wide file-type support (text/code/pdf/docx/pptx/xlsx/csv/html + image OCR + audio/video ASR where available)
-# - Robust Weaviate v4/v3 connection, multi-tenancy compatible
-# - Safer chat bubbles (HTML-escaped content to prevent invalid tag injections)
-# - Decision Intelligence modes, strictness knob, neighbor stitching, per-source caps, citation validator
+# Now with DI Agent: Plan → Retrieve → Validate → Act (KB-only skills) → Respond (+ exports)
 
 from __future__ import annotations
 
-import io, os, json, socket, ssl, tempfile, re, html
+import io, os, json, socket, ssl, tempfile, re, html, math, statistics, datetime as dt
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
@@ -1004,10 +1000,203 @@ if do_ingest:
             total = ingest_from_azure_to_weaviate(connection_string, container, prefix, w_client, tenancy=w_tenancy, status_cb=_status)
         st.success(f"Done. Upserted {total} chunks.")
 
+
+# ====================== DI AGENT: Skills (deterministic, KB-only) ======================
+NUM_PAT = re.compile(r"[-+]?\d{1,3}(?:,\d{3})*(?:\.\d+)?")
+DATE_PAT = re.compile(r"\b(20\d{2}[-/]\d{1,2}[-/]\d{1,2}|\d{1,2}[-/]\d{1,2}[-/](20\d{2}))\b")
+
+def _norm_num(s: str) -> Optional[float]:
+    try:
+        return float(s.replace(",", ""))
+    except Exception:
+        return None
+
+def _collect_numbers(texts: List[str]) -> List[float]:
+    vals = []
+    for t in texts:
+        for m in NUM_PAT.findall(t or ""):
+            v = _norm_num(m)
+            if v is not None:
+                vals.append(v)
+    return vals
+
+def _collect_kv_candidates(texts: List[str]) -> Dict[str, Dict[str, str]]:
+    """
+    Extract naive key: value pairs (e.g., 'Cost: $1200', 'Latency = 50ms') grouped by 'option'
+    Heuristic: lines that start with a token capitalized may be option; else try to detect 'Option A' etc.
+    """
+    options: Dict[str, Dict[str, str]] = {}
+    cur = None
+    for t in texts:
+        for line in (t or "").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            if re.match(r"^(Option|Plan|Model|Vendor|Tool|Service)\s+[\w\-\.]+", line, re.I):
+                cur = line.split()[0] + " " + " ".join(line.split()[1:2])
+                options.setdefault(cur, {})
+                continue
+            m = re.match(r"^([\w\s\-/]+)[:=]\s*(.+)$", line)
+            if m:
+                k = m.group(1).strip()
+                v = m.group(2).strip()
+                if cur is None:
+                    cur = "Item"
+                    options.setdefault(cur, {})
+                options[cur][k] = v
+    return options
+
+def _collect_dates(texts: List[str]) -> List[str]:
+    ds = []
+    for t in texts:
+        ds.extend(DATE_PAT.findall(t or ""))
+    # flatten tuples, normalize
+    flat = []
+    for d in ds:
+        if isinstance(d, tuple):
+            d = d[0] or d[1]
+        flat.append(str(d))
+    return flat
+
+def skill_summary_bullets(passages: List[Dict[str, Any]]) -> str:
+    bullets = []
+    for i, p in enumerate(passages, 1):
+        txt = (p.get("text") or "").strip()
+        if not txt:
+            continue
+        # take first 1-2 sentences
+        chunk = re.split(r"(?<=[.!?])\s+", txt)[:2]
+        if chunk:
+            bullets.append(f"• {chunk[0].strip()} [{i}]")
+    return "\n".join(bullets[:12]) if bullets else ""
+
+def skill_compare_table(passages: List[Dict[str, Any]]) -> Optional[str]:
+    texts = [p.get("text") or "" for p in passages]
+    kv = _collect_kv_candidates(texts)
+    if not kv:
+        return None
+    # Collect columns
+    all_keys = set()
+    for d in kv.values():
+        all_keys.update(d.keys())
+    cols = ["Option"] + sorted(all_keys)
+    # Build markdown table
+    lines = [" | ".join(cols), " | ".join(["---"] * len(cols))]
+    for opt, vals in kv.items():
+        row = [opt] + [vals.get(k, "") for k in sorted(all_keys)]
+        lines.append(" | ".join(row))
+    return "\n".join(lines)
+
+def skill_decision_matrix(passages: List[Dict[str, Any]]) -> Optional[str]:
+    texts = [p.get("text") or "" for p in passages]
+    kv = _collect_kv_candidates(texts)
+    if not kv:
+        return None
+    crit = sorted({k for d in kv.values() for k in d.keys()})
+    opts = sorted(kv.keys())
+    if not crit or not opts:
+        return None
+    # Simple unweighted presence matrix (✓ if value present)
+    lines = ["Criteria \\ Option | " + " | ".join(opts),
+             " | ".join(["---"] * (len(opts) + 1))]
+    for c in crit:
+        row = [c]
+        for o in opts:
+            row.append("✓" if kv[o].get(c) else "")
+        lines.append(" | ".join(row))
+    return "\n".join(lines)
+
+def skill_fact_extract_json(passages: List[Dict[str, Any]]) -> Optional[str]:
+    texts = [p.get("text") or "" for p in passages]
+    kv = _collect_kv_candidates(texts)
+    if not kv:
+        return None
+    return json.dumps(kv, indent=2, ensure_ascii=False)
+
+def _au_date(s: str) -> Optional[str]:
+    # Normalize to ISO if possible; be liberal
+    try:
+        if "-" in s or "/" in s:
+            for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%Y/%m/%d", "%d/%m/%Y", "%m/%d/%Y", "%d/%m/%y"):
+                try:
+                    dtobj = dt.datetime.strptime(s.replace("/", "-"), fmt)
+                    return dtobj.date().isoformat()
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return None
+
+def skill_action_items(passages: List[Dict[str, Any]]) -> Optional[str]:
+    out = []
+    for i, p in enumerate(passages, 1):
+        txt = (p.get("text") or "")
+        for line in txt.splitlines():
+            if re.search(r"\b(action|todo|task|owner|due|deadline|assign)\b", line, re.I):
+                dts = _collect_dates([line])
+                iso = _au_date(dts[0]) if dts else ""
+                line = re.sub(r"\s+\[\d+\]$", "", line.strip())
+                out.append(f"• {line} {('— Due: ' + iso) if iso else ''} [{i}]")
+    return "\n".join(out[:20]) if out else None
+
+def skill_calc(passages: List[Dict[str, Any]]) -> Optional[str]:
+    texts = [p.get("text") or "" for p in passages]
+    nums = _collect_numbers(texts)
+    if not nums:
+        return None
+    try:
+        total = sum(nums)
+        avg = statistics.mean(nums)
+        mx = max(nums); mn = min(nums)
+        return f"Computed from context numbers: count={len(nums)}, total={total:.4g}, avg={avg:.4g}, min={mn:.4g}, max={mx:.4g}"
+    except Exception:
+        return None
+
+
+# ====================== DI AGENT: Orchestration ======================
+def agent_plan(mode: str) -> List[str]:
+    """Return ordered skill names to run before/alongside LLM based on mode."""
+    if mode == "Summary":
+        return ["summary"]
+    if mode == "Compare":
+        return ["compare", "calc"]
+    if mode == "Decision Matrix":
+        return ["decision_matrix", "calc"]
+    if mode == "Fact Extract":
+        return ["fact_json"]
+    if mode == "Action Items":
+        return ["actions"]
+    return ["calc"]  # Direct Answer -> calc (optional)
+
+def agent_act(skills: List[str], passages: List[Dict[str, Any]]) -> Dict[str, str]:
+    """Run deterministic skills and return sidecar artifacts (added to final answer)."""
+    artifacts: Dict[str, str] = {}
+    if "summary" in skills:
+        s = skill_summary_bullets(passages)
+        if s: artifacts["Summary"] = s
+    if "compare" in skills:
+        t = skill_compare_table(passages)
+        if t: artifacts["Comparison"] = t
+    if "decision_matrix" in skills:
+        m = skill_decision_matrix(passages)
+        if m: artifacts["Decision Matrix"] = m
+    if "fact_json" in skills:
+        j = skill_fact_extract_json(passages)
+        if j: artifacts["Facts JSON"] = j
+    if "actions" in skills:
+        a = skill_action_items(passages)
+        if a: artifacts["Action Items"] = a
+    if "calc" in skills:
+        c = skill_calc(passages)
+        if c: artifacts["Calculations"] = c
+    return artifacts
+
+
 # ---------------------- CHAT (Decision-Intelligence Agent) ----------------------
-# Chat state
 if "history" not in st.session_state:
     st.session_state.history = []
+if "last_answer_payload" not in st.session_state:
+    st.session_state.last_answer_payload = None  # for export
 
 def add_history(role: str, content: str, sources: Optional[List[str]] = None):
     st.session_state.history.append({"role": role, "content": content, "sources": sources or []})
@@ -1026,7 +1215,6 @@ def retrieval_quality(hits: List[Dict[str, Any]]) -> Tuple[float, int, int]:
         return (0.0, 0, 0)
     total_chars = sum(len((h.get("text") or "")) for h in hits)
     uniq_sources = len({h.get("source") for h in hits if h.get("source")})
-    # light heuristic: more text, more distinct sources => higher quality
     score = min(1.0, (total_chars / 4000.0) * 0.6 + (uniq_sources / 6.0) * 0.4)
     return (score, total_chars, uniq_sources)
 
@@ -1048,11 +1236,9 @@ def format_context_for_prompt(hits: List[Dict[str, Any]], max_chars: int = 2000)
     return ("\n\n".join(ctx_blocks) if ctx_blocks else "No relevant context retrieved."), chips
 
 def enforce_citations(text: str) -> bool:
-    """Require at least one [n] citation marker; else considered ungrounded."""
     return has_citation(text)
 
 def build_followups(question: str, mode: str, quality: float) -> List[str]:
-    """Suggest next steps to tighten the decision when retrieval is borderline."""
     sugs = []
     if quality < 0.5:
         sugs.append("Sync the Knowledge Base or broaden the prefix to include the missing files.")
@@ -1064,7 +1250,29 @@ def build_followups(question: str, mode: str, quality: float) -> List[str]:
     return sugs[:3]
 
 st.subheader("Chat")
-user_q = st.chat_input("Ask about your Knowledge Base…")
+colL, colR = st.columns([4, 1])
+with colL:
+    user_q = st.chat_input("Ask about your Knowledge Base…")
+with colR:
+    export_md = st.button("⬇️ Export MD")
+    export_json = st.button("⬇️ Export JSON")
+
+if export_md and st.session_state.last_answer_payload:
+    payload = st.session_state.last_answer_payload
+    md = f"# Answer ({payload['mode']})\n\n{payload['final_text']}\n\n## Sources\n" + \
+         "\n".join([f"- {s}" for s in payload.get("sources", [])])
+    if payload.get("artifacts"):
+        md += "\n\n## Agent Artifacts\n"
+        for k, v in payload["artifacts"].items():
+            md += f"\n### {k}\n\n{v}\n"
+    fn = Path(tempfile.gettempdir())/"di_answer.md"
+    fn.write_text(md, encoding="utf-8")
+    st.success(f"Saved: {fn}")
+
+if export_json and st.session_state.last_answer_payload:
+    fn = Path(tempfile.gettempdir())/"di_answer.json"
+    Path(fn).write_text(json.dumps(st.session_state.last_answer_payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    st.success(f"Saved: {fn}")
 
 if user_q:
     add_history("user", user_q)
@@ -1078,7 +1286,10 @@ if user_q:
         add_history("assistant", final_text, [])
         render_msg("assistant", final_text, [])
     else:
-        # 1) Strict non-LLM retrieval (hybrid -> optional rerank -> diversify -> neighbors)
+        # 1) Plan (agent)
+        plan = agent_plan(mode)
+
+        # 2) Retrieve (strict non-LLM)
         q_vec = embed_texts([user_q])[0]
         hits = retrieve_hybrid_then_rerank(
             col,
@@ -1092,16 +1303,14 @@ if user_q:
             downweight_csv=hide_csv_bias,
         )
 
-        # 2) Answerability gate
+        # 3) Validate answerability
         qual, total_chars, uniq_src = retrieval_quality(hits)
         enough = gate_answerability(hits)
 
-        # 3) Build prompts
         system_prompt = build_system_prompt(strictness, mode)
         context_text, source_chips = format_context_for_prompt(hits)
 
         if not enough:
-            # Provide constructive DI-oriented guidance when context is weak
             followups = build_followups(user_q, mode, qual)
             final_text = (
                 "I don’t have enough information in the retrieved context to answer that.\n\n"
@@ -1111,11 +1320,16 @@ if user_q:
             ).strip()
             add_history("assistant", final_text, source_chips)
             render_msg("assistant", final_text, source_chips)
+            st.session_state.last_answer_payload = {
+                "mode": mode, "question": user_q, "final_text": final_text,
+                "sources": source_chips, "artifacts": {}, "answerable": False
+            }
         else:
-            # 4) Compose user prompt (KB-only)
-            user_prompt, chips = build_user_prompt(user_q, hits)
+            # 4) Act (run deterministic skills pre-LLM)
+            artifacts = agent_act(plan, hits)
 
-            # 5) Stream the grounded DI answer
+            # 5) Compose LLM prompt and stream KB-grounded answer
+            user_prompt, chips = build_user_prompt(user_q, hits)
             with st.chat_message("assistant"):
                 placeholder = st.empty()
                 try:
@@ -1126,21 +1340,21 @@ if user_q:
                                 delta_text = getattr(getattr(event, "delta", None), "text", None)
                                 if delta_text:
                                     text_accum += delta_text
-                                    # Always escape to prevent HTML tag injection into bubble
                                     placeholder.markdown(
                                         f"<div class='chat-bubble-assistant'>{esc(text_accum)}</div>",
                                         unsafe_allow_html=True
                                     )
                         final_text = (text_accum or "").strip() or "I couldn't generate a response."
-
-                        # 6) Grounding enforcement: must include [n] style citations
                         if not enforce_citations(final_text):
                             final_text = (
                                 "I don’t have enough information in the context to answer with citations. "
                                 "Please sync the KB or ask a narrower question."
                             )
-
-                        # Render final
+                        # If we produced artifacts, append them neatly
+                        if artifacts:
+                            final_text += "\n\n---\n**Agent Artifacts (KB-only):**\n"
+                            for k, v in artifacts.items():
+                                final_text += f"\n**{k}**\n\n{v}\n"
                         placeholder.markdown(
                             f"<div class='chat-bubble-assistant'>{esc(final_text)}</div>",
                             unsafe_allow_html=True
@@ -1154,6 +1368,10 @@ if user_q:
 
             add_history("assistant", final_text, source_chips)
             render_msg("assistant", final_text, source_chips)
+            st.session_state.last_answer_payload = {
+                "mode": mode, "question": user_q, "final_text": final_text,
+                "sources": source_chips, "artifacts": artifacts, "answerable": True
+            }
 
 # History (last 8 turns)
 if st.session_state.history:
