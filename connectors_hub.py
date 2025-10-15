@@ -12,19 +12,24 @@ from __future__ import annotations
 import base64
 import json
 import os
-import socket
-import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import pandas as pd
 import streamlit as st
 
 APP_TITLE = "🔌 Data Connectors Hub"
 APP_TAGLINE = "Configure, validate, and organize connection profiles for databases, warehouses, NoSQL, storage, streaming, and SaaS."
-CONN_STORE = Path("./connections.json")
-ASSETS_DIR = Path("./assets")  # optional logo files
+
+# Resolve paths robustly (works on local + Streamlit Cloud)
+try:
+    APP_DIR = Path(__file__).parent
+except NameError:
+    APP_DIR = Path.cwd()
+
+CONN_STORE = APP_DIR / "connections.json"
+ASSETS_DIR = APP_DIR / "assets"  # optional logo files
 
 # ---------------------- Page Config & Global Style ----------------------
 st.set_page_config(page_title="Connectors Hub", layout="wide", page_icon="🔌")
@@ -194,8 +199,21 @@ def _dsn_preview(conn_id: str, cfg: Dict[str, Any]) -> str:
     return "(preview unavailable)"
 
 def _short_timeout_env():
-    # Some SDKs read env for timeouts/SSL. We keep it minimal and safe.
     os.environ.setdefault("GRPC_VERBOSITY", "ERROR")
+
+# --- New: helpers to enforce Test-before-Save ---
+def _config_signature(cfg: Dict[str, Any]) -> str:
+    try:
+        return json.dumps(cfg, sort_keys=True, separators=(",", ":"))
+    except Exception:
+        return str(cfg)
+
+def _get_state_keys(conn_id: str) -> Dict[str, str]:
+    return {
+        "ok":  f"{conn_id}_last_test_ok",
+        "msg": f"{conn_id}_last_test_msg",
+        "sig": f"{conn_id}_last_test_sig",
+    }
 
 # ---------------------- Schema / Registry ----------------------
 @dataclass
@@ -218,7 +236,6 @@ class Connector:
     logo_key: Optional[str] = None  # for optional thumbnail (./assets/{logo_key}.svg|png)
 
 def F(key: str, label: str, **kw) -> Field:
-    # NOTE: Use keyword args like required=True, kind="password"
     return Field(key=key, label=label, **kw)
 
 REGISTRY: List[Connector] = [
@@ -418,9 +435,11 @@ CATEGORIES = sorted(REG_BY_CAT.keys())
 # ---------------------- Sidebar ----------------------
 with st.sidebar:
     # ---- Branding ----------------------------------------------------
-    logo_path = Path("assets/logo.png")
-    if logo_path.exists():
+    logo_path = ASSETS_DIR / "logo.png"
+    if logo_path.is_file():
         st.image(str(logo_path), caption="iSOFT ANZ Pvt Ltd", use_container_width=True)
+    else:
+        st.caption("")
 
     st.markdown("### 🔎 Search")
     q = st.text_input(
@@ -615,7 +634,6 @@ def test_bigquery(cfg):
         return False, f"{e}"
 
 def test_redshift(cfg):
-    # Treat like Postgres
     try:
         import psycopg2
         conn = psycopg2.connect(host=cfg.get("host"), port=int(cfg.get("port") or 5439),
@@ -723,7 +741,6 @@ def test_firestore(cfg):
         from google.cloud import firestore
         creds = _google_creds_from_json(cfg.get("credentials_json"))
         client = firestore.Client(project=cfg.get("project_id"), credentials=creds)
-        # Try to iterate collections (may be empty)
         _ = list(client.collections())[:1]
         return True, "Client initialized; collections accessible."
     except ModuleNotFoundError:
@@ -737,7 +754,7 @@ def test_bigtable(cfg):
         creds = _google_creds_from_json(cfg.get("credentials_json"))
         client = bigtable.Client(project=cfg.get("project_id"), credentials=creds, admin=True)
         instance = client.instance(cfg.get("instance_id"))
-        instance.exists()  # returns bool; still proves connectivity
+        instance.exists()
         return True, "Client initialized; instance checked."
     except ModuleNotFoundError:
         return False, "Install library: pip install google-cloud-bigtable"
@@ -820,7 +837,6 @@ def test_hdfs(cfg):
         return False, f"{e}"
 
 def test_kafka(cfg):
-    # Use kafka-python (pure-python) for a quick metadata hit
     try:
         from kafka import KafkaAdminClient
         admin = KafkaAdminClient(bootstrap_servers=cfg.get("bootstrap_servers"),
@@ -855,8 +871,7 @@ def test_eventhubs(cfg):
         from azure.eventhub import EventHubProducerClient
         client = EventHubProducerClient.from_connection_string(conn_str=cfg.get("connection_str"),
                                                                eventhub_name=cfg.get("eventhub") or None)
-        # A simple property call to validate creds/format
-        _ = client._container_id  # minimal attribute touch
+        _ = client._container_id
         client.close()
         return True, "Client initialized."
     except ModuleNotFoundError:
@@ -951,7 +966,6 @@ def test_jira(cfg):
         return False, f"{e}"
 
 def test_sharepoint(cfg):
-    # Use MSAL client credentials flow for Microsoft Graph (tenant-scoped check)
     try:
         import msal
         app = msal.ConfidentialClientApplication(
@@ -985,7 +999,6 @@ def test_tableau(cfg):
 
 def test_gmail(cfg):
     try:
-        import json as _json
         from googleapiclient.discovery import build
         creds = _google_creds_from_json(cfg.get("credentials_json"))
         service = build("gmail", "v1", credentials=creds, cache_discovery=False)
@@ -1045,6 +1058,12 @@ TEST_HANDLERS = {
 with left:
     st.markdown("#### Configure connection profile")
     st.markdown('<div class="card">', unsafe_allow_html=True)
+
+    # session keys for test status
+    _keys = _get_state_keys(conn.id)
+    for k in _keys.values():
+        st.session_state.setdefault(k, None)
+
     with st.form(key=f"form_{conn.id}", clear_on_submit=False):
         profile_name = st.text_input("Profile Name", placeholder="dev / staging / prod", key=f"{conn.id}_profile_name")
 
@@ -1067,25 +1086,43 @@ with left:
             if f.required and (val is None or str(val).strip() == ""):
                 missing_required.append(f.label)
 
+        # Actions inside the form (so testing uses the current inputs)
         c1, c2, c3, c4 = st.columns([1,1,1,1])
         submitted = c1.form_submit_button("💾 Save Profile", use_container_width=True)
-        preview = c2.form_submit_button("🧪 Preview DSN", use_container_width=True)
-        envvars = c3.form_submit_button("🔐 Env-Vars Snippet", use_container_width=True)
-        # Test button is outside the form to ensure immediate feedback after filling fields
+        preview   = c2.form_submit_button("🧪 Preview DSN", use_container_width=True)
+        envvars   = c3.form_submit_button("🔐 Env-Vars Snippet", use_container_width=True)
+        test_clicked = c4.form_submit_button("✅ Test Connection", use_container_width=True)
+
     st.markdown('</div>', unsafe_allow_html=True)
 
-    test_now = st.button(f"✅ Test Connection for {conn.icon} {conn.name}", use_container_width=True, key=f"test_{conn.id}")
-
-    if submitted:
-        if not profile_name.strip():
-            st.error("Please provide a **Profile Name**.")
-        elif missing_required:
-            st.error("Missing required fields: " + ", ".join(missing_required))
+    # Handle form actions (after form submit)
+    if test_clicked:
+        handler = TEST_HANDLERS.get(conn.id)
+        if not handler:
+            st.warning("Test handler not implemented for this connector.")
+            st.session_state[_keys["ok"]] = False
+            st.session_state[_keys["msg"]] = "No test available."
+            st.session_state[_keys["sig"]] = _config_signature(values)
         else:
-            all_profiles.setdefault(conn.id, {})
-            all_profiles[conn.id][profile_name] = values
-            _save_all(all_profiles)
-            st.success(f"Saved **{profile_name}** for {conn.icon} {conn.name}.")
+            _short_timeout_env()
+            with st.spinner("Testing connection..."):
+                ok, msg = handler(values)
+            st.session_state[_keys["ok"]] = bool(ok)
+            st.session_state[_keys["msg"]] = msg
+            st.session_state[_keys["sig"]] = _config_signature(values)
+
+    # Status pill (always visible)
+    last_ok  = st.session_state.get(_keys["ok"])
+    last_msg = st.session_state.get(_keys["msg"]) or "Not tested"
+    sig_now  = _config_signature(values)
+    sig_last = st.session_state.get(_keys["sig"])
+
+    if last_ok is True and sig_now == sig_last:
+        st.markdown(f'<span class="pill">✅ Successful</span> <span class="muted small">{last_msg}</span>', unsafe_allow_html=True)
+    elif last_ok is False and sig_now == sig_last:
+        st.markdown(f'<span class="pill" style="background:#FEE2E2;color:#991B1B;">❌ Failed</span> <span class="muted small">{last_msg}</span>', unsafe_allow_html=True)
+    else:
+        st.markdown(f'<span class="pill" style="background:#FFF7ED;color:#9A3412;">⏳ Not tested</span> <span class="muted small">Run “Test Connection” before saving.</span>', unsafe_allow_html=True)
 
     if preview:
         st.info("Indicative DSN/URI preview (no network calls):")
@@ -1095,18 +1132,18 @@ with left:
         st.info("Copy/paste into your shell (masked preview):")
         st.code(_env_snippet(conn.id, profile_name or "PROFILE", values, conn.secret_keys), language="bash")
 
-    if test_now:
-        handler = TEST_HANDLERS.get(conn.id)
-        if not handler:
-            st.warning("Test handler not implemented for this connector.")
+    if submitted:
+        if not profile_name.strip():
+            st.error("Please provide a **Profile Name**.")
+        elif missing_required:
+            st.error("Missing required fields: " + ", ".join(missing_required))
+        elif not (st.session_state.get(_keys["ok"]) is True and st.session_state.get(_keys["sig"]) == _config_signature(values)):
+            st.error("Please **Test Connection** and ensure it is **Successful** for the current values before saving.")
         else:
-            _short_timeout_env()
-            with st.spinner("Testing connection..."):
-                ok, msg = handler(values)
-            if ok:
-                st.success(msg)
-            else:
-                st.error(msg)
+            all_profiles.setdefault(conn.id, {})
+            all_profiles[conn.id][profile_name] = values
+            _save_all(all_profiles)
+            st.success(f"Saved **{profile_name}** for {conn.icon} {conn.name}.")
 
 # ---------------------- Right: Profiles for Selected Connector ----------------------
 with right:
@@ -1199,16 +1236,3 @@ with cB:
         except Exception as e:
             st.error(f"Failed to import: {e}")
     st.markdown('</div>', unsafe_allow_html=True)
-
-# ---------------------- Footer Tip ----------------------
-# st.write("")
-# st.markdown(
-#     """
-#     <div class="footer-tip">
-#       Names in the UI are always <b>“emoji + space + name”</b> (e.g., <code>❄️ Snowflake</code>).<br/>
-#       To show official logos, drop files into <code>./assets</code> with names like
-#       <code>snowflake.svg</code>, <code>postgres.png</code>, <code>azureblob.png</code>.
-#     </div>
-#     """,
-#     unsafe_allow_html=True,
-# )
