@@ -4,6 +4,7 @@
 # - Wide file-type support (text/code/pdf/docx/pptx/xlsx/csv/html + image OCR + audio/video ASR where available)
 # - Robust Weaviate v4/v3 connection, multi-tenancy compatible
 # - Safer chat bubbles (HTML-escaped content to prevent invalid tag injections)
+# - Decision Intelligence modes, strictness knob, neighbor stitching, per-source caps, citation validator
 
 from __future__ import annotations
 
@@ -123,9 +124,6 @@ CHUNK_OVERLAP    = 150
 CANDIDATES_K     = 60     # hybrid recall pool
 FINAL_K_DEFAULT  = 10     # passages sent to LLM
 
-# Chat UI defaults
-TOP_K_DISPLAY    = 5      # legacy knob (not used for retrieval), kept for UI friendliness
-
 # Anthropic model (adjust to your account/allowlist)
 CLAUDE_MODEL     = "claude-3-7-sonnet-20250219"
 
@@ -172,6 +170,9 @@ def _safe_decode(b: bytes, encoding="utf-8") -> str:
 def esc(s: str) -> str:
     """Escape any user/LLM text before putting inside our HTML bubble container."""
     return html.escape(s or "")
+
+def has_citation(text: str) -> bool:
+    return bool(re.search(r"\[\d+\]", text or ""))
 
 
 # --------- Parsers (each returns a TEXT representation suitable for RAG) ----------
@@ -627,7 +628,7 @@ def upsert_chunks(client: Any, class_name: str, items: List[Dict[str, Any]], vec
         return len(items)
 
 
-# ---------------------- Hybrid retrieval → optional rerank → diversify ----------------------
+# ---------------------- Hybrid retrieval → optional rerank → diversify + neighbors ----------------------
 @st.cache_resource(show_spinner=False)
 def get_embedder():
     return SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
@@ -641,6 +642,38 @@ def get_cross_encoder():
     except Exception:
         return None
 
+def _fetch_neighbors(col, class_name: str, hit: Dict[str, Any], window: int) -> List[Dict[str, Any]]:
+    """Fetch ±window neighboring chunks from the same doc_id using a cheap BM25 pass."""
+    if window <= 0:
+        return [hit]
+    doc_id = hit.get("doc_id")
+    idx = hit.get("chunk_index") or 0
+    want = set(range(max(0, idx - window), idx + window + 1))
+    out = [hit]
+    try:
+        res = col.query.bm25(
+            query=str(doc_id),
+            limit=max(10, 3 * window + 1),
+            return_properties=["doc_id", "source", "chunk_index", "text"],
+        )
+        for o in (getattr(res, "objects", None) or []):
+            p = o.properties or {}
+            if p.get("doc_id") != doc_id:
+                continue
+            ci = p.get("chunk_index")
+            if isinstance(ci, int) and ci in want and ci != idx:
+                out.append({
+                    "doc_id": p.get("doc_id"),
+                    "source": p.get("source"),
+                    "chunk_index": ci,
+                    "text": (p.get("text") or "").strip(),
+                    "score": None,
+                })
+    except Exception:
+        pass
+    out = sorted({(r["doc_id"], r["chunk_index"]): r for r in out}.values(), key=lambda r: r.get("chunk_index") or 0)
+    return out
+
 def retrieve_hybrid_then_rerank(
     col,                                 # v4 collection handle (tenant already bound)
     query_text: str,
@@ -649,6 +682,9 @@ def retrieve_hybrid_then_rerank(
     k_final: int = FINAL_K_DEFAULT,
     use_reranker: bool = True,
     max_chars_per_passage: int = 1100,
+    per_source_cap: int = 3,
+    neighbors_window: int = 1,
+    downweight_csv: bool = True,
 ) -> List[Dict[str, Any]]:
 
     # 1) HYBRID (falls back to dense-only if hybrid unavailable)
@@ -687,14 +723,14 @@ def retrieve_hybrid_then_rerank(
         return []
 
     # 2) Lightweight blend score (lower is better)
-    def is_csv(r):
-        s = (r["source"] or "").lower()
+    def is_csv_src(s: str) -> bool:
+        s = (s or "").lower()
         return s.endswith(".csv") or ".csv." in s or s.endswith(".bin")
     def blend(r):
         d = r["dist"] if isinstance(r["dist"], (float, int)) else 1.0
         k = r["kw"]   if isinstance(r["kw"], (float, int)) else 0.0
         val = 0.7 * d + 0.3 * (1.0 - k)
-        if is_csv(r):
+        if downweight_csv and is_csv_src(r.get("source", "")):
             val += 0.05
         return val
     rows.sort(key=blend)
@@ -714,30 +750,40 @@ def retrieve_hybrid_then_rerank(
             except Exception:
                 pass
 
-    # 3) Diversify by source (simple round-robin flavor)
-    seen = set()
-    picked = []
+    # 3) Per-source cap + diversify
+    per_src_counts, picked = {}, []
     for r in rows:
-        src = r["source"]
-        if src in seen and len(picked) < k_final // 2:
+        src = r.get("source")
+        if per_src_counts.get(src, 0) >= per_source_cap:
             continue
-        seen.add(src)
         picked.append(r)
-        if len(picked) >= k_final * 2:
+        per_src_counts[src] = per_src_counts.get(src, 0) + 1
+        if len(picked) >= k_final:
             break
 
-    # 4) Pack
+    # 4) Neighbor stitching
+    stitched = []
+    for r in picked:
+        stitched.extend(_fetch_neighbors(col, CLASS_NAME, r, neighbors_window))
+
+    # 5) Pack & truncate
     out = []
-    for r in picked[:k_final]:
-        txt = r["text"][:max_chars_per_passage]
+    seen_keys = set()
+    for r in stitched:
+        key = (r.get("source"), r.get("chunk_index"))
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        txt = (r.get("text") or "")[:max_chars_per_passage]
         out.append({
-            "doc_id": r["doc_id"],
-            "source": r["source"],
-            "chunk_index": r["chunk_index"],
+            "doc_id": r.get("doc_id"),
+            "source": r.get("source"),
+            "chunk_index": r.get("chunk_index"),
             "text": txt,
             "score": r.get("dist"),
         })
-    return out
+    # keep at most k_final * (1 + 2*neighbors_window)
+    return out[: k_final * (1 + 2*neighbors_window)]
 
 
 def embed_texts(texts: List[str]) -> List[List[float]]:
@@ -815,6 +861,53 @@ def call_claude(api_key: str, system_prompt: str, user_prompt: str, stream: bool
             return str(resp)
 
 
+# ---------------------- Prompts (modes + strictness) ----------------------
+def build_system_prompt(strictness: float, mode: str) -> str:
+    baseline = (
+        "You are a strict, grounded assistant for a Decision Intelligence system.\n"
+        "RULES:\n"
+        "1) Use ONLY the provided passages (KB) for facts.\n"
+        "2) Add citation markers like [1], [2] next to each claim you use.\n"
+        "3) If the passages lack the answer, say: \"I don’t have enough information in the context.\" and stop.\n"
+    )
+    style = (
+        f"Strictness: {strictness:.1f} (1.0 = quote snippets verbatim; 0.0 = freer paraphrase).\n"
+        "Prefer concise, decision-ready language.\n"
+    )
+    if mode == "Summary":
+        task = "Task: Produce a brief, bulleted summary with citations.\n"
+    elif mode == "Compare":
+        task = "Task: Compare key options/entities in a compact table or bullets; every row backed by citations.\n"
+    elif mode == "Decision Matrix":
+        task = ("Task: Build a criteria × options decision matrix from the passages only. "
+                "Propose weights only if weights are explicitly present; otherwise leave weights blank. Include citations.\n")
+    elif mode == "Fact Extract":
+        task = ("Task: Extract key fields as JSON (also print a short human summary). "
+                "Only include fields that appear in the passages. Include citations in the human summary.\n")
+    elif mode == "Action Items":
+        task = "Task: List concrete next actions with owner and date if present; cite each bullet.\n"
+    else:
+        task = "Task: Answer briefly and precisely with citations.\n"
+    return baseline + style + task
+
+def build_user_prompt(question: str, passages: List[Dict[str, Any]]) -> Tuple[str, List[str]]:
+    ctx_blocks, chips = [], []
+    for i, h in enumerate(passages):
+        t = (h.get("text") or "").strip()
+        if not t:
+            continue
+        ctx_blocks.append(f"[{i+1}] Source: {h.get('source')} (chunk {h.get('chunk_index')})\n{t}")
+        if h.get("source"):
+            chips.append(h["source"])
+    context_text = "\n\n".join(ctx_blocks) if ctx_blocks else "No relevant context retrieved."
+    user_prompt = (
+        f"Question:\n{question}\n\n"
+        f"Passages (numbered):\n{context_text}\n\n"
+        "Write the result according to the Task and Rules."
+    )
+    return user_prompt, chips
+
+
 # ---------------------- UI ----------------------
 st.set_page_config(page_title="RAG Chat — Claude + Weaviate + Azure", page_icon="💬", layout="wide")
 
@@ -852,6 +945,18 @@ with st.sidebar:
     cand_k  = st.slider("Candidate pool (hybrid)", 20, 120, CANDIDATES_K, step=10)
     final_k = st.slider("Final passages to LLM", 4, 20, FINAL_K_DEFAULT, step=1)
     use_reranker = st.checkbox("Use cross-encoder reranker (better precision, slower)", value=True)
+    per_source_cap = st.slider("Max passages per source", 1, 6, 3, 1)
+    neighbors = st.slider("Neighbor chunks to include per hit (each side)", 0, 2, 1, 1)
+    hide_csv_bias = st.checkbox("Downweight CSV-like passages", value=True)
+
+    st.divider()
+    st.caption("🎛️ Answer style")
+    mode = st.selectbox(
+        "Mode",
+        ["Direct Answer", "Summary", "Compare", "Decision Matrix", "Fact Extract", "Action Items"],
+        index=0,
+    )
+    strictness = st.slider("Grounding strictness", 0.0, 1.0, 0.7, 0.1)
 
     st.divider()
     st.caption("🧠 Index KB → Weaviate")
@@ -922,7 +1027,7 @@ if user_q:
     add_history("user", user_q)
     render_msg("user", user_q)
 
-    # 1) PURE non-LLM retrieval (HYBRID → optional rerank → diversify)
+    # 1) PURE non-LLM retrieval (HYBRID → optional rerank → diversify → neighbors)
     q_vec = embed_texts([user_q])[0]
     col = w_client.collections.get(CLASS_NAME, tenant=w_tenancy) if (V4 and w_tenancy) else w_client.collections.get(CLASS_NAME)
     hits = retrieve_hybrid_then_rerank(
@@ -932,6 +1037,9 @@ if user_q:
         k_candidates=cand_k,
         k_final=final_k,
         use_reranker=use_reranker,
+        per_source_cap=per_source_cap,
+        neighbors_window=neighbors,
+        downweight_csv=hide_csv_bias,
     )
 
     # 2) build prompt context
@@ -950,27 +1058,14 @@ if user_q:
     # Answerability gate (avoid hallucinations if retrieval is weak)
     enough = len(hits) >= 2 and sum(len(h.get("text","")) for h in hits) >= 800
 
-    system_prompt = (
-        "You are a strict, grounded enterprise assistant.\n"
-        "- Answer ONLY with facts from the provided passages.\n"
-        "- If the passages don’t contain the answer, say: "
-        "\"I don’t have enough information in the context.\"\n"
-        "- Be concise. Do not speculate. No external knowledge.\n"
-        "- Cite snippets with [1], [2], ... next to claims you use.\n"
-    )
+    system_prompt = build_system_prompt(strictness, mode)
 
     if not enough:
         final_text = "I don’t have enough information in the retrieved context to answer that. Try syncing the KB or rephrasing."
         add_history("assistant", final_text, source_chips)
         render_msg("assistant", final_text, source_chips)
     else:
-        user_prompt = (
-            f"Question: {user_q}\n\n"
-            f"Passages (use them only):\n{context_text}\n\n"
-            "Write a short answer using only the passages above. "
-            "If missing, say you don’t have enough information. "
-            "Add citation markers like [1], [2] next to each claim."
-        )
+        user_prompt, chips = build_user_prompt(user_q, hits)
 
         # 3) stream to UI (with safe HTML escaping on each update)
         with st.chat_message("assistant"):
@@ -988,6 +1083,9 @@ if user_q:
                                     unsafe_allow_html=True
                                 )
                     final_text = (text_accum or "").strip() or "I couldn't generate a response."
+                    # Citation validator: enforce KB-only answers
+                    if not has_citation(final_text):
+                        final_text = "I don’t have enough information in the context."
                     placeholder.markdown(
                         f"<div class='chat-bubble-assistant'>{esc(final_text)}</div>",
                         unsafe_allow_html=True
