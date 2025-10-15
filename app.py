@@ -172,6 +172,95 @@ def list_and_download_kb(container: str, prefix: str, connection_string: str, ca
     return results
 
 
+from urllib.parse import urlparse
+
+def make_weaviate_client(url: str, api_key: Optional[str]) -> Any:
+    """
+    Robust connector for Weaviate:
+      - v4 + WCS (.weaviate.network): connect_to_weaviate_cloud(cluster_url=..., auth_credentials=...)
+      - v4 + Self-hosted:            connect_to_custom(http_* and grpc_* params)
+      - v3 fallback (only if package is actually v3): Client(url=..., AuthApiKey)
+    """
+    ver = getattr(weaviate, "__version__", "unknown")
+    is_v3_pkg = ver.startswith("3.")
+    try:
+        st.caption(f"📦 weaviate-client: {ver} | V4 symbols: {bool(V4)}")
+    except Exception:
+        pass
+
+    if V4:
+        auth = Auth.api_key(api_key) if api_key else None
+
+        # 1) WCS (cloud) path
+        try:
+            if "weaviate.network" in url or "wcs" in url:
+                st.caption("🔌 using connect_to_weaviate_cloud(cluster_url=...)")
+                client = weaviate.connect_to_weaviate_cloud(
+                    cluster_url=url,
+                    auth_credentials=auth,
+                    skip_init_checks=True,
+                )
+                client.is_connected()  # fail fast if handshake/auth is bad
+                st.caption("✅ connected via WCS")
+                return client
+        except Exception as e:
+            st.warning(f"WCS connect failed (will try custom): {e}")
+
+        # 2) Custom/self-hosted path (some v4 builds require gRPC params)
+        try:
+            u = urlparse(url)
+            if not u.scheme or not u.netloc:
+                raise ValueError(f"Invalid Weaviate URL: {url}")
+            http_secure = (u.scheme == "https")
+            http_host = u.hostname
+            http_port = u.port if u.port else (443 if http_secure else 80)
+
+            # gRPC params – mirror HTTP host/port unless you know different ports.
+            grpc_host = http_host
+            grpc_secure = http_secure
+            grpc_port = 50051 if http_secure else 50051  # adjust if your cluster exposes a different gRPC port
+
+            st.caption(
+                f"🔌 using connect_to_custom(http_host={http_host}, http_port={http_port}, https={http_secure}, "
+                f"grpc_host={grpc_host}, grpc_port={grpc_port}, grpc_https={grpc_secure})"
+            )
+            client = weaviate.connect_to_custom(
+                http_host=http_host,
+                http_port=http_port,
+                http_secure=http_secure,
+                grpc_host=grpc_host,
+                grpc_port=grpc_port,
+                grpc_secure=grpc_secure,
+                auth_credentials=auth,
+                skip_init_checks=True,
+            )
+            client.is_connected()
+            st.caption("✅ connected via custom")
+            return client
+        except Exception as e:
+            st.warning(f"Custom connect failed (v4): {e}")
+
+    # 3) v3 fallback — only if the installed package is actually v3.x
+    if is_v3_pkg:
+        try:
+            st.caption("🔌 using v3 Client(url=...)")
+            from weaviate import Client
+            from weaviate.auth import AuthApiKey
+            client = Client(
+                url=url,
+                auth_client_secret=AuthApiKey(api_key) if api_key else None,
+            )
+            client.schema.get()  # health probe
+            st.caption("✅ connected via v3 client")
+            return client
+        except Exception as e:
+            st.warning(f"v3 fallback failed: {e}")
+
+    # If we got here, all strategies failed
+    raise RuntimeError("All connection strategies failed. Check URL, API key, networking/IP allow-list, and TLS.")
+
+
+
 # ---------------------- Weaviate client (v4 / v3) ----------------------
 def make_weaviate_client(url: str, api_key: Optional[str]) -> Any:
     """
