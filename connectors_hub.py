@@ -416,14 +416,20 @@ for c in REGISTRY:
 CATEGORIES = sorted(REG_BY_CAT.keys())
 
 # ---------------------- Sidebar ----------------------
-# ---- Branding --------------------------------------------------------
-if Path("assets/logo.png").exists():
-    st.image("assets/logo.png", caption="iSOFT ANZ Pvt Ltd", use_container_width=True)
-st.sidebar.markdown("### 🔎 Search")
-q = st.sidebar.text_input("Search connectors", placeholder="snowflake, postgres, blob, kafka...").strip().lower()
+with st.sidebar:
+    # ---- Branding ----------------------------------------------------
+    logo_path = Path("assets/logo.png")
+    if logo_path.exists():
+        st.image(str(logo_path), caption="iSOFT ANZ Pvt Ltd", use_container_width=True)
 
-st.sidebar.markdown('<div class="sidebar-caption">Filter by category</div>', unsafe_allow_html=True)
-cat = st.sidebar.selectbox("Category", CATEGORIES, index=0, label_visibility="collapsed")
+    st.markdown("### 🔎 Search")
+    q = st.text_input(
+        "Search connectors",
+        placeholder="snowflake, postgres, blob, kafka..."
+    ).strip().lower()
+
+    st.markdown('<div class="sidebar-caption">Filter by category</div>', unsafe_allow_html=True)
+    cat = st.selectbox("Category", CATEGORIES, index=0, label_visibility="collapsed")
 
 def _filter_conns(items: List[Connector], q: str) -> List[Connector]:
     if not q:
