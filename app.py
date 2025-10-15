@@ -451,8 +451,8 @@ with st.sidebar:
 if show_health:
     st.write("**Azure**",
              {"container": container, "prefix": prefix, "conn_str_set": bool(connection_string)})
-    st.write("**Weaviate**", {"url": w_url, "api_key_set": bool(w_api_key)})
-    st.write("**Anthropic**", {"api_key_set": bool(anthropic_key)})
+    st.write("**Weaviate**", {"url": w_url, "WEAVIATE_API_KEY": bool(w_api_key)})
+    st.write("**Anthropic**", {"ANTHROPIC_API_KEY": bool(anthropic_key)})
 
 # Connect to Weaviate
 if not w_url:
