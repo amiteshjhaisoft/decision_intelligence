@@ -216,21 +216,37 @@ def run_weaviate_diagnostics(base_url: str, api_key: Optional[str]) -> Dict[str,
 # ---------------------- Weaviate client (v4 with safe fallbacks) ----------------------
 def make_weaviate_client(url: str, api_key: Optional[str]) -> Any:
     """
-    v4 WCS (cloud) -> v4 custom (with and without gRPC) -> v3 fallback only if client is 3.x
+    v4 WCS (.weaviate.network or .weaviate.cloud) -> v4 custom (always with gRPC args)
+    -> v3 fallback only if the installed package is actually v3.x
     """
     ver = getattr(weaviate, "__version__", "unknown")
     is_v3_pkg = ver.startswith("3.")
     st.caption(f"📦 weaviate-client version: {ver} (V4 symbols: {bool(V4)})")
 
+    def _parse(u: str):
+        if not u or "://" not in u:
+            raise ValueError(
+                f"Invalid Weaviate URL '{u}'. Use full https URL (e.g., "
+                "https://<cluster-id>.weaviate.cloud)."
+            )
+        p = urlparse(u)
+        if not p.hostname:
+            raise ValueError(f"Could not parse hostname from '{u}'")
+        https = (p.scheme == "https")
+        http_port = p.port or (443 if https else 80)
+        return p.hostname, https, http_port
+
     if V4:
         auth = Auth.api_key(api_key) if api_key else None
 
-        # 1) WCS (cloud)
+        # 1) WCS (works for both weaviate.network and weaviate.cloud)
         try:
-            if "weaviate.network" in url or "wcs" in url:
+            if (".weaviate.network" in url) or (".weaviate.cloud" in url) or ("wcs" in url):
                 st.caption("🔌 connect_to_weaviate_cloud(cluster_url=...)")
                 client = weaviate.connect_to_weaviate_cloud(
-                    cluster_url=url, auth_credentials=auth, skip_init_checks=True
+                    cluster_url=url,
+                    auth_credentials=auth,
+                    skip_init_checks=True,
                 )
                 client.is_connected()
                 st.caption("✅ WCS connected")
@@ -238,51 +254,34 @@ def make_weaviate_client(url: str, api_key: Optional[str]) -> Any:
         except Exception as e:
             st.warning(f"WCS connect failed (will try custom): {e}")
 
-        # 2) Custom WITH gRPC
+        # 2) Custom (always include gRPC args for v4.17+)
         try:
-            u = urlparse(url)
-            if not u.scheme or not u.netloc:
-                raise ValueError(f"Invalid Weaviate URL: {url}")
-            http_secure = (u.scheme == "https")
-            http_host = u.hostname
-            http_port = u.port or (443 if http_secure else 80)
-            grpc_host = http_host
-            grpc_secure = http_secure
-            grpc_port = 50051  # change if your cluster uses a different gRPC port
+            host, https, http_port = _parse(url)
+            grpc_host = host
+            grpc_secure = https
+            grpc_port = 50051  # change if your cluster exposes a different gRPC port
 
             st.caption(
-                f"🔌 connect_to_custom(http={http_host}:{http_port} https={http_secure}, "
+                f"🔌 connect_to_custom(http={host}:{http_port} https={https}, "
                 f"grpc={grpc_host}:{grpc_port} tls={grpc_secure})"
             )
             client = weaviate.connect_to_custom(
-                http_host=http_host, http_port=http_port, http_secure=http_secure,
-                grpc_host=grpc_host, grpc_port=grpc_port, grpc_secure=grpc_secure,
-                auth_credentials=auth, skip_init_checks=True,
+                http_host=host,
+                http_port=http_port,
+                http_secure=https,
+                grpc_host=grpc_host,
+                grpc_port=grpc_port,
+                grpc_secure=grpc_secure,
+                auth_credentials=auth,
+                skip_init_checks=True,
             )
             client.is_connected()
-            st.caption("✅ custom connected (with gRPC)")
+            st.caption("✅ custom connected")
             return client
         except Exception as e:
-            st.warning(f"Custom (with gRPC) failed, trying without gRPC: {e}")
+            st.warning(f"Custom connect failed (v4): {e}")
 
-        # 3) Custom WITHOUT gRPC (some gateways block gRPC entirely)
-        try:
-            u = urlparse(url)
-            http_secure = (u.scheme == "https")
-            http_host = u.hostname
-            http_port = u.port or (443 if http_secure else 80)
-            st.caption(f"🔌 connect_to_custom(http={http_host}:{http_port} https={http_secure}, no gRPC)")
-            client = weaviate.connect_to_custom(
-                http_host=http_host, http_port=http_port, http_secure=http_secure,
-                auth_credentials=auth, skip_init_checks=True,
-            )
-            client.is_connected()
-            st.caption("✅ custom connected (no gRPC)")
-            return client
-        except Exception as e:
-            st.warning(f"Custom (no gRPC) failed: {e}")
-
-    # 4) v3 fallback ONLY if the installed package is 3.x
+    # 3) v3 fallback — only if the package is actually 3.x
     if is_v3_pkg:
         try:
             st.caption("🔌 v3 Client(url=...)")
@@ -295,8 +294,7 @@ def make_weaviate_client(url: str, api_key: Optional[str]) -> Any:
         except Exception as e:
             st.warning(f"v3 fallback failed: {e}")
 
-    # 5) Total failure → raise (the sidebar diagnostics can help pinpoint)
-    raise RuntimeError("All connection strategies failed. Check URL, API key, networking/IP allow-list, and TLS.")
+    raise RuntimeError("All connection strategies failed. Check URL (must include https://), API key, and IP allow-list.")
 
 
 def ensure_collection(client: Any, class_name: str = CLASS_NAME, tenancy: Optional[str] = None) -> None:
