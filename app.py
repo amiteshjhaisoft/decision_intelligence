@@ -1,16 +1,20 @@
-# Author: Amitesh Jha | iSoft | 2025-10-12 (full, diagnostics, wide file-type support, hybrid+rERANK)
-# Streamlit RAG chat using Claude + Azure Blob + Weaviate (cloud/local)
+# Author: Amitesh Jha | iSoft | 2025-10-12
+# Streamlit RAG chat — Azure Blob → Weaviate (hybrid) → (optional) Cross-Encoder rerank → Claude (grounded-only)
+# - No LLM-aided retrieval (no Query Expansion, no HyDE). Retrieval is strictly from your KB.
+# - Wide file-type support (text/code/pdf/docx/pptx/xlsx/csv/html + image OCR + audio/video ASR where available)
+# - Robust Weaviate v4/v3 connection, multi-tenancy compatible
+# - Safer chat bubbles (HTML-escaped content to prevent invalid tag injections)
 
 from __future__ import annotations
 
-import io, os, json, hashlib, socket, ssl, tempfile, re
+import io, os, json, socket, ssl, tempfile, re, html
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import streamlit as st
 
-# ---- IMPORTANT: avoid odd TLS EOFs through proxies/edges (must be set BEFORE importing weaviate)
+# ---- Avoid odd TLS EOFs through certain proxies/edges (must be set BEFORE importing weaviate)
 os.environ.setdefault("HTTPX_DISABLE_HTTP2", "1")
 
 # ---------------------- Optional heavy extractors (graceful if missing) ----------------------
@@ -20,7 +24,7 @@ try:
 except Exception:
     Image, ExifTags = None, None
 try:
-    import pytesseract  # pip install pytesseract  (requires Tesseract binary installed)
+    import pytesseract  # pip install pytesseract (needs tesseract binary installed)
 except Exception:
     pytesseract = None
 
@@ -92,15 +96,14 @@ try:
 except Exception:
     MetadataQuery = None
 
-# Embeddings
+# Embeddings (dense) + Cross-Encoder rerank (optional)
 try:
     from sentence_transformers import SentenceTransformer
 except Exception as e:
     raise RuntimeError("Missing dependency: sentence-transformers") from e
 
-# Optional cross-encoder reranker (graceful if missing)
 try:
-    from sentence_transformers import CrossEncoder  # pip install sentence-transformers
+    from sentence_transformers import CrossEncoder  # optional
 except Exception:
     CrossEncoder = None
 
@@ -115,10 +118,16 @@ except Exception as e:
 CLASS_NAME       = "KBChunk"
 CHUNK_SIZE       = 900
 CHUNK_OVERLAP    = 150
-TOP_K_DEFAULT    = 5
-CANDIDATES_K     = 60     # hybrid recall
-FINAL_K          = 10     # passages sent to LLM
-CLAUDE_MODEL     = "claude-3-7-sonnet-20250219"  # adjust if your account uses a different ID
+
+# Retrieval configuration (non-LLM only)
+CANDIDATES_K     = 60     # hybrid recall pool
+FINAL_K_DEFAULT  = 10     # passages sent to LLM
+
+# Chat UI defaults
+TOP_K_DISPLAY    = 5      # legacy knob (not used for retrieval), kept for UI friendliness
+
+# Anthropic model (adjust to your account/allowlist)
+CLAUDE_MODEL     = "claude-3-7-sonnet-20250219"
 
 # Bounds to avoid exploding memory on huge binaries
 MAX_BYTES_IMAGE = 25 * 1024 * 1024   # 25 MB
@@ -145,20 +154,24 @@ AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".ogg", ".flac"}
 VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
 
 
-# ---------------------- Helpers ----------------------
+# ---------------------- Small helpers ----------------------
 def _hash(s: str) -> str:
     import hashlib as _h
     return _h.md5(s.encode("utf-8")).hexdigest()
 
 def _truncate(s: str, limit: int = 2000) -> str:
     s = s or ""
-    return s if len(s) <= limit else s[:limit] + " ..."
+    return s if len(s) <= limit else s[:limit] + " …"
 
 def _safe_decode(b: bytes, encoding="utf-8") -> str:
     try:
         return b.decode(encoding, errors="ignore")
     except Exception:
         return ""
+
+def esc(s: str) -> str:
+    """Escape any user/LLM text before putting inside our HTML bubble container."""
+    return html.escape(s or "")
 
 
 # --------- Parsers (each returns a TEXT representation suitable for RAG) ----------
@@ -419,7 +432,7 @@ def run_weaviate_diagnostics(base_url: str, api_key: Optional[str]) -> Dict[str,
         # DNS
         try:
             addrs = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
-            info["dns"] = [f"{a[4][0]}:{a[4][1]}" for a in addrs]
+            info["dns"] = [f"{a[4][0]}}:{a[4][1]}" for a in addrs]
         except Exception as e:
             info["dns_error"] = repr(e)
 
@@ -465,8 +478,7 @@ def make_weaviate_client(url: str, api_key: Optional[str]) -> Any:
     def _parse(u: str):
         if not u or "://" not in u:
             raise ValueError(
-                f"Invalid Weaviate URL '{u}'. Use full https URL (e.g., "
-                "https://<cluster-id>.weaviate.cloud)."
+                f"Invalid Weaviate URL '{u}'. Use full https URL (e.g., https://<cluster-id>.weaviate.cloud)."
             )
         p = urlparse(u)
         if not p.hostname:
@@ -615,55 +627,7 @@ def upsert_chunks(client: Any, class_name: str, items: List[Dict[str, Any]], vec
         return len(items)
 
 
-# ---- Dense-only (kept for reference; not used by chat path anymore) ----
-def vector_search(client: Any, class_name: str, query_vec: List[float], top_k: int, tenancy: Optional[str] = None) -> List[Dict[str, Any]]:
-    if V4:
-        col = client.collections.get(class_name, tenant=tenancy) if tenancy else client.collections.get(class_name)
-        meta = MetadataQuery(distance=True) if MetadataQuery else None
-        try:
-            res = col.query.near_vector(
-                vector=query_vec,
-                limit=top_k,
-                return_properties=["doc_id", "source", "chunk_index", "text"],
-                return_metadata=meta,
-            )
-        except TypeError:
-            res = col.query.near_vector(
-                near_vector=query_vec,
-                limit=top_k,
-                return_properties=["doc_id", "source", "chunk_index", "text"],
-                return_metadata=meta,
-            )
-        out: List[Dict[str, Any]] = []
-        for o in res.objects:
-            props = o.properties or {}
-            dist = getattr(getattr(o, "metadata", None), "distance", None)
-            out.append({
-                "doc_id": props.get("doc_id"),
-                "source": props.get("source"),
-                "chunk_index": props.get("chunk_index"),
-                "text": props.get("text"),
-                "score": (1.0 - dist) if isinstance(dist, (float, int)) else None,
-            })
-        return out
-    else:
-        res = (
-            client.query
-            .get(class_name, ["doc_id", "source", "chunk_index", "text"])
-            .with_near_vector({"vector": query_vec})
-            .with_limit(top_k)
-            .do()
-        )
-        hits = res.get("data", {}).get("Get", {}).get(class_name, []) or []
-        return [
-            {"doc_id": h.get("doc_id"), "source": h.get("source"),
-             "chunk_index": h.get("chunk_index"), "text": h.get("text"),
-             "score": None}
-            for h in hits
-        ]
-
-
-# ---------------------- Hybrid retrieval → rerank → diversify ----------------------
+# ---------------------- Hybrid retrieval → optional rerank → diversify ----------------------
 @st.cache_resource(show_spinner=False)
 def get_embedder():
     return SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
@@ -682,11 +646,12 @@ def retrieve_hybrid_then_rerank(
     query_text: str,
     query_vec: List[float],
     k_candidates: int = CANDIDATES_K,
-    k_final: int = FINAL_K,
+    k_final: int = FINAL_K_DEFAULT,
+    use_reranker: bool = True,
     max_chars_per_passage: int = 1100,
 ) -> List[Dict[str, Any]]:
 
-    # 1) HYBRID (falls back to dense-only)
+    # 1) HYBRID (falls back to dense-only if hybrid unavailable)
     try:
         meta = MetadataQuery(distance=True, score=True) if MetadataQuery else None
         res = col.query.hybrid(
@@ -705,7 +670,7 @@ def retrieve_hybrid_then_rerank(
             return_metadata=MetadataQuery(distance=True) if MetadataQuery else None,
         )
 
-    objs = res.objects or []
+    objs = getattr(res, "objects", None) or []
     rows = []
     for o in objs:
         p = o.properties or {}
@@ -735,20 +700,21 @@ def retrieve_hybrid_then_rerank(
     rows.sort(key=blend)
 
     # Optional cross-encoder rerank on the top N
-    ce = get_cross_encoder()
-    if ce is not None:
-        pool = rows[: max(20, k_final * 3)]
-        pairs = [(query_text, r["text"]) for r in pool]
-        try:
-            scores = ce.predict(pairs).tolist()
-            for r, s in zip(pool, scores):
-                r["ce"] = float(s)
-            pool.sort(key=lambda x: x.get("ce", -1.0), reverse=True)
-            rows = pool + rows[len(pool):]
-        except Exception:
-            pass
+    if use_reranker:
+        ce = get_cross_encoder()
+        if ce is not None:
+            pool = rows[: max(20, k_final * 3)]
+            pairs = [(query_text, r["text"]) for r in pool]
+            try:
+                scores = ce.predict(pairs).tolist()
+                for r, s in zip(pool, scores):
+                    r["ce"] = float(s)
+                pool.sort(key=lambda x: x.get("ce", -1.0), reverse=True)
+                rows = pool + rows[len(pool):]
+            except Exception:
+                pass
 
-    # 3) Diversify by source
+    # 3) Diversify by source (simple round-robin flavor)
     seen = set()
     picked = []
     for r in rows:
@@ -824,7 +790,7 @@ def ingest_from_azure_to_weaviate(connection_string: str, container: str, prefix
     return total
 
 
-# ---------------------- Claude ----------------------
+# ---------------------- Claude (answer-only; no retrieval use) ----------------------
 def call_claude(api_key: str, system_prompt: str, user_prompt: str, stream: bool = True):
     client = Anthropic(api_key=api_key)
     if stream:
@@ -854,8 +820,8 @@ st.set_page_config(page_title="RAG Chat — Claude + Weaviate + Azure", page_ico
 
 st.markdown("""
 <style>
-.chat-bubble-user { background:#e7f0ff; padding:10px 12px; border-radius:14px; }
-.chat-bubble-assistant { background:#f7f7f8; padding:10px 12px; border-radius:14px; }
+.chat-bubble-user { background:#e7f0ff; padding:10px 12px; border-radius:14px; white-space:pre-wrap; }
+.chat-bubble-assistant { background:#f7f7f8; padding:10px 12px; border-radius:14px; white-space:pre-wrap; }
 .small-dim { font-size:12px; opacity:.7; }
 .source-chip { display:inline-block; font-size:12px; padding:4px 8px; margin:4px 6px 0 0; background:#eef1f4; border-radius:999px; }
 </style>
@@ -882,9 +848,10 @@ with st.sidebar:
     # Claude
     anthropic_key = anth.get("api_key", "")
 
-    top_k = st.number_input("Top-K passages", min_value=1, max_value=15, value=TOP_K_DEFAULT, step=1)
-    cand_k = st.slider("Candidate pool (hybrid)", 20, 120, CANDIDATES_K, step=10)
-    final_k = st.slider("Final passages to LLM", 4, 20, FINAL_K, step=1)
+    # Retrieval knobs (non-LLM)
+    cand_k  = st.slider("Candidate pool (hybrid)", 20, 120, CANDIDATES_K, step=10)
+    final_k = st.slider("Final passages to LLM", 4, 20, FINAL_K_DEFAULT, step=1)
+    use_reranker = st.checkbox("Use cross-encoder reranker (better precision, slower)", value=True)
 
     st.divider()
     st.caption("🧠 Index KB → Weaviate")
@@ -936,14 +903,36 @@ if do_ingest:
 if "history" not in st.session_state:
     st.session_state.history = []
 
+def add_history(role: str, content: str, sources: Optional[List[str]] = None):
+    st.session_state.history.append({"role": role, "content": content, "sources": sources or []})
+
+def render_msg(role: str, content: str, sources: Optional[List[str]] = None):
+    css = "chat-bubble-user" if role == "user" else "chat-bubble-assistant"
+    with st.chat_message(role):
+        # Escape text to avoid invalid HTML (e.g., "<b<" causing createElement errors)
+        st.markdown(f"<div class='{css}'>{esc(content)}</div>", unsafe_allow_html=True)
+        if role == "assistant" and sources:
+            chips = "".join([f"<span class='source-chip'>{esc(s)}</span>" for s in sources[:12]])
+            st.markdown(f"<div class='small-dim'>Sources: {chips}</div>", unsafe_allow_html=True)
+
 st.subheader("Chat")
 user_q = st.chat_input("Ask about your Knowledge Base…")
 
 if user_q:
-    # 1) embed & retrieve (HYBRID → rerank → diversify)
+    add_history("user", user_q)
+    render_msg("user", user_q)
+
+    # 1) PURE non-LLM retrieval (HYBRID → optional rerank → diversify)
     q_vec = embed_texts([user_q])[0]
     col = w_client.collections.get(CLASS_NAME, tenant=w_tenancy) if (V4 and w_tenancy) else w_client.collections.get(CLASS_NAME)
-    hits = retrieve_hybrid_then_rerank(col, user_q, q_vec, k_candidates=cand_k, k_final=final_k)
+    hits = retrieve_hybrid_then_rerank(
+        col,
+        query_text=user_q,         # no expansion
+        query_vec=q_vec,           # no HyDE
+        k_candidates=cand_k,
+        k_final=final_k,
+        use_reranker=use_reranker,
+    )
 
     # 2) build prompt context
     context_blocks, source_chips = [], []
@@ -952,16 +941,17 @@ if user_q:
         if not t:
             continue
         t = _truncate(t, 2000)
-        context_blocks.append(f"[{i+1}] Source: {h.get('source')} (chunk {h.get('chunk_index')})\n{t}")
-        if h.get("source"):
-            source_chips.append(h["source"])
+        src = h.get("source")
+        context_blocks.append(f"[{i+1}] Source: {src} (chunk {h.get('chunk_index')})\n{t}")
+        if src:
+            source_chips.append(src)
     context_text = "\n\n".join(context_blocks)
 
     # Answerability gate (avoid hallucinations if retrieval is weak)
-    enough = len(hits) >= 2 and sum(len(h["text"]) for h in hits) >= 800
+    enough = len(hits) >= 2 and sum(len(h.get("text","")) for h in hits) >= 800
 
     system_prompt = (
-        "You are a strict, grounded assistant.\n"
+        "You are a strict, grounded enterprise assistant.\n"
         "- Answer ONLY with facts from the provided passages.\n"
         "- If the passages don’t contain the answer, say: "
         "\"I don’t have enough information in the context.\"\n"
@@ -971,8 +961,8 @@ if user_q:
 
     if not enough:
         final_text = "I don’t have enough information in the retrieved context to answer that. Try syncing the KB or rephrasing."
-        with st.chat_message("assistant"):
-            st.markdown(f"<div class='chat-bubble-assistant'>{final_text}</div>", unsafe_allow_html=True)
+        add_history("assistant", final_text, source_chips)
+        render_msg("assistant", final_text, source_chips)
     else:
         user_prompt = (
             f"Question: {user_q}\n\n"
@@ -982,10 +972,9 @@ if user_q:
             "Add citation markers like [1], [2] next to each claim."
         )
 
-        # 3) stream to UI
+        # 3) stream to UI (with safe HTML escaping on each update)
         with st.chat_message("assistant"):
             placeholder = st.empty()
-            sources_holder = st.container()
             try:
                 with call_claude(anthropic_key, system_prompt, user_prompt, stream=True) as stream_resp:
                     text_accum = ""
@@ -995,42 +984,29 @@ if user_q:
                             if delta_text:
                                 text_accum += delta_text
                                 placeholder.markdown(
-                                    f"<div class='chat-bubble-assistant'>{text_accum}</div>",
+                                    f"<div class='chat-bubble-assistant'>{esc(text_accum)}</div>",
                                     unsafe_allow_html=True
                                 )
-                    final_text = (text_accum or "").strip()
-                    if not final_text:
-                        final_text = "I couldn't generate a response."
+                    final_text = (text_accum or "").strip() or "I couldn't generate a response."
                     placeholder.markdown(
-                        f"<div class='chat-bubble-assistant'>{final_text}</div>",
+                        f"<div class='chat-bubble-assistant'>{esc(final_text)}</div>",
                         unsafe_allow_html=True
                     )
             except Exception as e:
                 final_text = f"Sorry, streaming failed: {e}"
                 placeholder.markdown(
-                    f"<div class='chat-bubble-assistant'>{final_text}</div>",
+                    f"<div class='chat-bubble-assistant'>{esc(final_text)}</div>",
                     unsafe_allow_html=True
                 )
-
-        if source_chips:
-            chips_html = "".join([f"<span class='source-chip'>{s}</span>" for s in source_chips[:12]])
-            sources_holder.markdown(f"<div class='small-dim'>Sources: {chips_html}</div>", unsafe_allow_html=True)
-
-    # 4) save history
-    st.session_state.history.append({"role": "user", "content": user_q})
-    st.session_state.history.append({"role": "assistant", "content": final_text, "sources": source_chips})
+        add_history("assistant", final_text, source_chips)
+        # show sources under the final message
+        render_msg("assistant", final_text, source_chips)
 
 # History
 if st.session_state.history:
     st.markdown("### Recent conversation")
     for msg in st.session_state.history[-8:]:
-        role = msg["role"]
-        css = "chat-bubble-user" if role == "user" else "chat-bubble-assistant"
-        with st.chat_message(role):
-            st.markdown(f"<div class='{css}'>{msg['content']}</div>", unsafe_allow_html=True)
-            if role == "assistant" and msg.get("sources"):
-                chips = "".join([f"<span class='source-chip'>{s}</span>" for s in msg["sources"][:12]])
-                st.markdown(f"<div class='small-dim'>Sources: {chips}</div>", unsafe_allow_html=True)
+        render_msg(msg["role"], msg["content"], msg.get("sources"))
 
 # Clean up v4 client
 if V4:
