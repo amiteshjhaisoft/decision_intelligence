@@ -528,7 +528,7 @@ if show_health:
     st.write("**Azure**", {"container": container, "prefix": prefix, "conn_str_set": bool(connection_string)})
     st.write("**Weaviate**", {
         "url": w_url,
-        "WEAVIATE_API_KEY": bool(w_api_key),
+        "api_key": bool(w_api_key),
         "client_version": getattr(weaviate, "__version__", "unknown"),
         "v4_mode": V4,
     })
