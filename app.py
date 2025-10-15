@@ -525,20 +525,26 @@ def call_claude(api_key: str, system_prompt: str, user_prompt: str, stream: bool
     client = Anthropic(api_key=api_key)
     if stream:
         return client.messages.stream(
-            model=CLAUDE_MODEL,
+            model=CLAUDE_MODEL,  # or your resolved MODEL_ID
             max_tokens=800,
             temperature=0.2,
             system=system_prompt,
             messages=[{"role": "user", "content": user_prompt}],
         )
     else:
-        return client.messages.create(
+        resp = client.messages.create(
             model=CLAUDE_MODEL,
             max_tokens=800,
             temperature=0.2,
             system=system_prompt,
             messages=[{"role": "user", "content": user_prompt}],
         )
+        # Extract concatenated text from the content blocks
+        try:
+            return "".join(getattr(b, "text", "") for b in (resp.content or []))
+        except Exception:
+            # Fallback if SDK shape changes
+            return str(resp)
 
 
 # ---------------------- UI ----------------------
@@ -660,9 +666,6 @@ if user_q:
     )
 
     # 3) stream to UI
-    with st.chat_message("user"):
-        st.markdown(f"<div class='chat-bubble-user'>{user_q}</div>", unsafe_allow_html=True)
-
     with st.chat_message("assistant"):
         placeholder = st.empty()
         sources_holder = st.container()
@@ -670,19 +673,35 @@ if user_q:
             with call_claude(anthropic_key, system_prompt, user_prompt, stream=True) as stream_resp:
                 text_accum = ""
                 for event in stream_resp:
+                    # Only append text for textual deltas
                     if event.type == "content_block_delta":
-                        delta = event.delta.get("text", "")
-                        if delta:
-                            text_accum += delta
-                            placeholder.markdown(f"<div class='chat-bubble-assistant'>{text_accum}</div>", unsafe_allow_html=True)
+                        # Some SDK minors expose .delta.text; older expose .delta with .text
+                        delta_text = getattr(getattr(event, "delta", None), "text", None)
+                        if delta_text:
+                            text_accum += delta_text
+                            placeholder.markdown(
+                                f"<div class='chat-bubble-assistant'>{text_accum}</div>",
+                                unsafe_allow_html=True
+                            )
+                    # (optional) You can handle stops/errors here, but it's not required
                 final_text = (text_accum or "").strip()
+                if not final_text:
+                    final_text = "I couldn't generate a response."
+                placeholder.markdown(
+                    f"<div class='chat-bubble-assistant'>{final_text}</div>",
+                    unsafe_allow_html=True
+                )
         except Exception as e:
             final_text = f"Sorry, streaming failed: {e}"
-            placeholder.markdown(f"<div class='chat-bubble-assistant'>{final_text}</div>", unsafe_allow_html=True)
+            placeholder.markdown(
+                f"<div class='chat-bubble-assistant'>{final_text}</div>",
+                unsafe_allow_html=True
+            )
 
-        if source_chips:
-            chips_html = "".join([f"<span class='source-chip'>{s}</span>" for s in source_chips[:10]])
-            sources_holder.markdown(f"<div class='small-dim'>Sources: {chips_html}</div>", unsafe_allow_html=True)
+    if source_chips:
+        chips_html = "".join([f"<span class='source-chip'>{s}</span>" for s in source_chips[:10]])
+        sources_holder.markdown(f"<div class='small-dim'>Sources: {chips_html}</div>", unsafe_allow_html=True)
+
 
     # 4) save history
     st.session_state.history.append({"role": "user", "content": user_q})
