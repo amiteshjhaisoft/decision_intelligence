@@ -1004,6 +1004,7 @@ if do_ingest:
             total = ingest_from_azure_to_weaviate(connection_string, container, prefix, w_client, tenancy=w_tenancy, status_cb=_status)
         st.success(f"Done. Upserted {total} chunks.")
 
+# ---------------------- CHAT (Decision-Intelligence Agent) ----------------------
 # Chat state
 if "history" not in st.session_state:
     st.session_state.history = []
@@ -1014,11 +1015,53 @@ def add_history(role: str, content: str, sources: Optional[List[str]] = None):
 def render_msg(role: str, content: str, sources: Optional[List[str]] = None):
     css = "chat-bubble-user" if role == "user" else "chat-bubble-assistant"
     with st.chat_message(role):
-        # Escape text to avoid invalid HTML (e.g., "<b<" causing createElement errors)
         st.markdown(f"<div class='{css}'>{esc(content)}</div>", unsafe_allow_html=True)
         if role == "assistant" and sources:
             chips = "".join([f"<span class='source-chip'>{esc(s)}</span>" for s in sources[:12]])
             st.markdown(f"<div class='small-dim'>Sources: {chips}</div>", unsafe_allow_html=True)
+
+def retrieval_quality(hits: List[Dict[str, Any]]) -> Tuple[float, int, int]:
+    """Return (quality_score, total_chars, unique_sources)."""
+    if not hits:
+        return (0.0, 0, 0)
+    total_chars = sum(len((h.get("text") or "")) for h in hits)
+    uniq_sources = len({h.get("source") for h in hits if h.get("source")})
+    # light heuristic: more text, more distinct sources => higher quality
+    score = min(1.0, (total_chars / 4000.0) * 0.6 + (uniq_sources / 6.0) * 0.4)
+    return (score, total_chars, uniq_sources)
+
+def gate_answerability(hits: List[Dict[str, Any]], min_chars: int = 800, min_sources: int = 2) -> bool:
+    _, total_chars, uniq_sources = retrieval_quality(hits)
+    return (total_chars >= min_chars) and (uniq_sources >= min_sources)
+
+def format_context_for_prompt(hits: List[Dict[str, Any]], max_chars: int = 2000) -> Tuple[str, List[str]]:
+    ctx_blocks, chips = [], []
+    for i, h in enumerate(hits):
+        t = (h.get("text") or "").strip()
+        if not t:
+            continue
+        t = _truncate(t, max_chars)
+        src = h.get("source")
+        ctx_blocks.append(f"[{i+1}] Source: {src} (chunk {h.get('chunk_index')})\n{t}")
+        if src:
+            chips.append(src)
+    return ("\n\n".join(ctx_blocks) if ctx_blocks else "No relevant context retrieved."), chips
+
+def enforce_citations(text: str) -> bool:
+    """Require at least one [n] citation marker; else considered ungrounded."""
+    return has_citation(text)
+
+def build_followups(question: str, mode: str, quality: float) -> List[str]:
+    """Suggest next steps to tighten the decision when retrieval is borderline."""
+    sugs = []
+    if quality < 0.5:
+        sugs.append("Sync the Knowledge Base or broaden the prefix to include the missing files.")
+        sugs.append("Ask a narrower, factual question that appears verbatim in your docs.")
+    if mode in {"Decision Matrix", "Compare"}:
+        sugs.append("Provide explicit criteria and weight hints present in your KB (dates, costs, SLAs).")
+    if mode == "Fact Extract":
+        sugs.append("Name the exact fields you want (as they appear in your docs).")
+    return sugs[:3]
 
 st.subheader("Chat")
 user_q = st.chat_input("Ask about your Knowledge Base…")
@@ -1027,80 +1070,92 @@ if user_q:
     add_history("user", user_q)
     render_msg("user", user_q)
 
-    # 1) PURE non-LLM retrieval (HYBRID → optional rerank → diversify → neighbors)
-    q_vec = embed_texts([user_q])[0]
-    col = w_client.collections.get(CLASS_NAME, tenant=w_tenancy) if (V4 and w_tenancy) else w_client.collections.get(CLASS_NAME)
-    hits = retrieve_hybrid_then_rerank(
-        col,
-        query_text=user_q,         # no expansion
-        query_vec=q_vec,           # no HyDE
-        k_candidates=cand_k,
-        k_final=final_k,
-        use_reranker=use_reranker,
-        per_source_cap=per_source_cap,
-        neighbors_window=neighbors,
-        downweight_csv=hide_csv_bias,
-    )
-
-    # 2) build prompt context
-    context_blocks, source_chips = [], []
-    for i, h in enumerate(hits):
-        t = (h.get("text") or "").strip()
-        if not t:
-            continue
-        t = _truncate(t, 2000)
-        src = h.get("source")
-        context_blocks.append(f"[{i+1}] Source: {src} (chunk {h.get('chunk_index')})\n{t}")
-        if src:
-            source_chips.append(src)
-    context_text = "\n\n".join(context_blocks)
-
-    # Answerability gate (avoid hallucinations if retrieval is weak)
-    enough = len(hits) >= 2 and sum(len(h.get("text","")) for h in hits) >= 800
-
-    system_prompt = build_system_prompt(strictness, mode)
-
-    if not enough:
-        final_text = "I don’t have enough information in the retrieved context to answer that. Try syncing the KB or rephrasing."
-        add_history("assistant", final_text, source_chips)
-        render_msg("assistant", final_text, source_chips)
+    # Ensure collection exists and is reachable
+    try:
+        col = w_client.collections.get(CLASS_NAME, tenant=w_tenancy) if (V4 and w_tenancy) else w_client.collections.get(CLASS_NAME)
+    except Exception as e:
+        final_text = f"I can’t reach the '{CLASS_NAME}' collection. Try 'Sync / Rebuild Index' first. ({e})"
+        add_history("assistant", final_text, [])
+        render_msg("assistant", final_text, [])
     else:
-        user_prompt, chips = build_user_prompt(user_q, hits)
+        # 1) Strict non-LLM retrieval (hybrid -> optional rerank -> diversify -> neighbors)
+        q_vec = embed_texts([user_q])[0]
+        hits = retrieve_hybrid_then_rerank(
+            col,
+            query_text=user_q,
+            query_vec=q_vec,
+            k_candidates=cand_k,
+            k_final=final_k,
+            use_reranker=use_reranker,
+            per_source_cap=per_source_cap,
+            neighbors_window=neighbors,
+            downweight_csv=hide_csv_bias,
+        )
 
-        # 3) stream to UI (with safe HTML escaping on each update)
-        with st.chat_message("assistant"):
-            placeholder = st.empty()
-            try:
-                with call_claude(anthropic_key, system_prompt, user_prompt, stream=True) as stream_resp:
-                    text_accum = ""
-                    for event in stream_resp:
-                        if event.type == "content_block_delta":
-                            delta_text = getattr(getattr(event, "delta", None), "text", None)
-                            if delta_text:
-                                text_accum += delta_text
-                                placeholder.markdown(
-                                    f"<div class='chat-bubble-assistant'>{esc(text_accum)}</div>",
-                                    unsafe_allow_html=True
-                                )
-                    final_text = (text_accum or "").strip() or "I couldn't generate a response."
-                    # Citation validator: enforce KB-only answers
-                    if not has_citation(final_text):
-                        final_text = "I don’t have enough information in the context."
+        # 2) Answerability gate
+        qual, total_chars, uniq_src = retrieval_quality(hits)
+        enough = gate_answerability(hits)
+
+        # 3) Build prompts
+        system_prompt = build_system_prompt(strictness, mode)
+        context_text, source_chips = format_context_for_prompt(hits)
+
+        if not enough:
+            # Provide constructive DI-oriented guidance when context is weak
+            followups = build_followups(user_q, mode, qual)
+            final_text = (
+                "I don’t have enough information in the retrieved context to answer that.\n\n"
+                f"- Retrieved characters: {total_chars}\n"
+                f"- Distinct sources: {uniq_src}\n"
+                + ("\n".join(f"- {s}" for s in followups) if followups else "")
+            ).strip()
+            add_history("assistant", final_text, source_chips)
+            render_msg("assistant", final_text, source_chips)
+        else:
+            # 4) Compose user prompt (KB-only)
+            user_prompt, chips = build_user_prompt(user_q, hits)
+
+            # 5) Stream the grounded DI answer
+            with st.chat_message("assistant"):
+                placeholder = st.empty()
+                try:
+                    with call_claude(anthropic_key, system_prompt, user_prompt, stream=True) as stream_resp:
+                        text_accum = ""
+                        for event in stream_resp:
+                            if event.type == "content_block_delta":
+                                delta_text = getattr(getattr(event, "delta", None), "text", None)
+                                if delta_text:
+                                    text_accum += delta_text
+                                    # Always escape to prevent HTML tag injection into bubble
+                                    placeholder.markdown(
+                                        f"<div class='chat-bubble-assistant'>{esc(text_accum)}</div>",
+                                        unsafe_allow_html=True
+                                    )
+                        final_text = (text_accum or "").strip() or "I couldn't generate a response."
+
+                        # 6) Grounding enforcement: must include [n] style citations
+                        if not enforce_citations(final_text):
+                            final_text = (
+                                "I don’t have enough information in the context to answer with citations. "
+                                "Please sync the KB or ask a narrower question."
+                            )
+
+                        # Render final
+                        placeholder.markdown(
+                            f"<div class='chat-bubble-assistant'>{esc(final_text)}</div>",
+                            unsafe_allow_html=True
+                        )
+                except Exception as e:
+                    final_text = f"Sorry, streaming failed: {e}"
                     placeholder.markdown(
                         f"<div class='chat-bubble-assistant'>{esc(final_text)}</div>",
                         unsafe_allow_html=True
                     )
-            except Exception as e:
-                final_text = f"Sorry, streaming failed: {e}"
-                placeholder.markdown(
-                    f"<div class='chat-bubble-assistant'>{esc(final_text)}</div>",
-                    unsafe_allow_html=True
-                )
-        add_history("assistant", final_text, source_chips)
-        # show sources under the final message
-        render_msg("assistant", final_text, source_chips)
 
-# History
+            add_history("assistant", final_text, source_chips)
+            render_msg("assistant", final_text, source_chips)
+
+# History (last 8 turns)
 if st.session_state.history:
     st.markdown("### Recent conversation")
     for msg in st.session_state.history[-8:]:
