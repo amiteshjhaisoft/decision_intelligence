@@ -1,4 +1,3 @@
- rag_claude_weaviate_streamlit.py
 # Author: Amitesh Jha | iSoft | 2025-10-12 (full, fixed)
 # Streamlit RAG chat using Claude + Azure Blob + Weaviate (cloud/local)
 # - Downloads KB from Azure (prefix), parses common doc types
