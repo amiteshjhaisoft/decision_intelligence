@@ -14,6 +14,9 @@ from urllib.parse import urlparse
 
 import streamlit as st
 
+# --- IMPORTANT: avoid TLS EOFs on some edges/proxies (must be set BEFORE importing weaviate)
+os.environ.setdefault("HTTPX_DISABLE_HTTP2", "1")
+
 # ------- Required deps (with friendly errors) -------
 try:
     from azure.storage.blob import BlobServiceClient  # pip install azure-storage-blob
@@ -172,26 +175,39 @@ def list_and_download_kb(container: str, prefix: str, connection_string: str, ca
 # ---------------------- Weaviate client (v4 / v3) ----------------------
 def make_weaviate_client(url: str, api_key: Optional[str]) -> Any:
     """
-    Connect to Weaviate:
-      - v4 + WCS (.weaviate.network): connect_to_wcs(cluster_url=..., auth_credentials=...)
+    Robust connector for Weaviate:
+      - v4 + WCS (.weaviate.network): connect_to_weaviate_cloud(cluster_url=..., auth_credentials=...)
       - v4 + Self-hosted:            connect_to_custom(http_host, http_port, http_secure, ...)
       - v3 fallback:                 Client(url=..., auth_client_secret=...)
+    Also forces HTTP/1.1 to avoid TLS EOF issues on some edges/proxies.
     """
     try:
-        st.caption(f"📦 weaviate-client version: {getattr(weaviate, '__version__', 'unknown')}")
+        st.caption(f"📦 weaviate-client version: {getattr(weaviate, '__version__', 'unknown')} (V4: {V4})")
     except Exception:
         pass
 
     # v4 path
     if V4:
         auth = Auth.api_key(api_key) if api_key else None
+
+        # 1) Preferred: modern WCS helper
         try:
             if "weaviate.network" in url or "wcs" in url:
-                st.caption("🔌 using connect_to_wcs()")
-                return weaviate.connect_to_wcs(
-                    cluster_url=url, auth_credentials=auth, skip_init_checks=True
+                st.caption("🔌 using connect_to_weaviate_cloud(cluster_url=...)")
+                client = weaviate.connect_to_weaviate_cloud(
+                    cluster_url=url,
+                    auth_credentials=auth,
+                    skip_init_checks=True,
                 )
+                # quick probe; raises if handshake/auth fails
+                client.is_connected()
+                st.caption("✅ connected via WCS")
+                return client
+        except Exception as e:
+            st.warning(f"WCS connect failed (will try custom): {e}")
 
+        # 2) Custom (parses host/port/https) — works for self-hosted and some proxied WCS edges
+        try:
             u = urlparse(url)
             if not u.scheme or not u.netloc:
                 raise ValueError(f"Invalid Weaviate URL: {url}")
@@ -199,27 +215,31 @@ def make_weaviate_client(url: str, api_key: Optional[str]) -> Any:
             host = u.hostname
             port = u.port if u.port else (443 if secure else 80)
 
-            st.caption(f"🔌 using connect_to_custom(): host={host} port={port} secure={secure}")
-            return weaviate.connect_to_custom(
+            st.caption(f"🔌 using connect_to_custom(http_host={host}, port={port}, https={secure})")
+            client = weaviate.connect_to_custom(
                 http_host=host,
                 http_port=port,
                 http_secure=secure,
                 auth_credentials=auth,
                 skip_init_checks=True,
             )
+            client.is_connected()
+            st.caption("✅ connected via custom")
+            return client
         except Exception as e:
-            st.error(f"Failed to connect (v4): {e}")
-            raise
+            st.warning(f"Custom connect failed (will try v3 fallback): {e}")
 
-    # v3 fallback
+    # 3) v3 fallback
     try:
         st.caption("🔌 using v3 Client(url=...)")
         from weaviate import Client
         from weaviate.auth import AuthApiKey
-        auth_config = AuthApiKey(api_key) if api_key else None
-        return Client(url=url, auth_client_secret=auth_config)
+        client = Client(url=url, auth_client_secret=AuthApiKey(api_key) if api_key else None)
+        client.schema.get()  # quick health probe
+        st.caption("✅ connected via v3 client")
+        return client
     except Exception as e:
-        st.error(f"Failed to connect (v3): {e}")
+        st.error(f"❌ All connection strategies failed: {e}")
         raise
 
 
@@ -566,4 +586,3 @@ if V4:
         w_client.close()
     except Exception:
         pass
-
