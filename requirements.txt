@@ -1,41 +1,9 @@
-# ---------- Core UI ----------
-streamlit>=1.34
-pyyaml>=6.0.1
-docx2txt>=0.8
-
-
-# ---------- Data / file parsing ----------
-pandas>=2.2
-openpyxl>=3.1
-pypdf>=4.2
-python-docx>=1.1
-python-pptx>=0.6.23
-
-# ---------- LLM (Claude via Anthropic) ----------
-# Requires ANTHROPIC_API_KEY in .streamlit/secrets.toml
-anthropic>=0.20,<1.0
-
-# ---------- Vector DB (Milvus / Milvus-Lite) ----------
-# pymilvus>=2.4,<3.0
-pymilvus>=2.4.5
-
-# ---------- Retrieval / embeddings ----------
-sentence-transformers>=2.6,<3.0
-# Optional fallback: FAISS (for quick local testing)
-faiss-cpu>=1.8.0.post1; platform_system != "Windows"
-# If on Windows:
-# faiss-cpu-windows>=1.8.0.post1; platform_system == "Windows"
-
-# ---------- LangChain ecosystem ----------
-langchain-core>=0.2,<0.3
-langchain-community>=0.2,<0.3
-langchain-text-splitters>=0.2,<0.3
-
-# ---------- Azure SDK (for KB sync) ----------
-azure-storage-blob>=12.19
-azure-identity>=1.16
-
-# ---------- Misc utilities ----------
-python-dotenv>=1.0
-requests>=2.32
-tqdm>=4.66
+streamlit
+anthropic
+azure-storage-blob
+weaviate-client
+sentence-transformers
+langchain-text-splitters
+pypdf
+python-docx
+pandas
