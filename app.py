@@ -1,9 +1,9 @@
-# Author: Amitesh Jha | iSoft | 2025-10-12 (full, diagnostics, wide file-type support)
+# Author: Amitesh Jha | iSoft | 2025-10-12 (full, diagnostics, wide file-type support, hybrid+rERANK)
 # Streamlit RAG chat using Claude + Azure Blob + Weaviate (cloud/local)
 
 from __future__ import annotations
 
-import io, os, json, hashlib, socket, ssl, tempfile, time, re, base64
+import io, os, json, hashlib, socket, ssl, tempfile, re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
@@ -92,11 +92,19 @@ try:
 except Exception:
     MetadataQuery = None
 
+# Embeddings
 try:
     from sentence_transformers import SentenceTransformer
 except Exception as e:
     raise RuntimeError("Missing dependency: sentence-transformers") from e
 
+# Optional cross-encoder reranker (graceful if missing)
+try:
+    from sentence_transformers import CrossEncoder  # pip install sentence-transformers
+except Exception:
+    CrossEncoder = None
+
+# Anthropic (Claude)
 try:
     from anthropic import Anthropic
 except Exception as e:
@@ -104,12 +112,13 @@ except Exception as e:
 
 
 # ---------------------- App constants ----------------------
-CLASS_NAME = "KBChunk"
-CHUNK_SIZE = 900
-CHUNK_OVERLAP = 150
-TOP_K_DEFAULT = 5
-# Use a known-good Anthropic model id; change if your account has different access
-CLAUDE_MODEL = "claude-3-7-sonnet-20250219"
+CLASS_NAME       = "KBChunk"
+CHUNK_SIZE       = 900
+CHUNK_OVERLAP    = 150
+TOP_K_DEFAULT    = 5
+CANDIDATES_K     = 60     # hybrid recall
+FINAL_K          = 10     # passages sent to LLM
+CLAUDE_MODEL     = "claude-3-7-sonnet-20250219"  # adjust if your account uses a different ID
 
 # Bounds to avoid exploding memory on huge binaries
 MAX_BYTES_IMAGE = 25 * 1024 * 1024   # 25 MB
@@ -118,22 +127,23 @@ MAX_BYTES_VIDEO = 150 * 1024 * 1024  # 150 MB
 MAX_BYTES_TEXT  = 50 * 1024 * 1024   # 50 MB
 
 # File type buckets
-TEXT_EXTS = {".txt", ".md", ".log"}
-CSV_EXT = {".csv"}
-JSON_EXT = {".json"}
-YAML_EXT = {".yaml", ".yml"}
-HTML_EXT = {".html", ".htm"}
-DOC_EXT = {".docx"}
-PPT_EXT = {".pptx"}
-XLS_EXT = {".xlsx"}
-PDF_EXT = {".pdf"}
-CODE_EXTS = {
+TEXT_EXTS  = {".txt", ".md", ".log"}
+CSV_EXT    = {".csv"}
+JSON_EXT   = {".json"}
+YAML_EXT   = {".yaml", ".yml"}
+HTML_EXT   = {".html", ".htm"}
+DOC_EXT    = {".docx"}
+PPT_EXT    = {".pptx"}
+XLS_EXT    = {".xlsx"}
+PDF_EXT    = {".pdf"}
+CODE_EXTS  = {
     ".py", ".sql", ".js", ".ts", ".java", ".c", ".cpp", ".cs",
     ".go", ".rb", ".rs", ".php", ".xml", ".ini", ".cfg", ".toml"
 }
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp", ".gif"}
 AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".ogg", ".flac"}
 VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
+
 
 # ---------------------- Helpers ----------------------
 def _hash(s: str) -> str:
@@ -149,6 +159,7 @@ def _safe_decode(b: bytes, encoding="utf-8") -> str:
         return b.decode(encoding, errors="ignore")
     except Exception:
         return ""
+
 
 # --------- Parsers (each returns a TEXT representation suitable for RAG) ----------
 def read_pdf_bytes(b: bytes) -> str:
@@ -219,7 +230,6 @@ def read_html_bytes(b: bytes) -> str:
         return _safe_decode(b)
     try:
         soup = BeautifulSoup(_safe_decode(b), "html.parser")
-        # Remove script/style
         for tag in soup(["script", "style", "noscript"]):
             tag.decompose()
         text = soup.get_text("\n")
@@ -229,18 +239,12 @@ def read_html_bytes(b: bytes) -> str:
         return _safe_decode(b)
 
 def read_yaml_bytes(b: bytes) -> str:
-    # no yaml dep; keep raw but pretty
-    try:
-        s = _safe_decode(b)
-        return s.strip()
-    except Exception:
-        return ""
+    return _safe_decode(b).strip()
 
 def read_text_like_bytes(b: bytes, encoding: str = "utf-8") -> str:
     return _safe_decode(b, encoding)
 
 def read_code_bytes(b: bytes) -> str:
-    # Just decode; chunker will handle size
     return _safe_decode(b)
 
 def read_image_bytes_ocr(b: bytes, name: str) -> str:
@@ -248,17 +252,15 @@ def read_image_bytes_ocr(b: bytes, name: str) -> str:
         return f"[IMAGE: {name}] (Pillow not installed; OCR unavailable)"
     try:
         with Image.open(io.BytesIO(b)) as im:
-            # Basic EXIF
             exif_txt = ""
             try:
                 exif = getattr(im, "_getexif", lambda: None)()
                 if exif:
                     inv = {ExifTags.TAGS.get(k, str(k)): v for k, v in exif.items()}
-                    keep = {k: inv[k] for k in list(inv)[:20]}  # limit output
+                    keep = {k: inv[k] for k in list(inv)[:20]}
                     exif_txt = json.dumps(keep, default=str)
             except Exception:
                 pass
-            # OCR if possible
             ocr_txt = ""
             if pytesseract:
                 try:
@@ -291,11 +293,9 @@ def transcribe_video_bytes(b: bytes, name: str, tmp_dir: Path) -> str:
         vid_path = tmp_dir / (Path(name).name.replace("/", "_"))
         aud_path = tmp_dir / (Path(name).stem + ".wav")
         vid_path.write_bytes(b)
-        # Extract audio
         clip = AudioFileClip(str(vid_path))
         clip.audio.write_audiofile(str(aud_path), verbose=False, logger=None)
         clip.close()
-        # Transcribe
         model = whisper.load_model("base")
         res = model.transcribe(str(aud_path))
         txt = (res.get("text") or "").strip()
@@ -309,6 +309,7 @@ def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVE
         separators=["\n\n", "\n", ". ", " ", ""]
     )
     return splitter.split_text(text or "")
+
 
 # ---------------------- Azure loader ----------------------
 def list_and_download_kb(container: str, prefix: str, connection_string: str, cache_dir: Path) -> List[Tuple[str, Path, int]]:
@@ -351,6 +352,7 @@ def list_and_download_kb(container: str, prefix: str, connection_string: str, ca
 
     return results
 
+
 # ---------------------- Guess & Read (broad types) ----------------------
 def guess_and_read_path(name: str, path: Path, size_bytes: int, tmp_dir: Path) -> str:
     ext = Path(name).suffix.lower()
@@ -362,7 +364,7 @@ def guess_and_read_path(name: str, path: Path, size_bytes: int, tmp_dir: Path) -
         return f"[AUDIO: {name}] (skipped: {size_bytes} bytes > {MAX_BYTES_AUDIO})"
     if ext in VIDEO_EXTS and size_bytes > MAX_BYTES_VIDEO:
         return f"[VIDEO: {name}] (skipped: {size_bytes} bytes > {MAX_BYTES_VIDEO})"
-    if (ext in TEXT_EXTS | CSV_EXT | JSON_EXT | YAML_EXT | HTML_EXT | DOC_EXT | PPT_EXT | XLS_EXT | PDF_EXT | CODE_EXTS) and size_bytes > MAX_BYTES_TEXT:
+    if (ext in (TEXT_EXTS | CSV_EXT | JSON_EXT | YAML_EXT | HTML_EXT | DOC_EXT | PPT_EXT | XLS_EXT | PDF_EXT | CODE_EXTS)) and size_bytes > MAX_BYTES_TEXT:
         return f"[TEXT-LIKE: {name}] (skipped: {size_bytes} bytes > {MAX_BYTES_TEXT})"
 
     b = path.read_bytes()
@@ -403,6 +405,7 @@ def guess_and_read_path(name: str, path: Path, size_bytes: int, tmp_dir: Path) -
 
     # Fallback
     return _safe_decode(b)
+
 
 # ---------------------- Connectivity diagnostics ----------------------
 def run_weaviate_diagnostics(base_url: str, api_key: Optional[str]) -> Dict[str, Any]:
@@ -451,6 +454,7 @@ def run_weaviate_diagnostics(base_url: str, api_key: Optional[str]) -> Dict[str,
     except Exception as e:
         info["diagnostics_error"] = repr(e)
     return info
+
 
 # ---------------------- Weaviate client (v4 with safe fallbacks) ----------------------
 def make_weaviate_client(url: str, api_key: Optional[str]) -> Any:
@@ -529,6 +533,7 @@ def make_weaviate_client(url: str, api_key: Optional[str]) -> Any:
 
     raise RuntimeError("All connection strategies failed. Check URL (must include https://), API key, and IP allow-list.")
 
+
 def ensure_collection(client: Any, class_name: str = CLASS_NAME, tenancy: Optional[str] = None) -> None:
     """
     Ensure a KBChunk collection/class exists. If a tenant name is provided, ensure the tenant exists.
@@ -577,12 +582,14 @@ def ensure_collection(client: Any, class_name: str = CLASS_NAME, tenancy: Option
         }
         client.schema.create_class(new_class)
 
+
 def upsert_chunks(client: Any, class_name: str, items: List[Dict[str, Any]], vectors: List[List[float]], tenancy: Optional[str] = None) -> int:
     if not items:
         return 0
     if V4:
         col = client.collections.get(class_name, tenant=tenancy) if tenancy else client.collections.get(class_name)
         if tenancy:
+            # Insert one-by-one for widest compatibility with MT across v4 minors
             count = 0
             for it, vec in zip(items, vectors):
                 col.data.insert(properties=it["properties"], uuid=it["id"], vector=vec)
@@ -607,6 +614,8 @@ def upsert_chunks(client: Any, class_name: str, items: List[Dict[str, Any]], vec
                 )
         return len(items)
 
+
+# ---- Dense-only (kept for reference; not used by chat path anymore) ----
 def vector_search(client: Any, class_name: str, query_vec: List[float], top_k: int, tenancy: Optional[str] = None) -> List[Dict[str, Any]]:
     if V4:
         col = client.collections.get(class_name, tenant=tenancy) if tenancy else client.collections.get(class_name)
@@ -653,16 +662,124 @@ def vector_search(client: Any, class_name: str, query_vec: List[float], top_k: i
             for h in hits
         ]
 
-# ---------------------- Embeddings ----------------------
+
+# ---------------------- Hybrid retrieval → rerank → diversify ----------------------
 @st.cache_resource(show_spinner=False)
 def get_embedder():
     return SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+
+@st.cache_resource(show_spinner=False)
+def get_cross_encoder():
+    if CrossEncoder is None:
+        return None
+    try:
+        return CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+    except Exception:
+        return None
+
+def retrieve_hybrid_then_rerank(
+    col,                                 # v4 collection handle (tenant already bound)
+    query_text: str,
+    query_vec: List[float],
+    k_candidates: int = CANDIDATES_K,
+    k_final: int = FINAL_K,
+    max_chars_per_passage: int = 1100,
+) -> List[Dict[str, Any]]:
+
+    # 1) HYBRID (falls back to dense-only)
+    try:
+        meta = MetadataQuery(distance=True, score=True) if MetadataQuery else None
+        res = col.query.hybrid(
+            query=query_text,
+            vector=query_vec,
+            alpha=0.5,
+            limit=k_candidates,
+            return_properties=["doc_id","source","chunk_index","text"],
+            return_metadata=meta,
+        )
+    except Exception:
+        res = col.query.near_vector(
+            vector=query_vec,
+            limit=k_candidates,
+            return_properties=["doc_id","source","chunk_index","text"],
+            return_metadata=MetadataQuery(distance=True) if MetadataQuery else None,
+        )
+
+    objs = res.objects or []
+    rows = []
+    for o in objs:
+        p = o.properties or {}
+        m = getattr(o, "metadata", None)
+        rows.append({
+            "doc_id": p.get("doc_id"),
+            "source": p.get("source"),
+            "chunk_index": p.get("chunk_index"),
+            "text": (p.get("text") or "").strip(),
+            "dist": getattr(m, "distance", None),
+            "kw": getattr(m, "score", None),
+        })
+    if not rows:
+        return []
+
+    # 2) Lightweight blend score (lower is better)
+    def is_csv(r):
+        s = (r["source"] or "").lower()
+        return s.endswith(".csv") or ".csv." in s or s.endswith(".bin")
+    def blend(r):
+        d = r["dist"] if isinstance(r["dist"], (float, int)) else 1.0
+        k = r["kw"]   if isinstance(r["kw"], (float, int)) else 0.0
+        val = 0.7 * d + 0.3 * (1.0 - k)
+        if is_csv(r):
+            val += 0.05
+        return val
+    rows.sort(key=blend)
+
+    # Optional cross-encoder rerank on the top N
+    ce = get_cross_encoder()
+    if ce is not None:
+        pool = rows[: max(20, k_final * 3)]
+        pairs = [(query_text, r["text"]) for r in pool]
+        try:
+            scores = ce.predict(pairs).tolist()
+            for r, s in zip(pool, scores):
+                r["ce"] = float(s)
+            pool.sort(key=lambda x: x.get("ce", -1.0), reverse=True)
+            rows = pool + rows[len(pool):]
+        except Exception:
+            pass
+
+    # 3) Diversify by source
+    seen = set()
+    picked = []
+    for r in rows:
+        src = r["source"]
+        if src in seen and len(picked) < k_final // 2:
+            continue
+        seen.add(src)
+        picked.append(r)
+        if len(picked) >= k_final * 2:
+            break
+
+    # 4) Pack
+    out = []
+    for r in picked[:k_final]:
+        txt = r["text"][:max_chars_per_passage]
+        out.append({
+            "doc_id": r["doc_id"],
+            "source": r["source"],
+            "chunk_index": r["chunk_index"],
+            "text": txt,
+            "score": r.get("dist"),
+        })
+    return out
+
 
 def embed_texts(texts: List[str]) -> List[List[float]]:
     if not texts:
         return []
     model = get_embedder()
     return model.encode(texts, show_progress_bar=False, normalize_embeddings=True).tolist()
+
 
 # ---------------------- Ingestion ----------------------
 def ingest_from_azure_to_weaviate(connection_string: str, container: str, prefix: str,
@@ -681,7 +798,10 @@ def ingest_from_azure_to_weaviate(connection_string: str, container: str, prefix
             if not text:
                 status_cb(f"⚠️ No text extracted from {blob_name}; skipping.")
                 continue
-            chunks = chunk_text(text)
+
+            # CHUNK: prefix with filename so retrieval sees it as a signal
+            chunks_raw = chunk_text(text)
+            chunks = [f"FILE: {blob_name}\n{ch}" for ch in chunks_raw]
             if not chunks:
                 continue
 
@@ -702,6 +822,7 @@ def ingest_from_azure_to_weaviate(connection_string: str, container: str, prefix
         except Exception as e:
             status_cb(f"⚠️ Failed on {blob_name}: {e}")
     return total
+
 
 # ---------------------- Claude ----------------------
 def call_claude(api_key: str, system_prompt: str, user_prompt: str, stream: bool = True):
@@ -727,6 +848,7 @@ def call_claude(api_key: str, system_prompt: str, user_prompt: str, stream: bool
         except Exception:
             return str(resp)
 
+
 # ---------------------- UI ----------------------
 st.set_page_config(page_title="RAG Chat — Claude + Weaviate + Azure", page_icon="💬", layout="wide")
 
@@ -743,17 +865,17 @@ st.title("💬 RAG Chat — Claude + Weaviate + Azure Blob")
 
 with st.sidebar:
     st.header("⚙️ Settings")
-    az = st.secrets.get("azure", {})
+    az   = st.secrets.get("azure", {})
     weav = st.secrets.get("weaviate", {})
     anth = st.secrets.get("anthropic", {})
 
     # Azure
     connection_string = az.get("connection_string", "")
-    container = az.get("container", "")
-    prefix = az.get("prefix", "KB/")
+    container         = az.get("container", "")
+    prefix            = az.get("prefix", "KB/")
 
     # Weaviate
-    w_url = weav.get("url", "")
+    w_url     = weav.get("url", "")
     w_api_key = weav.get("api_key", None)
     w_tenancy = weav.get("tenancy", None)  # optional (v4 MT)
 
@@ -761,6 +883,8 @@ with st.sidebar:
     anthropic_key = anth.get("api_key", "")
 
     top_k = st.number_input("Top-K passages", min_value=1, max_value=15, value=TOP_K_DEFAULT, step=1)
+    cand_k = st.slider("Candidate pool (hybrid)", 20, 120, CANDIDATES_K, step=10)
+    final_k = st.slider("Final passages to LLM", 4, 20, FINAL_K, step=1)
 
     st.divider()
     st.caption("🧠 Index KB → Weaviate")
@@ -816,9 +940,10 @@ st.subheader("Chat")
 user_q = st.chat_input("Ask about your Knowledge Base…")
 
 if user_q:
-    # 1) embed & retrieve
+    # 1) embed & retrieve (HYBRID → rerank → diversify)
     q_vec = embed_texts([user_q])[0]
-    hits = vector_search(w_client, CLASS_NAME, q_vec, top_k, tenancy=w_tenancy)
+    col = w_client.collections.get(CLASS_NAME, tenant=w_tenancy) if (V4 and w_tenancy) else w_client.collections.get(CLASS_NAME)
+    hits = retrieve_hybrid_then_rerank(col, user_q, q_vec, k_candidates=cand_k, k_final=final_k)
 
     # 2) build prompt context
     context_blocks, source_chips = [], []
@@ -830,54 +955,66 @@ if user_q:
         context_blocks.append(f"[{i+1}] Source: {h.get('source')} (chunk {h.get('chunk_index')})\n{t}")
         if h.get("source"):
             source_chips.append(h["source"])
-    context_text = "\n\n".join(context_blocks) if context_blocks else "No relevant context retrieved."
+    context_text = "\n\n".join(context_blocks)
+
+    # Answerability gate (avoid hallucinations if retrieval is weak)
+    enough = len(hits) >= 2 and sum(len(h["text"]) for h in hits) >= 800
 
     system_prompt = (
-        "You are a precise assistant that answers ONLY using the provided context when possible. "
-        "If the answer is not in the context, say you don't have that info. "
-        "Cite sources by their [index] when you use them."
-    )
-    user_prompt = (
-        f"User question:\n{user_q}\n\n"
-        f"Context passages (numbered):\n{context_text}\n\n"
-        "Instructions:\n- Prefer quoting or paraphrasing the context.\n"
-        "- Use [1], [2], ... to cite snippets you relied on.\n"
-        "- If important details are missing, say what else you need."
+        "You are a strict, grounded assistant.\n"
+        "- Answer ONLY with facts from the provided passages.\n"
+        "- If the passages don’t contain the answer, say: "
+        "\"I don’t have enough information in the context.\"\n"
+        "- Be concise. Do not speculate. No external knowledge.\n"
+        "- Cite snippets with [1], [2], ... next to claims you use.\n"
     )
 
-    # 3) stream to UI
-    with st.chat_message("assistant"):
-        placeholder = st.empty()
-        sources_holder = st.container()
-        try:
-            with call_claude(anthropic_key, system_prompt, user_prompt, stream=True) as stream_resp:
-                text_accum = ""
-                for event in stream_resp:
-                    if event.type == "content_block_delta":
-                        delta_text = getattr(getattr(event, "delta", None), "text", None)
-                        if delta_text:
-                            text_accum += delta_text
-                            placeholder.markdown(
-                                f"<div class='chat-bubble-assistant'>{text_accum}</div>",
-                                unsafe_allow_html=True
-                            )
-                final_text = (text_accum or "").strip()
-                if not final_text:
-                    final_text = "I couldn't generate a response."
+    if not enough:
+        final_text = "I don’t have enough information in the retrieved context to answer that. Try syncing the KB or rephrasing."
+        with st.chat_message("assistant"):
+            st.markdown(f"<div class='chat-bubble-assistant'>{final_text}</div>", unsafe_allow_html=True)
+    else:
+        user_prompt = (
+            f"Question: {user_q}\n\n"
+            f"Passages (use them only):\n{context_text}\n\n"
+            "Write a short answer using only the passages above. "
+            "If missing, say you don’t have enough information. "
+            "Add citation markers like [1], [2] next to each claim."
+        )
+
+        # 3) stream to UI
+        with st.chat_message("assistant"):
+            placeholder = st.empty()
+            sources_holder = st.container()
+            try:
+                with call_claude(anthropic_key, system_prompt, user_prompt, stream=True) as stream_resp:
+                    text_accum = ""
+                    for event in stream_resp:
+                        if event.type == "content_block_delta":
+                            delta_text = getattr(getattr(event, "delta", None), "text", None)
+                            if delta_text:
+                                text_accum += delta_text
+                                placeholder.markdown(
+                                    f"<div class='chat-bubble-assistant'>{text_accum}</div>",
+                                    unsafe_allow_html=True
+                                )
+                    final_text = (text_accum or "").strip()
+                    if not final_text:
+                        final_text = "I couldn't generate a response."
+                    placeholder.markdown(
+                        f"<div class='chat-bubble-assistant'>{final_text}</div>",
+                        unsafe_allow_html=True
+                    )
+            except Exception as e:
+                final_text = f"Sorry, streaming failed: {e}"
                 placeholder.markdown(
                     f"<div class='chat-bubble-assistant'>{final_text}</div>",
                     unsafe_allow_html=True
                 )
-        except Exception as e:
-            final_text = f"Sorry, streaming failed: {e}"
-            placeholder.markdown(
-                f"<div class='chat-bubble-assistant'>{final_text}</div>",
-                unsafe_allow_html=True
-            )
 
-    if source_chips:
-        chips_html = "".join([f"<span class='source-chip'>{s}</span>" for s in source_chips[:10]])
-        sources_holder.markdown(f"<div class='small-dim'>Sources: {chips_html}</div>", unsafe_allow_html=True)
+        if source_chips:
+            chips_html = "".join([f"<span class='source-chip'>{s}</span>" for s in source_chips[:12]])
+            sources_holder.markdown(f"<div class='small-dim'>Sources: {chips_html}</div>", unsafe_allow_html=True)
 
     # 4) save history
     st.session_state.history.append({"role": "user", "content": user_q})
@@ -892,7 +1029,7 @@ if st.session_state.history:
         with st.chat_message(role):
             st.markdown(f"<div class='{css}'>{msg['content']}</div>", unsafe_allow_html=True)
             if role == "assistant" and msg.get("sources"):
-                chips = "".join([f"<span class='source-chip'>{s}</span>" for s in msg["sources"][:10]])
+                chips = "".join([f"<span class='source-chip'>{s}</span>" for s in msg["sources"][:12]])
                 st.markdown(f"<div class='small-dim'>Sources: {chips}</div>", unsafe_allow_html=True)
 
 # Clean up v4 client
