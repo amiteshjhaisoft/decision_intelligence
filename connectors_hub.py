@@ -1192,14 +1192,14 @@ with cB:
     st.markdown('</div>', unsafe_allow_html=True)
 
 # ---------------------- Footer Tip ----------------------
-st.write("")
-st.markdown(
-    """
-    <div class="footer-tip">
-      Names in the UI are always <b>“emoji + space + name”</b> (e.g., <code>❄️ Snowflake</code>).<br/>
-      To show official logos, drop files into <code>./assets</code> with names like
-      <code>snowflake.svg</code>, <code>postgres.png</code>, <code>azureblob.png</code>.
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
+# st.write("")
+# st.markdown(
+#     """
+#     <div class="footer-tip">
+#       Names in the UI are always <b>“emoji + space + name”</b> (e.g., <code>❄️ Snowflake</code>).<br/>
+#       To show official logos, drop files into <code>./assets</code> with names like
+#       <code>snowflake.svg</code>, <code>postgres.png</code>, <code>azureblob.png</code>.
+#     </div>
+#     """,
+#     unsafe_allow_html=True,
+# )
