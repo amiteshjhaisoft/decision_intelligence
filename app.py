@@ -58,6 +58,13 @@ try:
 except Exception as e:
     raise RuntimeError("Missing dependency: langchain-text-splitters") from e
 
+# add this import near your other weaviate imports (inside the v4 try/except)
+try:
+    from weaviate.classes.tenants import Tenant  # v4 only
+except Exception:
+    Tenant = None
+
+
 
 # ---------------------- App constants ----------------------
 CLASS_NAME = "KBChunk"
@@ -298,22 +305,46 @@ def make_weaviate_client(url: str, api_key: Optional[str]) -> Any:
 
 
 def ensure_collection(client: Any, class_name: str = CLASS_NAME, tenancy: Optional[str] = None) -> None:
+    """
+    Ensure a KBChunk collection/class exists. In v4, list_all() returns names (str),
+    not objects with .name. If a tenant name is provided, ensure the tenant exists.
+    """
     if V4:
-        cols = client.collections.list_all()
-        if class_name in [c.name for c in cols]:
-            return
-        client.collections.create(
-            name=class_name,
-            vectorizer_config=Configure.Vectorizer.none(),
-            properties=[
-                Property(name="doc_id", data_type=DataType.TEXT),
-                Property(name="source", data_type=DataType.TEXT),
-                Property(name="chunk_index", data_type=DataType.INT),
-                Property(name="text", data_type=DataType.TEXT),
-            ],
-            multi_tenancy_config=Configure.multi_tenancy(enabled=bool(tenancy)) if tenancy else None,
-        )
+        # list_all() -> List[str] in recent v4
+        try:
+            existing_names = client.collections.list_all()
+            # older v4 SDKs might return objects; normalize
+            existing_names = [getattr(c, "name", c) for c in existing_names]
+        except Exception:
+            existing_names = []
+
+        # Create the collection if missing
+        if class_name not in existing_names:
+            mt_cfg = Configure.multi_tenancy(enabled=bool(tenancy)) if tenancy else None
+            client.collections.create(
+                name=class_name,
+                vectorizer_config=Configure.Vectorizer.none(),
+                properties=[
+                    Property(name="doc_id", data_type=DataType.TEXT),
+                    Property(name="source", data_type=DataType.TEXT),
+                    Property(name="chunk_index", data_type=DataType.INT),
+                    Property(name="text", data_type=DataType.TEXT),
+                ],
+                multi_tenancy_config=mt_cfg,
+            )
+
+        # If multi-tenancy is requested, ensure the tenant exists
+        if tenancy:
+            col = client.collections.get(class_name)
+            try:
+                existing_tenants = [t.name for t in col.tenants.list_all()]
+            except Exception:
+                existing_tenants = []
+            if tenancy not in existing_tenants and Tenant is not None:
+                col.tenants.create(Tenant(name=tenancy))
+
     else:
+        # ------- v3 schema path -------
         schema = client.schema.get()
         existing = [c["class"] for c in schema.get("classes", [])]
         if class_name in existing:
@@ -329,6 +360,7 @@ def ensure_collection(client: Any, class_name: str = CLASS_NAME, tenancy: Option
             ],
         }
         client.schema.create_class(new_class)
+
 
 
 def upsert_chunks(client: Any, class_name: str, items: List[Dict[str, Any]], vectors: List[List[float]], tenancy: Optional[str] = None) -> int:
