@@ -367,7 +367,22 @@ def upsert_chunks(client: Any, class_name: str, items: List[Dict[str, Any]], vec
     if not items:
         return 0
     if V4:
-        col = client.collections.get(class_name)
+        # Bind tenant on the collection handle (works across v4 minors)
+        col = client.collections.get(class_name, tenant=tenancy) if tenancy else client.collections.get(class_name)
+
+        # MT: insert one-by-one (some v4 minors don't support tenant= in batch)
+        if tenancy:
+            count = 0
+            for it, vec in zip(items, vectors):
+                col.data.insert(
+                    properties=it["properties"],
+                    uuid=it["id"],
+                    vector=vec,
+                )
+                count += 1
+            return count
+
+        # Non-MT: use batch for speed
         count = 0
         with col.batch.dynamic() as batch:
             for it, vec in zip(items, vectors):
@@ -375,35 +390,35 @@ def upsert_chunks(client: Any, class_name: str, items: List[Dict[str, Any]], vec
                     properties=it["properties"],
                     uuid=it["id"],
                     vector=vec,
-                    tenant=tenancy,
                 )
                 count += 1
         return count
-    else:
-        batch = client.batch
-        batch.configure(batch_size=64, num_workers=2)
-        with batch as b:
-            for it, vec in zip(items, vectors):
-                b.add_data_object(
-                    data_object=it["properties"],
-                    class_name=class_name,
-                    uuid=it["id"],
-                    vector=vec,
-                )
-        return len(items)
+
+    # ---- v3 client ----
+    batch = client.batch
+    batch.configure(batch_size=64, num_workers=2)
+    with batch as b:
+        for it, vec in zip(items, vectors):
+            b.add_data_object(
+                data_object=it["properties"],
+                class_name=class_name,
+                uuid=it["id"],
+                vector=vec,
+            )
+    return len(items)
 
 
 def vector_search(client: Any, class_name: str, query_vec: List[float], top_k: int, tenancy: Optional[str] = None) -> List[Dict[str, Any]]:
     if V4:
-        col = client.collections.get(class_name)
+        # Bind tenant here; do NOT pass tenant= into near_vector
+        col = client.collections.get(class_name, tenant=tenancy) if tenancy else client.collections.get(class_name)
         res = col.query.near_vector(
-            vector=query_vec,                  # ← use `vector=`
+            vector=query_vec,
             limit=top_k,
-            tenant=tenancy,
             return_metadata=["distance"],
             return_properties=["doc_id", "source", "chunk_index", "text"],
         )
-        out: List[Dict[str, Any]] = []
+        out = []
         for o in res.objects:
             props = o.properties or {}
             dist = o.metadata.distance if getattr(o, "metadata", None) else None
@@ -416,7 +431,22 @@ def vector_search(client: Any, class_name: str, query_vec: List[float], top_k: i
             })
         return out
     else:
-        ...
+        res = (
+            client.query
+            .get(class_name, ["doc_id", "source", "chunk_index", "text"])
+            .with_near_vector({"vector": query_vec})
+            .with_limit(top_k)
+            .do()
+        )
+        hits = res.get("data", {}).get("Get", {}).get(class_name, []) or []
+        return [
+            {"doc_id": h.get("doc_id"), "source": h.get("source"),
+             "chunk_index": h.get("chunk_index"), "text": h.get("text"),
+             "score": None}
+            for h in hits
+        ]
+
+
 # ---------------------- Embeddings ----------------------
 @st.cache_resource(show_spinner=False)
 def get_embedder():
