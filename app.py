@@ -76,7 +76,7 @@ CLASS_NAME = "KBChunk"
 CHUNK_SIZE = 900
 CHUNK_OVERLAP = 150
 TOP_K_DEFAULT = 5
-CLAUDE_MODEL = "claude-4-5-sonnet"  # set your preferred Claude model
+CLAUDE_MODEL = "claude-sonnet-4-5"  # set your preferred Claude model
 
 
 # ---------------------- Helpers ----------------------
