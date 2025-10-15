@@ -1,34 +1,30 @@
-# Author: Amitesh Jha | iSoft | 2025-10-12 (full, fixed)
+# Author: Amitesh Jha | iSoft | 2025-10-12 (full, diagnostics)
 # Streamlit RAG chat using Claude + Azure Blob + Weaviate (cloud/local)
-# - Downloads KB from Azure (prefix), parses common doc types
-# - Chunks & embeds locally (MiniLM) and upserts to Weaviate
-# - Retrieves top-k matches and chats with Claude
-# - Works with weaviate-client v4 (WCS/custom); v3 fallback only if package is 3.x
 
 from __future__ import annotations
 
-import io, os, json, hashlib, tempfile
+import io, os, json, hashlib, socket, ssl, tempfile, time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import streamlit as st
 
-# --- IMPORTANT: avoid TLS EOFs on some edges/proxies (must be set BEFORE importing weaviate)
+# ---- IMPORTANT: avoid odd TLS EOFs through proxies/edges (must be set BEFORE importing weaviate)
 os.environ.setdefault("HTTPX_DISABLE_HTTP2", "1")
 
-# ------- Required deps (with friendly errors) -------
+# ---- Required deps ----
 try:
-    from azure.storage.blob import BlobServiceClient  # pip install azure-storage-blob
+    from azure.storage.blob import BlobServiceClient
 except Exception as e:
     raise RuntimeError("Missing dependency: azure-storage-blob") from e
 
 try:
-    import weaviate  # pip install weaviate-client>=4.6.0
+    import weaviate  # v4 preferred (>=4.6.0)
 except Exception as e:
     raise RuntimeError("Missing dependency: weaviate-client") from e
 
-# Detect v4 helpers; otherwise we’ll use v3
+# Detect v4 helpers
 try:
     from weaviate.classes.init import Auth
     from weaviate.classes.config import Property, DataType, Configure
@@ -37,28 +33,28 @@ except Exception:
     V4 = False
 
 try:
-    from sentence_transformers import SentenceTransformer  # pip install sentence-transformers
+    from sentence_transformers import SentenceTransformer
 except Exception as e:
     raise RuntimeError("Missing dependency: sentence-transformers") from e
 
 try:
-    from anthropic import Anthropic  # pip install anthropic
+    from anthropic import Anthropic
 except Exception as e:
     raise RuntimeError("Missing dependency: anthropic") from e
 
 # Optional parsers
 try:
-    from pypdf import PdfReader  # pip install pypdf
+    from pypdf import PdfReader
 except Exception:
     PdfReader = None
 
 try:
-    import docx  # pip install python-docx
+    import docx
 except Exception:
     docx = None
 
 try:
-    from langchain_text_splitters import RecursiveCharacterTextSplitter  # pip install langchain-text-splitters
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
 except Exception as e:
     raise RuntimeError("Missing dependency: langchain-text-splitters") from e
 
@@ -68,12 +64,13 @@ CLASS_NAME = "KBChunk"
 CHUNK_SIZE = 900
 CHUNK_OVERLAP = 150
 TOP_K_DEFAULT = 5
-CLAUDE_MODEL = "claude-4-5-sonnet"  # update to your preferred Claude model
+CLAUDE_MODEL = "claude-4-5-sonnet"  # set your preferred Claude model
 
 
 # ---------------------- Helpers ----------------------
 def _hash(s: str) -> str:
-    return hashlib.md5(s.encode("utf-8")).hexdigest()
+    import hashlib as _h
+    return _h.md5(s.encode("utf-8")).hexdigest()
 
 
 def read_pdf_bytes(b: bytes) -> str:
@@ -119,7 +116,6 @@ def guess_and_read_blob(name: str, b: bytes) -> str:
         return read_pdf_bytes(b)
     if ext == ".docx":
         return read_docx_bytes(b)
-    # best effort for unknowns
     return read_text_like_bytes(b)
 
 
@@ -133,10 +129,6 @@ def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVE
 
 # ---------------------- Azure loader ----------------------
 def list_and_download_kb(container: str, prefix: str, connection_string: str, cache_dir: Path) -> List[Tuple[str, Path]]:
-    """
-    Download blobs under prefix into cache_dir, return list of (blob_name, local_path).
-    Uses ETag cache to avoid re-downloading unchanged blobs.
-    """
     cache_dir.mkdir(parents=True, exist_ok=True)
     bsc = BlobServiceClient.from_connection_string(connection_string)
     cont = bsc.get_container_client(container)
@@ -172,97 +164,142 @@ def list_and_download_kb(container: str, prefix: str, connection_string: str, ca
     return results
 
 
-# ---------------------- Weaviate client (v4 with safe fallback) ----------------------
+# ---------------------- Connectivity diagnostics ----------------------
+def run_weaviate_diagnostics(base_url: str, api_key: Optional[str]) -> Dict[str, Any]:
+    info: Dict[str, Any] = {"url": base_url}
+    try:
+        u = urlparse(base_url)
+        host = u.hostname or ""
+        port = u.port or (443 if u.scheme == "https" else 80)
+        info["parsed"] = {"scheme": u.scheme, "host": host, "port": port}
+
+        # DNS
+        try:
+            addrs = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
+            info["dns"] = [f"{a[4][0]}:{a[4][1]}" for a in addrs]
+        except Exception as e:
+            info["dns_error"] = repr(e)
+
+        # TCP
+        try:
+            s = socket.create_connection((host, port), timeout=6)
+            s.close()
+            info["tcp_ok"] = True
+        except Exception as e:
+            info["tcp_error"] = repr(e)
+
+        # HTTPS /.well-known/ready (no auth)
+        try:
+            import urllib.request
+            ready_url = base_url.rstrip("/") + "/v1/.well-known/ready"
+            ctx = ssl.create_default_context()
+            with urllib.request.urlopen(ready_url, context=ctx, timeout=8) as r:
+                info["ready_no_auth"] = f"HTTP {r.status}"
+        except Exception as e:
+            info["ready_no_auth_error"] = repr(e)
+
+        # HTTPS /.well-known/ready (with Bearer)
+        try:
+            import urllib.request
+            ready_url = base_url.rstrip("/") + "/v1/.well-known/ready"
+            ctx = ssl.create_default_context()
+            req = urllib.request.Request(ready_url, headers={"Authorization": f"Bearer {api_key}"} if api_key else {})
+            with urllib.request.urlopen(req, context=ctx, timeout=8) as r:
+                info["ready_with_auth"] = f"HTTP {r.status}"
+        except Exception as e:
+            info["ready_with_auth_error"] = repr(e)
+    except Exception as e:
+        info["diagnostics_error"] = repr(e)
+    return info
+
+
+# ---------------------- Weaviate client (v4 with safe fallbacks) ----------------------
 def make_weaviate_client(url: str, api_key: Optional[str]) -> Any:
     """
-    Robust connector for Weaviate:
-      - v4 + WCS (.weaviate.network): connect_to_weaviate_cloud(cluster_url=..., auth_credentials=...)
-      - v4 + Self-hosted:            connect_to_custom(http_* and grpc_* params)
-      - v3 fallback ONLY if the installed package is actually v3.x
+    v4 WCS (cloud) -> v4 custom (with and without gRPC) -> v3 fallback only if client is 3.x
     """
     ver = getattr(weaviate, "__version__", "unknown")
     is_v3_pkg = ver.startswith("3.")
-    try:
-        st.caption(f"📦 weaviate-client version: {ver} (V4 symbols present: {bool(V4)})")
-    except Exception:
-        pass
+    st.caption(f"📦 weaviate-client version: {ver} (V4 symbols: {bool(V4)})")
 
     if V4:
         auth = Auth.api_key(api_key) if api_key else None
 
-        # 1) WCS (cloud) path
+        # 1) WCS (cloud)
         try:
             if "weaviate.network" in url or "wcs" in url:
-                st.caption("🔌 using connect_to_weaviate_cloud(cluster_url=...)")
+                st.caption("🔌 connect_to_weaviate_cloud(cluster_url=...)")
                 client = weaviate.connect_to_weaviate_cloud(
-                    cluster_url=url,
-                    auth_credentials=auth,
-                    skip_init_checks=True,
+                    cluster_url=url, auth_credentials=auth, skip_init_checks=True
                 )
-                client.is_connected()  # fail fast
-                st.caption("✅ connected via WCS")
+                client.is_connected()
+                st.caption("✅ WCS connected")
                 return client
         except Exception as e:
             st.warning(f"WCS connect failed (will try custom): {e}")
 
-        # 2) Custom/self-hosted path — some builds require gRPC params
+        # 2) Custom WITH gRPC
         try:
             u = urlparse(url)
             if not u.scheme or not u.netloc:
                 raise ValueError(f"Invalid Weaviate URL: {url}")
             http_secure = (u.scheme == "https")
             http_host = u.hostname
-            http_port = u.port if u.port else (443 if http_secure else 80)
-
-            # gRPC params — mirror HTTP host/port unless you know different ports.
+            http_port = u.port or (443 if http_secure else 80)
             grpc_host = http_host
             grpc_secure = http_secure
-            grpc_port = 50051  # adjust if your cluster uses a different gRPC port
+            grpc_port = 50051  # change if your cluster uses a different gRPC port
 
             st.caption(
-                f"🔌 using connect_to_custom(http_host={http_host}, http_port={http_port}, https={http_secure}, "
-                f"grpc_host={grpc_host}, grpc_port={grpc_port}, grpc_https={grpc_secure})"
+                f"🔌 connect_to_custom(http={http_host}:{http_port} https={http_secure}, "
+                f"grpc={grpc_host}:{grpc_port} tls={grpc_secure})"
             )
             client = weaviate.connect_to_custom(
-                http_host=http_host,
-                http_port=http_port,
-                http_secure=http_secure,
-                grpc_host=grpc_host,
-                grpc_port=grpc_port,
-                grpc_secure=grpc_secure,
-                auth_credentials=auth,
-                skip_init_checks=True,
+                http_host=http_host, http_port=http_port, http_secure=http_secure,
+                grpc_host=grpc_host, grpc_port=grpc_port, grpc_secure=grpc_secure,
+                auth_credentials=auth, skip_init_checks=True,
             )
             client.is_connected()
-            st.caption("✅ connected via custom")
+            st.caption("✅ custom connected (with gRPC)")
             return client
         except Exception as e:
-            st.warning(f"Custom connect failed (v4): {e}")
+            st.warning(f"Custom (with gRPC) failed, trying without gRPC: {e}")
 
-    # 3) v3 fallback — only if package is actually v3.x
+        # 3) Custom WITHOUT gRPC (some gateways block gRPC entirely)
+        try:
+            u = urlparse(url)
+            http_secure = (u.scheme == "https")
+            http_host = u.hostname
+            http_port = u.port or (443 if http_secure else 80)
+            st.caption(f"🔌 connect_to_custom(http={http_host}:{http_port} https={http_secure}, no gRPC)")
+            client = weaviate.connect_to_custom(
+                http_host=http_host, http_port=http_port, http_secure=http_secure,
+                auth_credentials=auth, skip_init_checks=True,
+            )
+            client.is_connected()
+            st.caption("✅ custom connected (no gRPC)")
+            return client
+        except Exception as e:
+            st.warning(f"Custom (no gRPC) failed: {e}")
+
+    # 4) v3 fallback ONLY if the installed package is 3.x
     if is_v3_pkg:
         try:
-            st.caption("🔌 using v3 Client(url=...)")
+            st.caption("🔌 v3 Client(url=...)")
             from weaviate import Client
             from weaviate.auth import AuthApiKey
-            client = Client(
-                url=url,
-                auth_client_secret=AuthApiKey(api_key) if api_key else None,
-            )
-            client.schema.get()  # health probe
-            st.caption("✅ connected via v3 client")
+            client = Client(url=url, auth_client_secret=AuthApiKey(api_key) if api_key else None)
+            client.schema.get()
+            st.caption("✅ v3 connected")
             return client
         except Exception as e:
             st.warning(f"v3 fallback failed: {e}")
 
-    # If we got here, all strategies failed
+    # 5) Total failure → raise (the sidebar diagnostics can help pinpoint)
     raise RuntimeError("All connection strategies failed. Check URL, API key, networking/IP allow-list, and TLS.")
 
 
 def ensure_collection(client: Any, class_name: str = CLASS_NAME, tenancy: Optional[str] = None) -> None:
-    """
-    Ensure a KBChunk collection/class exists (no built-in vectorizer; we push vectors ourselves).
-    """
     if V4:
         cols = client.collections.list_all()
         if class_name in [c.name for c in cols]:
@@ -297,13 +334,8 @@ def ensure_collection(client: Any, class_name: str = CLASS_NAME, tenancy: Option
 
 
 def upsert_chunks(client: Any, class_name: str, items: List[Dict[str, Any]], vectors: List[List[float]], tenancy: Optional[str] = None) -> int:
-    """
-    items[i]: { id: str, properties: {doc_id, source, chunk_index, text} }
-    vectors[i]: embedding list
-    """
     if not items:
         return 0
-
     if V4:
         col = client.collections.get(class_name)
         count = 0
@@ -486,16 +518,11 @@ with st.sidebar:
     st.caption("Health checks")
     show_health = st.checkbox("Show connection details")
 
-    # Optional quick ready probe (HTTP)
-    if st.button("Connectivity test (/.well-known/ready)"):
-        try:
-            import urllib.request, ssl
-            ready_url = (w_url.rstrip("/") + "/v1/.well-known/ready")
-            ctx = ssl.create_default_context()
-            with urllib.request.urlopen(ready_url, context=ctx, timeout=10) as r:
-                st.success(f"HTTP {r.status} from {ready_url}")
-        except Exception as e:
-            st.error(f"HTTP probe failed: {e}")
+    st.divider()
+    st.caption("🔎 Connectivity diagnostics")
+    if st.button("Run diagnostics"):
+        diag = run_weaviate_diagnostics(w_url, w_api_key)
+        st.json(diag)
 
 if show_health:
     st.write("**Azure**", {"container": container, "prefix": prefix, "conn_str_set": bool(connection_string)})
@@ -509,7 +536,7 @@ if show_health:
 
 # Guards
 if not w_url:
-    st.error("Please set [weaviate].url in .streamlit/secrets.toml")
+    st.error("Please set [weaviate].url in .streamlit/secrets.toml (cluster URL, no /v1)")
     st.stop()
 if not anthropic_key:
     st.warning("Missing [anthropic].api_key — add your ANTHROPIC key to secrets to chat.")
