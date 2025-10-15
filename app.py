@@ -432,7 +432,7 @@ def run_weaviate_diagnostics(base_url: str, api_key: Optional[str]) -> Dict[str,
         # DNS
         try:
             addrs = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
-            info["dns"] = [f"{a[4][0]}}:{a[4][1]}" for a in addrs]
+            info["dns"] = [f"{a[4][0]}:{a[4][1]}" for a in addrs]
         except Exception as e:
             info["dns_error"] = repr(e)
 
