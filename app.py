@@ -365,14 +365,16 @@ def vector_search(client: Any, class_name: str, query_vec: List[float], top_k: i
     if V4:
         col = client.collections.get(class_name)
         res = col.query.near_vector(
-            near_vector=query_vec, limit=top_k, tenant=tenancy,
+            vector=query_vec,                  # ← use `vector=`
+            limit=top_k,
+            tenant=tenancy,
             return_metadata=["distance"],
             return_properties=["doc_id", "source", "chunk_index", "text"],
         )
         out: List[Dict[str, Any]] = []
         for o in res.objects:
             props = o.properties or {}
-            dist = getattr(o, "metadata", None).distance if getattr(o, "metadata", None) else None
+            dist = o.metadata.distance if getattr(o, "metadata", None) else None
             out.append({
                 "doc_id": props.get("doc_id"),
                 "source": props.get("source"),
@@ -382,25 +384,7 @@ def vector_search(client: Any, class_name: str, query_vec: List[float], top_k: i
             })
         return out
     else:
-        res = (
-            client.query
-            .get(class_name, ["doc_id", "source", "chunk_index", "text"])
-            .with_near_vector({"vector": query_vec})
-            .with_limit(top_k)
-            .do()
-        )
-        hits = res.get("data", {}).get("Get", {}).get(class_name, []) or []
-        return [
-            {
-                "doc_id": h.get("doc_id"),
-                "source": h.get("source"),
-                "chunk_index": h.get("chunk_index"),
-                "text": h.get("text"),
-                "score": None,
-            } for h in hits
-        ]
-
-
+        ...
 # ---------------------- Embeddings ----------------------
 @st.cache_resource(show_spinner=False)
 def get_embedder():
