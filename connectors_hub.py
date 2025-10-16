@@ -23,7 +23,7 @@ try:
 except NameError:
     APP_DIR = Path.cwd()
 
-# CONN_STORE = APP_DIR / "connections.json"
+CONN_STORE = APP_DIR / "connections.json"
 ASSETS_DIR = APP_DIR / "assets"  # optional logo files
 
 # ---------------------- Page Config & Global Style ----------------------
@@ -1402,21 +1402,21 @@ with main_left:
 # Pipelines helpers & UI (drop into your Streamlit page)
 # =================================================================================================
 
-from pathlib import Path
-from typing import Any, Dict, List
-import json
-import streamlit as st
+# from pathlib import Path
+# from typing import Any, Dict, List
+# import json
+# import streamlit as st
 
-# ---------------------------------------------------------------------------------
-# Files / stores
-# ---------------------------------------------------------------------------------
-try:
-    APP_DIR = Path(__file__).parent
-except NameError:
-    APP_DIR = Path.cwd()
+# # ---------------------------------------------------------------------------------
+# # Files / stores
+# # ---------------------------------------------------------------------------------
+# try:
+#     APP_DIR = Path(__file__).parent
+# except NameError:
+#     APP_DIR = Path.cwd()
 
-CONN_STORE = APP_DIR / "connections.json"
-PIPE_STORE = APP_DIR / "pipelines.json"
+# CONN_STORE = APP_DIR / "connections.json"
+# PIPE_STORE = APP_DIR / "pipelines.json"
 
 # ---------------------------------------------------------------------------------
 # Connections store helpers (read-only here)
