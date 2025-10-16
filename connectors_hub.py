@@ -705,7 +705,7 @@ def test_mongodb(cfg):
     except ModuleNotFoundError:
         return False, "Install library: pip install pymongo"
     except Exception as e:
-        return False, f"{e}")
+        return False, f"{e}"
 
 def test_cassandra(cfg):
     try:
@@ -718,7 +718,7 @@ def test_cassandra(cfg):
     except ModuleNotFoundError:
         return False, "Install library: pip install cassandra-driver"
     except Exception as e:
-        return False, f"{e}")
+        return False, f"{e}"
 
 def test_redis(cfg):
     try:
@@ -730,7 +730,7 @@ def test_redis(cfg):
     except ModuleNotFoundError:
         return False, "Install library: pip install redis"
     except Exception as e:
-        return False, f"{e}")
+        return False, f"{e}"
 
 def test_dynamodb(cfg):
     try:
@@ -744,7 +744,7 @@ def test_dynamodb(cfg):
     except ModuleNotFoundError:
         return False, "Install library: pip install boto3"
     except Exception as e:
-        return False, f"{e}")
+        return False, f"{e}"
 
 def test_neo4j(cfg):
     try:
@@ -756,7 +756,7 @@ def test_neo4j(cfg):
     except ModuleNotFoundError:
         return False, "Install library: pip install neo4j"
     except Exception as e:
-        return False, f"{e}")
+        return False, f"{e}"
 
 def test_elasticsearch(cfg):
     try:
@@ -769,7 +769,7 @@ def test_elasticsearch(cfg):
     except ModuleNotFoundError:
         return False, "Install library: pip install elasticsearch"
     except Exception as e:
-        return False, f"{e}")
+        return False, f"{e}"
 
 def test_cosmos(cfg):
     try:
@@ -780,7 +780,7 @@ def test_cosmos(cfg):
     except ModuleNotFoundError:
         return False, "Install library: pip install azure-cosmos"
     except Exception as e:
-        return False, f"{e}")
+        return False, f"{e}"
 
 def test_firestore(cfg):
     try:
@@ -792,7 +792,7 @@ def test_firestore(cfg):
     except ModuleNotFoundError:
         return False, "Install library: pip install google-cloud-firestore"
     except Exception as e:
-        return False, f"{e}")
+        return False, f"{e}"
 
 def test_bigtable(cfg):
     try:
@@ -805,7 +805,7 @@ def test_bigtable(cfg):
     except ModuleNotFoundError:
         return False, "Install library: pip install google-cloud-bigtable"
     except Exception as e:
-        return False, f"{e}")
+        return False, f"{e}"
 
 def test_s3(cfg):
     try:
@@ -819,7 +819,7 @@ def test_s3(cfg):
     except ModuleNotFoundError:
         return False, "Install library: pip install boto3 s3fs"
     except Exception as e:
-        return False, f"{e}")
+        return False, f"{e}"
 
 def test_azureblob(cfg):
     try:
@@ -839,7 +839,7 @@ def test_azureblob(cfg):
     except ModuleNotFoundError:
         return False, "Install library: pip install azure-storage-blob"
     except Exception as e:
-        return False, f"{e}")
+        return False, f"{e}"
 
 def test_adls(cfg):
     try:
@@ -854,7 +854,7 @@ def test_adls(cfg):
     except ModuleNotFoundError:
         return False, "Install library: pip install azure-storage-file-datalake"
     except Exception as e:
-        return False, f"{e}")
+        return False, f"{e}"
 
 def test_gcs(cfg):
     try:
@@ -868,7 +868,7 @@ def test_gcs(cfg):
     except ModuleNotFoundError:
         return False, "Install library: pip install google-cloud-storage gcsfs"
     except Exception as e:
-        return False, f"{e}")
+        return False, f"{e}"
 
 def test_hdfs(cfg):
     try:
@@ -880,7 +880,7 @@ def test_hdfs(cfg):
     except ModuleNotFoundError:
         return False, "Install library: pip install hdfs"
     except Exception as e:
-        return False, f"{e}")
+        return False, f"{e}"
 
 def test_kafka(cfg):
     try:
@@ -897,7 +897,7 @@ def test_kafka(cfg):
     except ModuleNotFoundError:
         return False, "Install library: pip install kafka-python"
     except Exception as e:
-        return False, f"{e}")
+        return False, f"{e}"
 
 def test_rabbitmq(cfg):
     try:
@@ -910,7 +910,7 @@ def test_rabbitmq(cfg):
     except ModuleNotFoundError:
         return False, "Install library: pip install pika"
     except Exception as e:
-        return False, f"{e}")
+        return False, f"{e}"
 
 def test_eventhubs(cfg):
     try:
@@ -923,7 +923,7 @@ def test_eventhubs(cfg):
     except ModuleNotFoundError:
         return False, "Install library: pip install azure-eventhub"
     except Exception as e:
-        return False, f"{e}")
+        return False, f"{e}"
 
 def test_pubsub(cfg):
     try:
@@ -936,7 +936,7 @@ def test_pubsub(cfg):
     except ModuleNotFoundError:
         return False, "Install library: pip install google-cloud-pubsub"
     except Exception as e:
-        return False, f"{e}")
+        return False, f"{e}"
 
 def test_kinesis(cfg):
     try:
@@ -950,7 +950,7 @@ def test_kinesis(cfg):
     except ModuleNotFoundError:
         return False, "Install library: pip install boto3"
     except Exception as e:
-        return False, f"{e}")
+        return False, f"{e}"
 
 def test_spark(cfg):
     try:
@@ -962,7 +962,7 @@ def test_spark(cfg):
     except ModuleNotFoundError:
         return False, "Install library: pip install pyspark"
     except Exception as e:
-        return False, f"{e}")
+        return False, f"{e}"
 
 def test_dask(cfg):
     try:
@@ -974,7 +974,7 @@ def test_dask(cfg):
     except ModuleNotFoundError:
         return False, "Install library: pip install dask distributed"
     except Exception as e:
-        return False, f"{e}")
+        return False, f"{e}"
 
 def test_salesforce(cfg):
     try:
@@ -986,7 +986,7 @@ def test_salesforce(cfg):
     except ModuleNotFoundError:
         return False, "Install library: pip install simple-salesforce"
     except Exception as e:
-        return False, f"{e}")
+        return False, f"{e}"
 
 def test_servicenow(cfg):
     try:
@@ -998,7 +998,7 @@ def test_servicenow(cfg):
     except ModuleNotFoundError:
         return False, "Install library: pip install pysnow"
     except Exception as e:
-        return False, f"{e}")
+        return False, f"{e}"
 
 def test_jira(cfg):
     try:
@@ -1009,7 +1009,7 @@ def test_jira(cfg):
     except ModuleNotFoundError:
         return False, "Install library: pip install jira"
     except Exception as e:
-        return False, f"{e}")
+        return False, f"{e}"
 
 def test_sharepoint(cfg):
     try:
@@ -1026,7 +1026,7 @@ def test_sharepoint(cfg):
     except ModuleNotFoundError:
         return False, "Install library: pip install msal"
     except Exception as e:
-        return False, f"{e}")
+        return False, f"{e}"
 
 def test_tableau(cfg):
     try:
@@ -1041,7 +1041,7 @@ def test_tableau(cfg):
     except ModuleNotFoundError:
         return False, "Install library: pip install tableauserverclient"
     except Exception as e:
-        return False, f"{e}")
+        return False, f"{e}"
 
 def test_gmail(cfg):
     try:
@@ -1053,7 +1053,7 @@ def test_gmail(cfg):
     except ModuleNotFoundError:
         return False, "Install libraries: pip install google-api-python-client google-auth-httplib2 google-auth-oauthlib"
     except Exception as e:
-        return False, f"{e}")
+        return False, f"{e}"
 
 def test_msgraph(cfg):
     return test_sharepoint(cfg)
