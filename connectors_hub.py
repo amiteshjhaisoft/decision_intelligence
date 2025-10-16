@@ -516,8 +516,8 @@ with st.sidebar:
 conn: Connector = REG_BY_ID[st.session_state["selected_id"]]
 
 # # ---------------------- Load store & KPIs ----------------------
-# all_profiles = _load_all()
-# total_profiles_all = sum(len(v) for v in all_profiles.values())
+all_profiles = _load_all()
+total_profiles_all = sum(len(v) for v in all_profiles.values())
 
 # # (Keep the red-circled KPIs)
 # k2, k3 = st.columns([1,1])
