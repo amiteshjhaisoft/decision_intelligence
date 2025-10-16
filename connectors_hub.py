@@ -1108,46 +1108,67 @@ def test_msgraph(cfg):
 def test_weaviate(cfg):
     """
     Test Weaviate connectivity with the v4 client.
-    Supports: WCS via cluster_url, or self-hosted via scheme/host/port.
-    Auth: API key (optional).
+    Prefers WCS via cluster_url; otherwise uses scheme/host/port.
+    Auth via API key (optional).
     """
     try:
+        from urllib.parse import urlparse
         from weaviate import connect_to_wcs, connect_to_custom
         from weaviate.classes.init import Auth
     except ModuleNotFoundError:
         return False, "Install library: pip install 'weaviate-client>=4,<5'"
 
+    client = None
     try:
-        # Inputs
         cluster_url = (cfg.get("cluster_url") or cfg.get("url") or "").strip().rstrip("/")
         api_key = (cfg.get("api_key") or "").strip() or None
-        scheme = (cfg.get("scheme") or "https").lower()
-        host = (cfg.get("host") or "").strip()
-        port = int(cfg.get("port") or (443 if scheme == "https" else 80))
-
         auth = Auth.api_key(api_key) if api_key else None
 
-        # Connect (prefer WCS)
         if cluster_url:
-            client = connect_to_wcs(cluster_url=cluster_url, auth_credentials=auth, timeout=5.0)
+            # WCS path (no timeout kw supported)
+            client = connect_to_wcs(cluster_url=cluster_url, auth_credentials=auth)
         else:
-            base_url = f"{scheme}://{host}" + ("" if (scheme == "https" and port == 443) or (scheme == "http" and port == 80) else f":{port}")
-            client = connect_to_custom(http_host=base_url, auth_credentials=auth, timeout=5.0)
+            # Normalize scheme/host/port; allow users to paste a URL into Host
+            scheme = (cfg.get("scheme") or "https").lower()
+            host_raw = (cfg.get("host") or "").strip()
+            port = cfg.get("port")
 
-        # Lightweight check; any call will validate auth + reachability.
+            if host_raw.startswith("http://") or host_raw.startswith("https://"):
+                parsed = urlparse(host_raw)
+                scheme = parsed.scheme or scheme
+                host = parsed.hostname or host_raw
+                port = port or parsed.port
+            else:
+                host = host_raw
+
+            if not host:
+                return False, "Host is required when Cluster URL is not provided."
+
+            if port in (None, "", 0):
+                port = 443 if scheme == "https" else 80
+
+            # Self-hosted/custom path: pass host/port/secure separately
+            client = connect_to_custom(
+                http_host=host,
+                http_port=int(port),
+                http_secure=(scheme == "https"),
+                auth_credentials=auth,
+            )
+
+        # Lightweight readiness/auth check
         try:
-            ready = client.is_ready()  # v4 readiness probe
-        except AttributeError:
-            # Fallback if the client version lacks is_ready()
-            # Listing collections is also a cheap, auth-protected call.
-            _ = list(getattr(client, "collections").list_all())  # will raise on failure
+            ready = bool(getattr(client, "is_ready", lambda: True)())
+        except Exception:
+            # Fallback: listing collections also validates reachability+auth
+            _ = list(client.collections.list_all())
             ready = True
 
         client.close()
         return (True, "Connected to Weaviate.") if ready else (False, "Weaviate is not ready.")
     except Exception as e:
         try:
-            client.close()  # just in case it was created
+            if client:
+                client.close()
         except Exception:
             pass
         return False, f"Failed to connect to Weaviate: {e}"
