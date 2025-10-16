@@ -1092,8 +1092,18 @@ def render_configure_form(container, conn: Connector):
         # Header row with inline Close (top-right) inside the card
         title_col, close_col = st.columns([10, 1])
         with title_col:
-            st.markdown('<div class="card-title-row"><h4 style="margin:0;">Configure connection profile</h4></div>',
-                        unsafe_allow_html=True)
+            # st.markdown('<div class="card-title-row"><h4 style="margin:0;">Configure connection profile</h4></div>',
+            #             unsafe_allow_html=True)
+            st.markdown(
+                """
+                <style>
+                  .rowhead { font-size:.9rem; color:#6b7280; margin-bottom:.25rem; }
+                  .action-col button[kind="secondary"] { padding: .3rem .5rem; }
+                </style>
+                <div class="card all-configured"><h3>Configure connection profile</h3>
+                """,
+                unsafe_allow_html=True,
+            )
         with close_col:
             if st.button("✖", key="close_rhs", type="secondary", help="Close", use_container_width=True):
                 st.session_state["rhs_open"] = False
