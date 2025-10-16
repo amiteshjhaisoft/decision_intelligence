@@ -65,6 +65,9 @@ st.markdown(
       .rhs-aside .stTextArea, .rhs-aside .stNumberInput, .rhs-aside .stSelectbox { font-size: 0.95rem; }
       .rhs-aside .card { border-color:#E5E7EB; }
       .rhs-header { display:flex; align-items:center; justify-content:space-between; margin:.25rem 0 .5rem; }
+
+      /* small header row inside configure card */
+      .card-title-row{display:flex;align-items:center;justify-content:space-between;margin:0 0 .5rem;}
     </style>
     """,
     unsafe_allow_html=True,
@@ -537,7 +540,6 @@ def _prefill_and_open_editor(conn_id: str, profile: str, cfg: Dict[str, Any]) ->
     st.session_state[f"{conn_id}_profile_name"] = profile
     for f in REG_BY_ID[conn_id].fields:
         st.session_state[f"{conn_id}_{f.key}"] = cfg.get(f.key, "")
-
 
 # ---------------------- Header renderer ----------------------
 def render_header(container, conn: Connector, total_connectors: int, total_profiles: int, *, in_rhs: bool):
@@ -1084,8 +1086,18 @@ TEST_HANDLERS = {
 # --------------- Reusable: render Configure form into any container ---------------
 def render_configure_form(container, conn: Connector):
     with container:
-        # Title inside the card (requested)
-        st.markdown('<div class="card"><h4>Configure connection profile</h4>', unsafe_allow_html=True)
+        # Card shell
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+
+        # Header row with inline Close (top-right) inside the card
+        title_col, close_col = st.columns([10, 1])
+        with title_col:
+            st.markdown('<div class="card-title-row"><h4 style="margin:0;">Configure connection profile</h4></div>',
+                        unsafe_allow_html=True)
+        with close_col:
+            if st.button("✖", key="close_rhs", type="secondary", help="Close", use_container_width=True):
+                st.session_state["rhs_open"] = False
+                st.rerun()
 
         _keys = _get_state_keys(conn.id)
         for k in _keys.values():
@@ -1177,18 +1189,11 @@ if st.session_state["rhs_open"]:
         st.markdown('<div class="rhs-aside">', unsafe_allow_html=True)
         render_header(main_right, conn, len(REGISTRY), total_profiles_all, in_rhs=True)
 
-        # Keep a compact Close button above the card (title moved inside card)
-        _, close_col = st.columns([6,1])
-        with close_col:
-            if st.button("✖ Close", key="close_rhs", use_container_width=True):
-                st.session_state["rhs_open"] = False
-
+        # Close button is now inside the Configure card header
         render_configure_form(main_right, conn)
         st.markdown('</div>', unsafe_allow_html=True)
 else:
     with main_right:
-        # Keep the blue info prompt (requested)
-        # st.info("Select a connector from the left to open the configuration panel →")
         st.markdown("")
 
 # ---------------------- All Configured Connections (ALWAYS in left box) ----------------------
@@ -1207,7 +1212,7 @@ def _run_status_check_for_all():
             _cache_status_set(cid, pname, ok, msg)
 
 with main_left:
-    # Title inside the card (as you asked)
+    # Title inside the card
     st.markdown(
         """
         <style>
@@ -1275,4 +1280,3 @@ with main_left:
                         st.error(f"Failed to delete: {e}")
 
     st.markdown('</div>', unsafe_allow_html=True)
-
