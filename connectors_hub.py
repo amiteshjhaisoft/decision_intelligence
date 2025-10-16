@@ -110,7 +110,7 @@ def _logo_html(basename: str, size: int = 22) -> Optional[str]:
         return None
     base = basename.lower().replace(" ", "").replace("/", "").replace("-", "")
     for ext in (".svg", ".png", ".jpg", ".jpeg", ".webp"):
-        p = ASSETS_DIR / f"{base}{ext}"]
+        p = ASSETS_DIR / f"{base}{ext}"
         if p.exists():
             try:
                 b64 = base64.b64encode(p.read_bytes()).decode("utf-8")
