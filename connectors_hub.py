@@ -18,10 +18,10 @@ APP_TITLE = "🔌 Data Connectors Hub"
 APP_TAGLINE = "Configure, validate, and organize connection profiles for databases, warehouses, NoSQL, storage, streaming, and SaaS."
 
 # Resolve paths robustly (works on local + Streamlit Cloud)
-# try:
-#     APP_DIR = Path(__file__).parent
-# except NameError:
-#     APP_DIR = Path.cwd()
+try:
+    APP_DIR = Path(__file__).parent
+except NameError:
+    APP_DIR = Path.cwd()
 
 # CONN_STORE = APP_DIR / "connections.json"
 ASSETS_DIR = APP_DIR / "assets"  # optional logo files
