@@ -1,15 +1,6 @@
 # Author: Amitesh Jha | iSoft | 2025-10-12
 # connectors_hub.py
 # Professional Connectors Hub (Streamlit)
-# - Sidebar: all connectors listed alphabetically as links (icon + name)
-# - Dynamic forms by connector; required-field validation
-# - Persist profiles to ./connections.json (secrets masked in UI)
-# - Import/Export JSON; DSN preview; Env-var snippet
-# - Optional logos in ./assets (e.g., snowflake.svg, postgres.png)
-# - "Test Connection" for ALL registered connectors (best-effort, short timeouts, safe)
-# - RHS panel (pseudo-sidebar) that shows the Configure form as a slide-in panel
-# - NEW: SPA navigation (no hard refresh); header moves into RHS when panel is open
-# - NEW: Left content always shows "All configured connections" in a card; auto status checks (no manual button)
 
 from __future__ import annotations
 
@@ -19,7 +10,6 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from textwrap import dedent
 
 import pandas as pd
 import streamlit as st
@@ -49,6 +39,7 @@ st.markdown(
         border: 1px solid #E5E7EB; border-radius: 10px; padding: 1rem 1.1rem;
         background: #FFFFFF; box-shadow: 0 1px 2px rgba(0,0,0,.04);
       }
+      .card h3, .card h4 { margin: 0 0 .6rem 0; }
       .muted { color: #6b7280; }
       .small { font-size: .92rem; }
       .kpi {
@@ -101,9 +92,6 @@ def _mask(val: Any) -> Any:
     if len(val) <= 6:
         return "•" * len(val)
     return f"{val[:2]}{'•' * (len(val)-4)}{val[-2:]}"
-
-def masked_view(d: Dict[str, Any], secret_keys: List[str]) -> Dict[str, Any]:
-    return {k: (_mask(v) if k in secret_keys else v) for k, v in d.items()}
 
 def _logo_html(basename: str, size: int = 22) -> Optional[str]:
     if not ASSETS_DIR.exists():
@@ -486,7 +474,6 @@ with st.sidebar:
 
     # ---------- Import / Export moved into the sidebar ----------
     st.divider()
-    # st.markdown("### 🔄 Import / Export Connections")
     with st.expander("🔄 Import / Export Connections", expanded=False):
         sidebar_profiles = _load_all()
 
@@ -532,6 +519,7 @@ conn: Connector = REG_BY_ID[st.session_state["selected_id"]]
 all_profiles = _load_all()
 total_profiles_all = sum(len(v) for v in all_profiles.values())
 
+# (Keep the red-circled KPIs)
 k2, k3 = st.columns([1,1])
 with k2:
     st.markdown(f'<div class="kpi">🧩 Connectors: <b>{len(REGISTRY)}</b></div>', unsafe_allow_html=True)
@@ -689,7 +677,7 @@ def test_bigquery(cfg):
     except ModuleNotFoundError:
         return False, "Install library: pip install google-cloud-bigquery"
     except Exception as e:
-        return False, f"{e}"
+        return False, f"{e}")
 
 def test_redshift(cfg):
     try:
@@ -702,7 +690,7 @@ def test_redshift(cfg):
     except ModuleNotFoundError:
         return False, "Install library: pip install psycopg2-binary"
     except Exception as e:
-        return False, f"{e}"
+        return False, f"{e}")
 
 def test_synapse(cfg):
     return test_mssql(cfg)
@@ -717,7 +705,7 @@ def test_mongodb(cfg):
     except ModuleNotFoundError:
         return False, "Install library: pip install pymongo"
     except Exception as e:
-        return False, f"{e}"
+        return False, f"{e}")
 
 def test_cassandra(cfg):
     try:
@@ -730,7 +718,7 @@ def test_cassandra(cfg):
     except ModuleNotFoundError:
         return False, "Install library: pip install cassandra-driver"
     except Exception as e:
-        return False, f"{e}"
+        return False, f"{e}")
 
 def test_redis(cfg):
     try:
@@ -742,7 +730,7 @@ def test_redis(cfg):
     except ModuleNotFoundError:
         return False, "Install library: pip install redis"
     except Exception as e:
-        return False, f"{e}"
+        return False, f"{e}")
 
 def test_dynamodb(cfg):
     try:
@@ -756,7 +744,7 @@ def test_dynamodb(cfg):
     except ModuleNotFoundError:
         return False, "Install library: pip install boto3"
     except Exception as e:
-        return False, f"{e}"
+        return False, f"{e}")
 
 def test_neo4j(cfg):
     try:
@@ -768,7 +756,7 @@ def test_neo4j(cfg):
     except ModuleNotFoundError:
         return False, "Install library: pip install neo4j"
     except Exception as e:
-        return False, f"{e}"
+        return False, f"{e}")
 
 def test_elasticsearch(cfg):
     try:
@@ -781,7 +769,7 @@ def test_elasticsearch(cfg):
     except ModuleNotFoundError:
         return False, "Install library: pip install elasticsearch"
     except Exception as e:
-        return False, f"{e}"
+        return False, f"{e}")
 
 def test_cosmos(cfg):
     try:
@@ -792,7 +780,7 @@ def test_cosmos(cfg):
     except ModuleNotFoundError:
         return False, "Install library: pip install azure-cosmos"
     except Exception as e:
-        return False, f"{e}"
+        return False, f"{e}")
 
 def test_firestore(cfg):
     try:
@@ -804,7 +792,7 @@ def test_firestore(cfg):
     except ModuleNotFoundError:
         return False, "Install library: pip install google-cloud-firestore"
     except Exception as e:
-        return False, f"{e}"
+        return False, f"{e}")
 
 def test_bigtable(cfg):
     try:
@@ -817,7 +805,7 @@ def test_bigtable(cfg):
     except ModuleNotFoundError:
         return False, "Install library: pip install google-cloud-bigtable"
     except Exception as e:
-        return False, f"{e}"
+        return False, f"{e}")
 
 def test_s3(cfg):
     try:
@@ -831,7 +819,7 @@ def test_s3(cfg):
     except ModuleNotFoundError:
         return False, "Install library: pip install boto3 s3fs"
     except Exception as e:
-        return False, f"{e}"
+        return False, f"{e}")
 
 def test_azureblob(cfg):
     try:
@@ -851,7 +839,7 @@ def test_azureblob(cfg):
     except ModuleNotFoundError:
         return False, "Install library: pip install azure-storage-blob"
     except Exception as e:
-        return False, f"{e}"
+        return False, f"{e}")
 
 def test_adls(cfg):
     try:
@@ -866,7 +854,7 @@ def test_adls(cfg):
     except ModuleNotFoundError:
         return False, "Install library: pip install azure-storage-file-datalake"
     except Exception as e:
-        return False, f"{e}"
+        return False, f"{e}")
 
 def test_gcs(cfg):
     try:
@@ -880,7 +868,7 @@ def test_gcs(cfg):
     except ModuleNotFoundError:
         return False, "Install library: pip install google-cloud-storage gcsfs"
     except Exception as e:
-        return False, f"{e}"
+        return False, f"{e}")
 
 def test_hdfs(cfg):
     try:
@@ -892,7 +880,7 @@ def test_hdfs(cfg):
     except ModuleNotFoundError:
         return False, "Install library: pip install hdfs"
     except Exception as e:
-        return False, f"{e}"
+        return False, f"{e}")
 
 def test_kafka(cfg):
     try:
@@ -909,7 +897,7 @@ def test_kafka(cfg):
     except ModuleNotFoundError:
         return False, "Install library: pip install kafka-python"
     except Exception as e:
-        return False, f"{e}"
+        return False, f"{e}")
 
 def test_rabbitmq(cfg):
     try:
@@ -922,7 +910,7 @@ def test_rabbitmq(cfg):
     except ModuleNotFoundError:
         return False, "Install library: pip install pika"
     except Exception as e:
-        return False, f"{e}"
+        return False, f"{e}")
 
 def test_eventhubs(cfg):
     try:
@@ -935,7 +923,7 @@ def test_eventhubs(cfg):
     except ModuleNotFoundError:
         return False, "Install library: pip install azure-eventhub"
     except Exception as e:
-        return False, f"{e}"
+        return False, f"{e}")
 
 def test_pubsub(cfg):
     try:
@@ -948,7 +936,7 @@ def test_pubsub(cfg):
     except ModuleNotFoundError:
         return False, "Install library: pip install google-cloud-pubsub"
     except Exception as e:
-        return False, f"{e}"
+        return False, f"{e}")
 
 def test_kinesis(cfg):
     try:
@@ -962,7 +950,7 @@ def test_kinesis(cfg):
     except ModuleNotFoundError:
         return False, "Install library: pip install boto3"
     except Exception as e:
-        return False, f"{e}"
+        return False, f"{e}")
 
 def test_spark(cfg):
     try:
@@ -974,7 +962,7 @@ def test_spark(cfg):
     except ModuleNotFoundError:
         return False, "Install library: pip install pyspark"
     except Exception as e:
-        return False, f"{e}"
+        return False, f"{e}")
 
 def test_dask(cfg):
     try:
@@ -986,7 +974,7 @@ def test_dask(cfg):
     except ModuleNotFoundError:
         return False, "Install library: pip install dask distributed"
     except Exception as e:
-        return False, f"{e}"
+        return False, f"{e}")
 
 def test_salesforce(cfg):
     try:
@@ -998,7 +986,7 @@ def test_salesforce(cfg):
     except ModuleNotFoundError:
         return False, "Install library: pip install simple-salesforce"
     except Exception as e:
-        return False, f"{e}"
+        return False, f"{e}")
 
 def test_servicenow(cfg):
     try:
@@ -1010,7 +998,7 @@ def test_servicenow(cfg):
     except ModuleNotFoundError:
         return False, "Install library: pip install pysnow"
     except Exception as e:
-        return False, f"{e}"
+        return False, f"{e}")
 
 def test_jira(cfg):
     try:
@@ -1021,7 +1009,7 @@ def test_jira(cfg):
     except ModuleNotFoundError:
         return False, "Install library: pip install jira"
     except Exception as e:
-        return False, f"{e}"
+        return False, f"{e}")
 
 def test_sharepoint(cfg):
     try:
@@ -1038,7 +1026,7 @@ def test_sharepoint(cfg):
     except ModuleNotFoundError:
         return False, "Install library: pip install msal"
     except Exception as e:
-        return False, f"{e}"
+        return False, f"{e}")
 
 def test_tableau(cfg):
     try:
@@ -1053,7 +1041,7 @@ def test_tableau(cfg):
     except ModuleNotFoundError:
         return False, "Install library: pip install tableauserverclient"
     except Exception as e:
-        return False, f"{e}"
+        return False, f"{e}")
 
 def test_gmail(cfg):
     try:
@@ -1065,7 +1053,7 @@ def test_gmail(cfg):
     except ModuleNotFoundError:
         return False, "Install libraries: pip install google-api-python-client google-auth-httplib2 google-auth-oauthlib"
     except Exception as e:
-        return False, f"{e}"
+        return False, f"{e}")
 
 def test_msgraph(cfg):
     return test_sharepoint(cfg)
@@ -1086,7 +1074,8 @@ TEST_HANDLERS = {
 # --------------- Reusable: render Configure form into any container ---------------
 def render_configure_form(container, conn: Connector):
     with container:
-        st.markdown('<div class="card">', unsafe_allow_html=True)
+        # Title inside the card (requested)
+        st.markdown('<div class="card"><h4>Configure connection profile</h4>', unsafe_allow_html=True)
 
         _keys = _get_state_keys(conn.id)
         for k in _keys.values():
@@ -1115,9 +1104,9 @@ def render_configure_form(container, conn: Connector):
                     missing_required.append(f.label)
 
             c1, c2, c3, c4 = st.columns([1,1,1,1])
-            submitted = c1.form_submit_button("💾 Save Profile", use_container_width=True)
-            preview   = c2.form_submit_button("🧪 Preview DSN", use_container_width=True)
-            envvars   = c3.form_submit_button("🔐 Env-Vars Snippet", use_container_width=True)
+            submitted    = c1.form_submit_button("💾 Save Profile", use_container_width=True)
+            preview      = c2.form_submit_button("🧪 Preview DSN", use_container_width=True)
+            envvars      = c3.form_submit_button("🔐 Env-Vars Snippet", use_container_width=True)
             test_clicked = c4.form_submit_button("✅ Test Connection", use_container_width=True)
 
         st.markdown('</div>', unsafe_allow_html=True)
@@ -1155,7 +1144,7 @@ def render_configure_form(container, conn: Connector):
 
         if envvars:
             st.info("Copy/paste into your shell (masked preview):")
-            st.code(_env_snippet(conn.id, profile_name or "PROFILE", values, conn.secret_keys), language="bash")
+            st.code(_env_snippet(conn.id, profile_name or "PROFILE", values, REG_BY_ID[conn.id].secret_keys), language="bash")
 
         if submitted:
             if not profile_name.strip():
@@ -1178,10 +1167,9 @@ if st.session_state["rhs_open"]:
         st.markdown('<div class="rhs-aside">', unsafe_allow_html=True)
         render_header(main_right, conn, len(REGISTRY), total_profiles_all, in_rhs=True)
 
-        col_a, col_b = st.columns([3,1])
-        with col_a:
-            st.markdown("#### Configure connection profile")
-        with col_b:
+        # Keep a compact Close button above the card (title moved inside card)
+        _, close_col = st.columns([6,1])
+        with close_col:
             if st.button("✖ Close", key="close_rhs", use_container_width=True):
                 st.session_state["rhs_open"] = False
 
@@ -1189,6 +1177,7 @@ if st.session_state["rhs_open"]:
         st.markdown('</div>', unsafe_allow_html=True)
 else:
     with main_right:
+        # Keep the blue info prompt (requested)
         st.info("Select a connector from the left to open the configuration panel →")
 
 # ---------------------- All Configured Connections (ALWAYS in left box) ----------------------
@@ -1207,9 +1196,11 @@ def _run_status_check_for_all():
             _cache_status_set(cid, pname, ok, msg)
 
 with main_left:
-    st.markdown("### 📚 All configured connections")
-    st.markdown('<div class="card all-configured">', unsafe_allow_html=True)
-
+    # Move the section title inside the card (requested)
+    st.markdown(
+        '<div class="card all-configured"><h3>📚 All configured connections</h3>',
+        unsafe_allow_html=True,
+    )
 
     # Auto-check status every render to keep it up-to-date
     _run_status_check_for_all()
@@ -1234,45 +1225,3 @@ with main_left:
         st.dataframe(df, hide_index=True, use_container_width=True)
 
     st.markdown('</div>', unsafe_allow_html=True)
-
-# # ---------------------- Import / Export JSON ----------------------
-# st.write("")
-# st.markdown("### 🔄 Import / Export")
-# cA, cB = st.columns([1,1])
-
-# with cA:
-#     st.markdown("#### Export connections")
-#     st.markdown('<div class="card">', unsafe_allow_html=True)
-#     if all_profiles:
-#         export_json = json.dumps(all_profiles, indent=2).encode("utf-8")
-#         st.download_button(
-#             "⬇️ Download connections.json",
-#             data=export_json,
-#             file_name="connections.json",
-#             mime="application/json",
-#             use_container_width=True,
-#         )
-#     else:
-#         st.caption("Nothing to export yet.")
-#     st.markdown('</div>', unsafe_allow_html=True)
-
-# with cB:
-#     st.markdown("#### Import connections")
-#     st.markdown('<div class="card">', unsafe_allow_html=True)
-#     up = st.file_uploader("Upload a connections.json", type=["json"])
-#     if up:
-#         try:
-#             data = json.loads(up.read().decode("utf-8"))
-#             if isinstance(data, dict):
-#                 merged = _load_all()
-#                 for cid, profs in data.items():
-#                     merged.setdefault(cid, {})
-#                     merged[cid].update(profs or {})
-#                 _save_all(merged)
-#                 st.success("Imported connections successfully.")
-#                 st.rerun()
-#             else:
-#                 st.error("Invalid format. Expected a JSON object.")
-#         except Exception as e:
-#             st.error(f"Failed to import: {e}")
-#     st.markdown('</div>', unsafe_allow_html=True)
