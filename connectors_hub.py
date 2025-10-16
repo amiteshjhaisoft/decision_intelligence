@@ -1207,42 +1207,14 @@ def _run_status_check_for_all():
             _cache_status_set(cid, pname, ok, msg)
 
 with main_left:
+    # Title inside the card (as you asked)
     st.markdown(
         """
         <style>
-          /* Card already exists; these are table styles inside the card */
-          .tbl { width:100%; }
-          .tbl-head, .tbl-row {
-            display:grid;
-            grid-template-columns: 4fr 3fr 3fr 64px 64px;
-            align-items:center;
-            column-gap: .75rem;
-            padding: .5rem .25rem;
-          }
-          .tbl-head {
-            color:#6b7280; font-size:.9rem; border-bottom:1px solid #E5E7EB;
-            position:sticky; top:0; background:#FFF; z-index:1;
-          }
-          .tbl-row { border-bottom:1px solid #F1F5F9; }
-          .tbl-row:hover { background:#FAFAFA; }
-          .badge {
-            display:inline-block; padding:.18rem .55rem; border-radius:999px;
-            background:#EEF2FF; color:#3730A3; font-weight:600; font-size:.78rem;
-          }
-          .badge.fail { background:#FEE2E2; color:#991B1B; }
-          .badge.wait { background:#FFF7ED; color:#9A3412; }
-          .pill-prof {
-            display:inline-block; font-size:.75rem; padding:.12rem .45rem; border-radius:999px;
-            background:#F3F4F6; color:#374151;
-          }
-          .action-col button[kind="secondary"] { padding:.3rem .5rem; }
+          .rowhead { font-size:.9rem; color:#6b7280; margin-bottom:.25rem; }
+          .action-col button[kind="secondary"] { padding: .3rem .5rem; }
         </style>
-        <div class="card all-configured">
-          <h3>📚 All configured connections</h3>
-          <div class="tbl">
-            <div class="tbl-head">
-              <div>Connector</div><div>Profile</div><div>Status</div><div>Edit</div><div>Delete</div>
-            </div>
+        <div class="card all-configured"><h3>📚 All configured connections</h3>
         """,
         unsafe_allow_html=True,
     )
@@ -1254,57 +1226,53 @@ with main_left:
     if not all_profiles:
         st.info("You haven’t saved any connections yet.")
     else:
-        # Sorted listing
+        # Header row (not interactive)
+        h1, h2, h3, h4, h5 = st.columns([4, 3, 3, 1, 1])
+        h1.markdown('<div class="rowhead">Connector</div>', unsafe_allow_html=True)
+        h2.markdown('<div class="rowhead">Profile</div>', unsafe_allow_html=True)
+        h3.markdown('<div class="rowhead">Status</div>', unsafe_allow_html=True)
+        h4.markdown('<div class="rowhead">Edit</div>', unsafe_allow_html=True)
+        h5.markdown('<div class="rowhead">Delete</div>', unsafe_allow_html=True)
+
+        # Sorted display
         for cid in sorted(all_profiles.keys(), key=lambda c: (REG_BY_ID.get(c).name if REG_BY_ID.get(c) else c).lower()):
             meta = REG_BY_ID.get(cid)
             for pname in sorted(all_profiles[cid].keys(), key=lambda x: x.lower()):
                 cfg = all_profiles[cid][pname]
                 status_info = _cache_status_get(cid, pname)
                 ok = status_info.get("ok")
-                # status badge html
-                if ok is True:
-                    badge = '<span class="badge">✅ Successful</span>'
-                elif ok is False:
-                    badge = '<span class="badge fail">❌ Failed</span>'
-                else:
-                    badge = '<span class="badge wait">⏳ Not tested</span>'
+                status_text = (
+                    '<span class="pill">✅ Successful</span>' if ok is True
+                    else '<span class="pill" style="background:#FEE2E2;color:#991B1B;">❌ Failed</span>' if ok is False
+                    else '<span class="pill" style="background:#FFF7ED;color:#9A3412;">⏳ Not tested</span>'
+                )
 
-                # one "row": 5 columns laid out to look like a table
-                c1, c2, c3, c4, c5 = st.columns([4, 3, 3, 1, 1], gap="small")
-                with c1:
-                    st.markdown(
-                        f'<div class="tbl-row"><div style="grid-column:1 / span 5;"></div></div>',
-                        unsafe_allow_html=True,
-                    )
-                    st.markdown(f"{meta.icon if meta else '🔌'} **{meta.name if meta else cid}**")
+                c1, c2, c3, c4, c5 = st.columns([4, 3, 3, 1, 1])
+                c1.markdown(f"{meta.icon if meta else '🔌'} **{meta.name if meta else cid}**")
+                c2.markdown(f"`{pname}`")
+                c3.markdown(status_text, unsafe_allow_html=True)
 
-                with c2:
-                    st.markdown(f'<span class="pill-prof">{pname}</span>', unsafe_allow_html=True)
+                # EDIT
+                if c4.button("📝", key=f"edit::{cid}::{pname}", help="Edit this profile"):
+                    _prefill_and_open_editor(cid, pname, cfg)
+                    st.rerun()
 
-                with c3:
-                    st.markdown(badge, unsafe_allow_html=True)
+                # DELETE
+                if c5.button("🗑️", key=f"del::{cid}::{pname}", help="Delete this profile"):
+                    store = _load_all()
+                    try:
+                        # remove the profile
+                        if cid in store and pname in store[cid]:
+                            del store[cid][pname]
+                            if not store[cid]:
+                                del store[cid]
+                            _save_all(store)
+                            st.success(f"Deleted profile **{pname}** for {meta.icon if meta else '🔌'} {meta.name if meta else cid}.")
+                            st.rerun()
+                        else:
+                            st.warning("Profile not found (already deleted?).")
+                    except Exception as e:
+                        st.error(f"Failed to delete: {e}")
 
-                with c4:
-                    if st.button("📝", key=f"edit::{cid}::{pname}", help="Edit this profile"):
-                        _prefill_and_open_editor(cid, pname, cfg)
-                        st.rerun()
+    st.markdown('</div>', unsafe_allow_html=True)
 
-                with c5:
-                    if st.button("🗑️", key=f"del::{cid}::{pname}", help="Delete this profile"):
-                        store = _load_all()
-                        try:
-                            if cid in store and pname in store[cid]:
-                                del store[cid][pname]
-                                if not store[cid]:
-                                    del store[cid]
-                                _save_all(store)
-                                st.success(
-                                    f"Deleted profile **{pname}** for {meta.icon if meta else '🔌'} {meta.name if meta else cid}."
-                                )
-                                st.rerun()
-                            else:
-                                st.warning("Profile not found (already deleted?).")
-                        except Exception as e:
-                            st.error(f"Failed to delete: {e}")
-
-    st.markdown("</div></div>", unsafe_allow_html=True)
