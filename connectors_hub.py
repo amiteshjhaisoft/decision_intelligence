@@ -1,7 +1,7 @@
 # Author: Amitesh Jha | iSoft | 2025-10-12
 # connectors_hub.py
 # Professional Connectors Hub (Streamlit)
-# - Sidebar: categorized connectors labeled like "❄️ Snowflake"
+# - Sidebar: all connectors listed alphabetically as links (icon + name)
 # - Dynamic forms by connector; required-field validation
 # - Persist profiles to ./connections.json (secrets masked in UI)
 # - Import/Export JSON; DSN preview; Env-var snippet
@@ -56,8 +56,14 @@ st.markdown(
       .logo-wrap img { border-radius: 4px; }
       .footer-tip { color:#6b7280; font-size:.9rem; }
       section[data-testid="stSidebar"] { width: 340px !important; }
-      .sidebar-caption { margin: .3rem 0 1rem 0; color:#6b7280; font-size:.92rem; }
+      .sidebar-caption { margin: .3rem 0 .4rem 0; color:#6b7280; font-size:.92rem; }
       .sidebar-section { margin-top:.6rem; padding-top:.6rem; border-top:1px dashed #E5E7EB; }
+      .sidebar-links a {
+        display:block; padding:.35rem .3rem; text-decoration:none;
+        border-radius:8px; color:#111827; font-weight:500;
+      }
+      .sidebar-links a:hover { background:#F3F4F6; }
+      .sidebar-links a.active { background:#EEF2FF; color:#3730A3; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -436,12 +442,28 @@ REGISTRY: List[Connector] = [
 ]
 
 REG_BY_ID: Dict[str, Connector] = {c.id: c for c in REGISTRY}
-REG_BY_CAT: Dict[str, List[Connector]] = {}
-for c in REGISTRY:
-    REG_BY_CAT.setdefault(c.category, []).append(c)
-CATEGORIES = sorted(REG_BY_CAT.keys())
 
-# ---------------------- Sidebar ----------------------
+# ---------------------- Sidebar (All connectors as links) ----------------------
+def _sorted_filtered_connectors(q: str) -> List[Connector]:
+    items = sorted(REGISTRY, key=lambda x: x.name.lower())
+    if not q:
+        return items
+    ql = q.lower()
+    return [c for c in items if ql in c.name.lower() or ql in c.id.lower() or ql in c.category.lower()]
+
+def _get_query_params() -> Dict[str, List[str]]:
+    # Streamlit 1.30+: st.query_params; older: experimental_get_query_params
+    try:
+        return dict(st.query_params)  # type: ignore[attr-defined]
+    except Exception:
+        return st.experimental_get_query_params()
+
+def _set_query_params(**params):
+    try:
+        st.query_params.update(params)  # type: ignore[attr-defined]
+    except Exception:
+        st.experimental_set_query_params(**params)
+
 with st.sidebar:
     logo_path = ASSETS_DIR / "logo.png"
     if logo_path.is_file():
@@ -450,36 +472,27 @@ with st.sidebar:
         st.caption("")
 
     st.markdown("### 🔎 Search")
-    q = st.text_input("Search connectors", placeholder="snowflake, postgres, blob, kafka...").strip().lower()
+    q = st.text_input("Search connectors", placeholder="snowflake, postgres, blob, kafka...").strip()
 
-    st.markdown('<div class="sidebar-caption">Filter by category</div>', unsafe_allow_html=True)
-    cat = st.selectbox("Category", CATEGORIES, index=0, label_visibility="collapsed")
+    st.markdown('<div class="sidebar-caption">All connectors</div>', unsafe_allow_html=True)
+    filtered = _sorted_filtered_connectors(q)
 
-def _filter_conns(items: List[Connector], q: str) -> List[Connector]:
-    if not q:
-        return sorted(items, key=lambda x: x.name.lower())
-    return sorted([c for c in items if q in c.name.lower() or q in c.id.lower() or q in c.category.lower()],
-                  key=lambda x: x.name.lower())
+    # Determine selected connector from query param (?conn=)
+    qp = _get_query_params()
+    selected_id = (qp.get("conn")[0] if isinstance(qp.get("conn"), list) else qp.get("conn")) if qp.get("conn") else None
+    if selected_id not in {c.id for c in REGISTRY}:
+        selected_id = filtered[0].id if filtered else REGISTRY[0].id
 
-choices = _filter_conns(REG_BY_CAT.get(cat, []), q)
-label_for = lambda c: f"{c.icon} {c.name}"
+    # Render link list
+    st.markdown('<div class="sidebar-links">', unsafe_allow_html=True)
+    for c in filtered:
+        href = f"?conn={c.id}"
+        active_cls = "active" if c.id == selected_id else ""
+        st.markdown(f'<a class="{active_cls}" href="{href}">{c.icon} {c.name}</a>', unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True)
 
-st.sidebar.markdown('<div class="sidebar-section"></div>', unsafe_allow_html=True)
-selected_label = st.sidebar.radio(
-    "Connectors",
-    [label_for(c) for c in choices],
-    key="connector_radio",
-    label_visibility="collapsed",
-)
-
-def resolve_selected(lbl: str) -> Connector:
-    name = lbl.split(" ", 1)[1] if " " in lbl else lbl
-    for c in choices:
-        if c.name == name:
-            return c
-    return choices[0]
-
-conn = resolve_selected(selected_label)
+# Resolve current connector
+conn: Connector = REG_BY_ID[selected_id]  # type: ignore[index]
 
 # ---------------------- Load / Save storage ----------------------
 all_profiles = _load_all()
@@ -1064,7 +1077,6 @@ with left:
     st.markdown("#### Configure connection profile")
     st.markdown('<div class="card">', unsafe_allow_html=True)
 
-    # session keys for test status
     _keys = _get_state_keys(conn.id)
     for k in _keys.values():
         st.session_state.setdefault(k, None)
@@ -1099,7 +1111,6 @@ with left:
 
     st.markdown('</div>', unsafe_allow_html=True)
 
-    # Handle form actions (after form submit)
     if test_clicked:
         handler = TEST_HANDLERS.get(conn.id)
         if not handler:
@@ -1115,7 +1126,6 @@ with left:
             st.session_state[_keys["msg"]] = msg
             st.session_state[_keys["sig"]] = _config_signature(values)
 
-    # Status pill (always visible)
     last_ok  = st.session_state.get(_keys["ok"])
     last_msg = st.session_state.get(_keys["msg"]) or "Not tested"
     sig_now  = _config_signature(values)
@@ -1147,7 +1157,6 @@ with left:
             all_profiles.setdefault(conn.id, {})
             all_profiles[conn.id][profile_name] = values
             _save_all(all_profiles)
-            # Update status cache for table view
             _cache_status_set(conn.id, profile_name, st.session_state.get(_keys["ok"]), st.session_state.get(_keys["msg"]) or "")
             st.success(f"Saved **{profile_name}** for {conn.icon} {conn.name}.")
 
@@ -1187,7 +1196,6 @@ with right:
                     if not all_profiles[conn.id]:
                         all_profiles.pop(conn.id, None)
                     _save_all(all_profiles)
-                    # clear cached status
                     st.session_state.pop(_status_cache_key(conn.id, pname), None)
                     st.warning(f"Deleted profile **{pname}**.")
                     st.rerun()
@@ -1213,13 +1221,13 @@ def _run_status_check_for_all():
                 ok, msg = None, "No test implemented."
             _cache_status_set(cid, pname, ok, msg)
 
-# Controls for table
 cA, cB = st.columns([1,3])
 with cA:
     if st.button("🔁 Test all saved connections now", use_container_width=True):
         with st.spinner("Running status checks..."):
             _run_status_check_for_all()
 
+all_profiles = _load_all()  # re-read after potential changes above
 if not all_profiles:
     st.info("You haven’t saved any connections yet.")
 else:
