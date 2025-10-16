@@ -1207,8 +1207,9 @@ def _run_status_check_for_all():
             _cache_status_set(cid, pname, ok, msg)
 
 with main_left:
-    # st.markdown("### 📚 All configured connections")
-    st.markdown('<div class="📚 All configured connections">', unsafe_allow_html=True)
+    st.markdown("### 📚 All configured connections")
+    st.markdown('<div class="card all-configured">', unsafe_allow_html=True)
+
 
     # Auto-check status every render to keep it up-to-date
     _run_status_check_for_all()
