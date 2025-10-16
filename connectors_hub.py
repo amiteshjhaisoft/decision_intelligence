@@ -202,27 +202,27 @@ def _dsn_preview(conn_id: str, cfg: Dict[str, Any]) -> str:
         if conn_id == "msgraph":
             return f"msgraph://tenant={cfg.get('tenant_id')}"
         if conn_id == "weaviate":
-        # Prefer a full cluster URL (WCS); otherwise build from host/port.
-        cluster_url = (cfg.get("cluster_url") or cfg.get("url") or "").strip().rstrip("/")
-    
-        if cluster_url:
-            http_url = cluster_url
-            scheme = "https" if cluster_url.startswith("https") else "http"
-        else:
-            scheme = (cfg.get("scheme") or "https").lower()
-            host = (cfg.get("host") or "").strip()
-            port = int(cfg.get("port") or (443 if scheme == "https" else 80))
-            default_port = 443 if scheme == "https" else 80
-            http_url = f"{scheme}://{host}" + ("" if port == default_port else f":{port}")
-    
-        mt = " (multi-tenancy)" if str(cfg.get("multi_tenancy") or "").lower() in ("true", "yes", "1") else ""
-    
-        # If you later add gRPC fields, uncomment to display them in the preview.
-        # grpc_host = (cfg.get("grpc_host") or host or "").strip()
-        # grpc_port = cfg.get("grpc_port")
-        # grpc_part = f" [grpc={grpc_host}:{grpc_port}]" if grpc_host and grpc_port else ""
-    
-        return f"weaviate://{http_url}{mt}"  # + grpc_part
+            # Prefer a full cluster URL (WCS); otherwise build from host/port.
+            cluster_url = (cfg.get("cluster_url") or cfg.get("url") or "").strip().rstrip("/")
+        
+            if cluster_url:
+                http_url = cluster_url
+                scheme = "https" if cluster_url.startswith("https") else "http"
+            else:
+                scheme = (cfg.get("scheme") or "https").lower()
+                host = (cfg.get("host") or "").strip()
+                port = int(cfg.get("port") or (443 if scheme == "https" else 80))
+                default_port = 443 if scheme == "https" else 80
+                http_url = f"{scheme}://{host}" + ("" if port == default_port else f":{port}")
+        
+            mt = " (multi-tenancy)" if str(cfg.get("multi_tenancy") or "").lower() in ("true", "yes", "1") else ""
+        
+            # If you later add gRPC fields, uncomment to display them in the preview.
+            # grpc_host = (cfg.get("grpc_host") or host or "").strip()
+            # grpc_port = cfg.get("grpc_port")
+            # grpc_part = f" [grpc={grpc_host}:{grpc_port}]" if grpc_host and grpc_port else ""
+        
+            return f"weaviate://{http_url}{mt}"  # + grpc_part
   
     except Exception:
         pass
