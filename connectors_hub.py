@@ -677,7 +677,7 @@ def test_bigquery(cfg):
     except ModuleNotFoundError:
         return False, "Install library: pip install google-cloud-bigquery"
     except Exception as e:
-        return False, f"{e}")
+        return False, f"{e}"
 
 def test_redshift(cfg):
     try:
