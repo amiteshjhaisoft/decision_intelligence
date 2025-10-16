@@ -515,19 +515,19 @@ with st.sidebar:
 # Resolve current connector from state
 conn: Connector = REG_BY_ID[st.session_state["selected_id"]]
 
-# ---------------------- Load store & KPIs ----------------------
-all_profiles = _load_all()
-total_profiles_all = sum(len(v) for v in all_profiles.values())
+# # ---------------------- Load store & KPIs ----------------------
+# all_profiles = _load_all()
+# total_profiles_all = sum(len(v) for v in all_profiles.values())
 
-# (Keep the red-circled KPIs)
-k2, k3 = st.columns([1,1])
-with k2:
-    st.markdown(f'<div class="kpi">🧩 Connectors: <b>{len(REGISTRY)}</b></div>', unsafe_allow_html=True)
-with k3:
-    st.markdown(f'<div class="kpi">🗂️ Profiles: <b>{total_profiles_all}</b></div>', unsafe_allow_html=True)
+# # (Keep the red-circled KPIs)
+# k2, k3 = st.columns([1,1])
+# with k2:
+#     st.markdown(f'<div class="kpi">🧩 Connectors: <b>{len(REGISTRY)}</b></div>', unsafe_allow_html=True)
+# with k3:
+#     st.markdown(f'<div class="kpi">🗂️ Profiles: <b>{total_profiles_all}</b></div>', unsafe_allow_html=True)
 
-st.write("")
-main_left, main_right = st.columns([7, 5], gap="large")
+# st.write("")
+# main_left, main_right = st.columns([7, 5], gap="large")
 
 # ---------------------- Header renderer ----------------------
 def render_header(container, conn: Connector, total_connectors: int, total_profiles: int, *, in_rhs: bool):
