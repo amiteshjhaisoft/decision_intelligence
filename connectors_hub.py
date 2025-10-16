@@ -18,12 +18,12 @@ APP_TITLE = "🔌 Data Connectors Hub"
 APP_TAGLINE = "Configure, validate, and organize connection profiles for databases, warehouses, NoSQL, storage, streaming, and SaaS."
 
 # Resolve paths robustly (works on local + Streamlit Cloud)
-try:
-    APP_DIR = Path(__file__).parent
-except NameError:
-    APP_DIR = Path.cwd()
+# try:
+#     APP_DIR = Path(__file__).parent
+# except NameError:
+#     APP_DIR = Path.cwd()
 
-CONN_STORE = APP_DIR / "connections.json"
+# CONN_STORE = APP_DIR / "connections.json"
 ASSETS_DIR = APP_DIR / "assets"  # optional logo files
 
 # ---------------------- Page Config & Global Style ----------------------
@@ -1422,6 +1422,7 @@ PIPE_STORE = APP_DIR / "pipelines.json"
 # Connections store helpers (read-only here)
 # ---------------------------------------------------------------------------------
 def _load_profiles_store() -> dict:
+    # single source of truth
     if not CONN_STORE.exists():
         return {}
     try:
@@ -1429,15 +1430,20 @@ def _load_profiles_store() -> dict:
     except Exception:
         return {}
 
+def _profiles_for_connector(conn_id: str) -> List[str]:
+    store = _load_profiles_store()
+    return sorted(list((store.get(conn_id) or {}).keys()), key=str.lower)
+
+
 def _profiles_for(connector_id: str) -> List[str]:
     """Return sorted list of saved profile names for a connector (from connections.json)."""
     store = _load_profiles_store()
     profs = store.get(connector_id, {}) or {}
     return sorted(profs.keys(), key=str.lower)
 
-def _profiles_for_connector(conn_id: str) -> List[str]:
-    """Same as _profiles_for; kept for backwards compatibility with the app."""
-    return _profiles_for(conn_id)
+# def _profiles_for_connector(conn_id: str) -> List[str]:
+#     """Same as _profiles_for; kept for backwards compatibility with the app."""
+#     return _profiles_for(conn_id)
 
 # ---------------------------------------------------------------------------------
 # Pipelines store helpers
@@ -1525,13 +1531,13 @@ with st.container():
 
             # -------------------- Source --------------------
             st.markdown("**Source**")
-
+            
             # Allow only connectors that have at least one saved profile
             profiles_store = _load_profiles_store()
             avail_sources = [cid for cid, profs in profiles_store.items() if profs]
             # Prefer non-Weaviate for source
             avail_sources = [c for c in avail_sources if c != "weaviate"] or avail_sources
-
+            
             src_connector_opts = [""] + avail_sources
             src_connector = st.selectbox(
                 "Source Connector",
@@ -1539,25 +1545,31 @@ with st.container():
                 index=src_connector_opts.index(initial.get("source_connector", ""))
                 if initial.get("source_connector", "") in src_connector_opts
                 else 0,
+                key="pipe_src_connector",  # (optional) keep a stable key for this too
             )
-
+            
             # Re-render when connector changes so profiles refresh
             if "pipe__last_src_connector" not in st.session_state:
                 st.session_state["pipe__last_src_connector"] = src_connector
             elif st.session_state["pipe__last_src_connector"] != src_connector:
                 st.session_state["pipe__last_src_connector"] = src_connector
                 st.rerun()
-
+            
+            # Populate profiles for the selected connector
             src_profiles = _profiles_for_connector(src_connector) if src_connector else []
             src_profile_opts = [""] + src_profiles if src_profiles else [""]
+            
+            # (3) add a stable key for the Source Profile selectbox here
             src_profile = st.selectbox(
                 "Source Profile",
                 options=src_profile_opts,
                 index=src_profile_opts.index(initial.get("source_profile", ""))
                 if initial.get("source_profile", "") in src_profile_opts
                 else 0,
+                key="pipe_src_profile",   # ← this is step 3
             )
-
+            
+            # Optional helper to jump to connector editor if no profiles exist
             if src_connector and not src_profiles:
                 st.caption(
                     "No saved profiles found for this connector. Open the connector, "
@@ -1568,6 +1580,7 @@ with st.container():
                     st.session_state["selected_id"] = src_connector
                     st.session_state["rhs_open"] = True
                     st.rerun()
+
 
             # -------------------- Destination (Weaviate) --------------------
             st.markdown("**Destination (Weaviate)**")
