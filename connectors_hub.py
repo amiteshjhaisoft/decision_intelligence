@@ -529,6 +529,16 @@ with k3:
 st.write("")
 main_left, main_right = st.columns([7, 5], gap="large")
 
+def _prefill_and_open_editor(conn_id: str, profile: str, cfg: Dict[str, Any]) -> None:
+    """Open the RHS editor with fields prefilled from an existing saved profile."""
+    st.session_state["selected_id"] = conn_id
+    st.session_state["rhs_open"] = True
+    # prefill profile name and all fields for this connector
+    st.session_state[f"{conn_id}_profile_name"] = profile
+    for f in REG_BY_ID[conn_id].fields:
+        st.session_state[f"{conn_id}_{f.key}"] = cfg.get(f.key, "")
+
+
 # ---------------------- Header renderer ----------------------
 def render_header(container, conn: Connector, total_connectors: int, total_profiles: int, *, in_rhs: bool):
     with container:
@@ -1197,9 +1207,15 @@ def _run_status_check_for_all():
             _cache_status_set(cid, pname, ok, msg)
 
 with main_left:
-    # Move the section title inside the card (requested)
+    # Title inside the card (as you asked)
     st.markdown(
-        '<div class="card all-configured"><h3>📚 All configured connections</h3>',
+        """
+        <style>
+          .rowhead { font-size:.9rem; color:#6b7280; margin-bottom:.25rem; }
+          .action-col button[kind="secondary"] { padding: .3rem .5rem; }
+        </style>
+        <div class="card all-configured"><h3>📚 All configured connections</h3>
+        """,
         unsafe_allow_html=True,
     )
 
@@ -1210,19 +1226,53 @@ with main_left:
     if not all_profiles:
         st.info("You haven’t saved any connections yet.")
     else:
-        rows: List[Dict[str, Any]] = []
-        for cid, items in all_profiles.items():
+        # Header row (not interactive)
+        h1, h2, h3, h4, h5 = st.columns([4, 3, 3, 1, 1])
+        h1.markdown('<div class="rowhead">Connector</div>', unsafe_allow_html=True)
+        h2.markdown('<div class="rowhead">Profile</div>', unsafe_allow_html=True)
+        h3.markdown('<div class="rowhead">Status</div>', unsafe_allow_html=True)
+        h4.markdown('<div class="rowhead">Edit</div>', unsafe_allow_html=True)
+        h5.markdown('<div class="rowhead">Delete</div>', unsafe_allow_html=True)
+
+        # Sorted display
+        for cid in sorted(all_profiles.keys(), key=lambda c: (REG_BY_ID.get(c).name if REG_BY_ID.get(c) else c).lower()):
             meta = REG_BY_ID.get(cid)
-            for pname in items.keys():
+            for pname in sorted(all_profiles[cid].keys(), key=lambda x: x.lower()):
+                cfg = all_profiles[cid][pname]
                 status_info = _cache_status_get(cid, pname)
                 ok = status_info.get("ok")
-                status_text = "✅ Successful" if ok is True else ("❌ Failed" if ok is False else "⏳ Not tested")
-                rows.append({
-                    "Connector": f"{meta.icon if meta else '🔌'} {meta.name if meta else cid}",
-                    "Profile": pname,
-                    "Status": status_text,
-                })
-        df = pd.DataFrame(rows).sort_values(["Connector", "Profile"])
-        st.dataframe(df, hide_index=True, use_container_width=True)
+                status_text = (
+                    '<span class="pill">✅ Successful</span>' if ok is True
+                    else '<span class="pill" style="background:#FEE2E2;color:#991B1B;">❌ Failed</span>' if ok is False
+                    else '<span class="pill" style="background:#FFF7ED;color:#9A3412;">⏳ Not tested</span>'
+                )
+
+                c1, c2, c3, c4, c5 = st.columns([4, 3, 3, 1, 1])
+                c1.markdown(f"{meta.icon if meta else '🔌'} **{meta.name if meta else cid}**")
+                c2.markdown(f"`{pname}`")
+                c3.markdown(status_text, unsafe_allow_html=True)
+
+                # EDIT
+                if c4.button("📝", key=f"edit::{cid}::{pname}", help="Edit this profile"):
+                    _prefill_and_open_editor(cid, pname, cfg)
+                    st.rerun()
+
+                # DELETE
+                if c5.button("🗑️", key=f"del::{cid}::{pname}", help="Delete this profile"):
+                    store = _load_all()
+                    try:
+                        # remove the profile
+                        if cid in store and pname in store[cid]:
+                            del store[cid][pname]
+                            if not store[cid]:
+                                del store[cid]
+                            _save_all(store)
+                            st.success(f"Deleted profile **{pname}** for {meta.icon if meta else '🔌'} {meta.name if meta else cid}.")
+                            st.rerun()
+                        else:
+                            st.warning("Profile not found (already deleted?).")
+                    except Exception as e:
+                        st.error(f"Failed to delete: {e}")
 
     st.markdown('</div>', unsafe_allow_html=True)
+
