@@ -1178,7 +1178,7 @@ if st.session_state["rhs_open"]:
 else:
     with main_right:
         # Keep the blue info prompt (requested)
-        st.info("Select a connector from the left to open the configuration panel →")
+        # st.info("Select a connector from the left to open the configuration panel →")
 
 # ---------------------- All Configured Connections (ALWAYS in left box) ----------------------
 def _run_status_check_for_all():
