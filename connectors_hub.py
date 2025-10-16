@@ -690,7 +690,7 @@ def test_redshift(cfg):
     except ModuleNotFoundError:
         return False, "Install library: pip install psycopg2-binary"
     except Exception as e:
-        return False, f"{e}")
+        return False, f"{e}"
 
 def test_synapse(cfg):
     return test_mssql(cfg)
