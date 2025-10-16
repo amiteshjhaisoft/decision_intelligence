@@ -18,7 +18,7 @@ from typing import Any, Dict, List, Optional
 
 import pandas as pd
 import streamlit as st
-import streamlit.components.v1 as components  # NEW: to render same-page links with JS
+import streamlit.components.v1 as components
 
 APP_TITLE = "🔌 Data Connectors Hub"
 APP_TAGLINE = "Configure, validate, and organize connection profiles for databases, warehouses, NoSQL, storage, streaming, and SaaS."
@@ -55,18 +55,8 @@ st.markdown(
               background:#EEF2FF; color:#3730A3; font-weight:600; font-size:.8rem; }
       .logo-wrap { display:flex; align-items:center; gap:.6rem; }
       .logo-wrap img { border-radius: 4px; }
-      .footer-tip { color:#6b7280; font-size:.9rem; }
       section[data-testid="stSidebar"] { width: 340px !important; }
       .sidebar-caption { margin: .3rem 0 .4rem 0; color:#6b7280; font-size:.92rem; }
-      .sidebar-section { margin-top:.6rem; padding-top:.6rem; border-top:1px dashed #E5E7EB; }
-
-      /* Sidebar links: no underline, same-page styling */
-      .sidebar-links a {
-        display:block; padding:.35rem .3rem; text-decoration:none !important;
-        border-radius:8px; color:#111827; font-weight:500; cursor:pointer;
-      }
-      .sidebar-links a:hover { background:#F3F4F6; }
-      .sidebar-links a.active { background:#EEF2FF; color:#3730A3; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -446,7 +436,7 @@ REGISTRY: List[Connector] = [
 
 REG_BY_ID: Dict[str, Connector] = {c.id: c for c in REGISTRY}
 
-# ---------------------- Sidebar (All connectors as links; no underline; same page) ----------------------
+# ---------------------- Sidebar (Pro link list; no underline; same page) ----------------------
 def _sorted_filtered_connectors(q: str) -> List[Connector]:
     items = sorted(REGISTRY, key=lambda x: x.name.lower())
     if not q:
@@ -473,37 +463,101 @@ with st.sidebar:
     st.markdown('<div class="sidebar-caption">All connectors</div>', unsafe_allow_html=True)
     filtered = _sorted_filtered_connectors(q)
 
-    # Determine selected connector from query param (?conn=)
     qp = _get_query_params()
     selected_id = (qp.get("conn")[0] if isinstance(qp.get("conn"), list) else qp.get("conn")) if qp.get("conn") else None
     if selected_id not in {c.id for c in REGISTRY}:
         selected_id = filtered[0].id if filtered else REGISTRY[0].id
 
-    # Build HTML list (no underline) and force same-page navigation via JS
-    # Clicking updates parent window's query string, which triggers a normal rerun.
-    link_items = []
+    # Build a polished list inside the iframe with its own CSS so styles always apply.
+    rows_html = []
     for c in filtered:
-        active_cls = "active" if c.id == selected_id else ""
-        link_items.append(f'<a href="#" data-cid="{c.id}" class="{active_cls}">{c.icon} {c.name}</a>')
+        active = "is-active" if c.id == selected_id else ""
+        rows_html.append(
+            f"""
+            <button class="hub-row {active}" data-cid="{c.id}" title="{c.name}">
+              <span class="hub-ico">{c.icon}</span>
+              <span class="hub-name">{c.name}</span>
+            </button>
+            """
+        )
+
     html = f"""
-    <div class="sidebar-links">
-        {''.join(link_items)}
-    </div>
-    <script>
-      // Attach click handlers to stay on the same page, just swap ?conn=
-      for (const a of document.querySelectorAll('.sidebar-links a')) {{
-        a.addEventListener('click', function(e) {{
-          e.preventDefault();
-          const cid = this.getAttribute('data-cid');
-          // Update the parent (Streamlit app) location to same page with new query
-          const url = new URL(parent.window.location.href);
-          url.searchParams.set('conn', cid);
-          parent.window.location.href = url.toString();
-        }});
-      }}
-    </script>
+      <style>
+        :root {{
+          --row-h: 38px;
+          --radius: 10px;
+          --bg: #ffffff;
+          --text: #111827;
+          --muted: #6b7280;
+          --hover: #F3F4F6;
+          --active-bg: #EEF2FF;
+          --active-fg: #3730A3;
+          --border: #E5E7EB;
+        }}
+        * {{ box-sizing: border-box; font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, 'Helvetica Neue', Arial, 'Noto Sans', 'Apple Color Emoji', 'Segoe UI Emoji'; }}
+        .hub-wrap {{
+          width: 100%;
+          background: var(--bg);
+          border: 1px solid var(--border);
+          border-radius: var(--radius);
+          overflow: hidden;
+        }}
+        .hub-scroll {{
+          max-height: 520px;
+          overflow: auto;
+        }}
+        .hub-row {{
+          display: grid;
+          grid-template-columns: 26px 1fr;
+          align-items: center;
+          width: 100%;
+          height: var(--row-h);
+          padding: 0 .55rem 0 .45rem;
+          border: 0;
+          border-bottom: 1px dashed #F1F5F9;
+          background: transparent;
+          color: var(--text);
+          text-align: left;
+          cursor: pointer;
+          transition: background .12s ease-in-out, color .12s ease-in-out;
+        }}
+        .hub-row:last-child {{ border-bottom: 0; }}
+        .hub-row:hover {{ background: var(--hover); }}
+        .hub-row.is-active {{
+          background: var(--active-bg);
+          color: var(--active-fg);
+          font-weight: 600;
+        }}
+        .hub-ico {{ font-size: 16px; opacity:.95; }}
+        .hub-name {{
+          font-size: 14px;
+          white-space: nowrap;
+          overflow: hidden;
+          text-overflow: ellipsis;
+        }}
+      </style>
+      <div class="hub-wrap">
+        <div class="hub-scroll">
+          {''.join(rows_html)}
+        </div>
+      </div>
+      <script>
+        // Same-page navigation: update ?conn= and reload parent app.
+        const rows = document.querySelectorAll('.hub-row');
+        for (const r of rows) {{
+          r.addEventListener('click', (e) => {{
+            const cid = r.getAttribute('data-cid');
+            const url = new URL(parent.window.location.href);
+            url.searchParams.set('conn', cid);
+            parent.window.location.href = url.toString();
+          }});
+        }}
+      </script>
     """
-    components.html(html, height=min(600, 40 * max(3, len(filtered))), scrolling=True)
+
+    # Dynamic height: a bit of padding, capped.
+    height = min(560, 12 + 40 * max(3, len(filtered)))
+    components.html(html, height=height, scrolling=False)
 
 # Resolve current connector
 conn: Connector = REG_BY_ID[selected_id]  # type: ignore[index]
@@ -532,7 +586,6 @@ st.write("")
 left, right = st.columns([7, 5], gap="large")
 
 # ---------------------- Test handlers (per connector) ----------------------
-# (unchanged; kept for completeness)
 def test_postgres(cfg):
     try:
         import psycopg2
