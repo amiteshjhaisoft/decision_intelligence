@@ -1,7 +1,7 @@
 streamlit
 anthropic
 azure-storage-blob
-weaviate-client
+weaviate-client>=4,<5
 sentence-transformers
 langchain-text-splitters
 pypdf
