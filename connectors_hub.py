@@ -486,8 +486,8 @@ with st.sidebar:
 
     # ---------- Import / Export moved into the sidebar ----------
     st.divider()
-    st.markdown("### 🔄 Import / Export")
-    with st.expander("🔄 Import / Export", expanded=False):
+    # st.markdown("### 🔄 Import / Export Connections")
+    with st.expander("🔄 Import / Export Connections", expanded=False):
         sidebar_profiles = _load_all()
 
         # Export
