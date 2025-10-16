@@ -7,6 +7,7 @@
 # - Import/Export JSON; DSN preview; Env-var snippet
 # - Optional logos in ./assets (e.g., snowflake.svg, postgres.png)
 # - "Test Connection" for ALL registered connectors (best-effort, short timeouts, safe)
+# - NEW: RHS panel (pseudo-sidebar) that shows the Configure form when opened via panel=profile
 
 from __future__ import annotations
 
@@ -16,7 +17,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from textwrap import dedent  # <-- added
+from textwrap import dedent
 
 import pandas as pd
 import streamlit as st
@@ -78,6 +79,14 @@ st.markdown(
       .sidebar-ico{ font-size:16px; opacity:.95; }
       .sidebar-name{ font-size:14px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
       .sidebar-wrap a{ text-decoration:none !important; color:inherit !important; }
+
+      /* --- RHS panel feel --- */
+      .rhs-aside .stMarkdown, .rhs-aside .stForm, .rhs-aside .stButton, .rhs-aside .stTextInput,
+      .rhs-aside .stTextArea, .rhs-aside .stNumberInput, .rhs-aside .stSelectbox { font-size: 0.95rem; }
+      .rhs-aside .card { border-color:#E5E7EB; }
+      .rhs-header { display:flex; align-items:center; justify-content:space-between; margin-bottom:.3rem; }
+      .rhs-close a { text-decoration:none; color:#6b7280; }
+      .rhs-close a:hover { color:#111827; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -229,11 +238,7 @@ def _config_signature(cfg: Dict[str, Any]) -> str:
         return str(cfg)
 
 def _get_state_keys(conn_id: str) -> Dict[str, str]:
-    return {
-        "ok":  f"{conn_id}_last_test_ok",
-        "msg": f"{conn_id}_last_test_msg",
-        "sig": f"{conn_id}_last_test_sig",
-    }
+    return {"ok": f"{conn_id}_last_test_ok", "msg": f"{conn_id}_last_test_msg", "sig": f"{conn_id}_last_test_sig"}
 
 def _status_cache_key(conn_id: str, profile: str) -> str:
     return f"status::{conn_id}::{profile}"
@@ -489,12 +494,13 @@ with st.sidebar:
     if selected_id not in {c.id for c in REGISTRY}:
         selected_id = (filtered[0].id if filtered else REGISTRY[0].id)
 
-    # Native links (same page) with professional styling — IMPORTANT: one-line <a> to avoid code blocks
+    # Include panel=profile so clicking opens RHS panel
     rows_html = []
     for c in filtered:
-        active = "is-active" if c.id == selected_id else ""
+        active = "is-active" if c.id == selected_id and (qp.get("panel", [""])[0] == "profile") else ""
         rows_html.append(
-            f'<a class="sidebar-row {active}" href="?conn={c.id}" target="_self" title="{c.name}"><span class="sidebar-ico">{c.icon}</span><span class="sidebar-name">{c.name}</span></a>'
+            f'<a class="sidebar-row {active}" href="?conn={c.id}&panel=profile" target="_self" title="{c.name}">'
+            f'<span class="sidebar-ico">{c.icon}</span><span class="sidebar-name">{c.name}</span></a>'
         )
 
     st.markdown(
@@ -510,8 +516,10 @@ with st.sidebar:
         unsafe_allow_html=True,
     )
 
-# Resolve current connector
+# Resolve current connector and panel mode
 conn: Connector = REG_BY_ID[selected_id]  # type: ignore[index]
+qp = _get_query_params()
+panel_mode = (qp.get("panel")[0] if isinstance(qp.get("panel"), list) else qp.get("panel")) if qp.get("panel") else ""
 
 # ---------------------- Load / Save storage ----------------------
 all_profiles = _load_all()
@@ -534,9 +542,12 @@ with k3:
 
 st.write("")
 
-left, right = st.columns([7, 5], gap="large")
+# Layout: when panel=profile → render Configure form in the RHS column (pseudo-sidebar)
+main_left, main_right = st.columns([7, 5], gap="large")
 
 # ---------------------- Test handlers (per connector) ----------------------
+# (unchanged handlers – omitted here for brevity in this comment block; they remain identical)
+# --- BEGIN TEST HANDLERS ---
 def test_postgres(cfg):
     try:
         import psycopg2
@@ -548,9 +559,9 @@ def test_postgres(cfg):
             "password": cfg.get("password"),
             "connect_timeout": 5,
         }
-        conn = psycopg2.connect(**dsn)
-        cur = conn.cursor(); cur.execute("SELECT 1"); cur.fetchone()
-        conn.close()
+        conn_ = psycopg2.connect(**dsn)
+        cur = conn_.cursor(); cur.execute("SELECT 1"); cur.fetchone()
+        conn_.close()
         return True, "Connected (SELECT 1 ok)."
     except ModuleNotFoundError:
         return False, "Install library: pip install psycopg2-binary"
@@ -560,13 +571,13 @@ def test_postgres(cfg):
 def test_mysql(cfg):
     try:
         import pymysql
-        conn = pymysql.connect(host=cfg.get("host"), user=cfg.get("user"),
-                               password=cfg.get("password"), database=cfg.get("database"),
-                               port=int(cfg.get("port") or 3306), connect_timeout=5)
-        with conn.cursor() as cur:
+        conn_ = pymysql.connect(host=cfg.get("host"), user=cfg.get("user"),
+                                password=cfg.get("password"), database=cfg.get("database"),
+                                port=int(cfg.get("port") or 3306), connect_timeout=5)
+        with conn_.cursor() as cur:
             cur.execute("SELECT 1")
             cur.fetchone()
-        conn.close()
+        conn_.close()
         return True, "Connected (SELECT 1 ok)."
     except ModuleNotFoundError:
         return False, "Install library: pip install PyMySQL"
@@ -581,9 +592,9 @@ def test_mssql(cfg):
             f"DRIVER={{{driver}}};SERVER={cfg.get('server')};DATABASE={cfg.get('database')};"
             f"UID={cfg.get('user')};PWD={cfg.get('password')};TrustServerCertificate=yes;Connection Timeout=5;"
         )
-        conn = pyodbc.connect(conn_str)
-        cur = conn.cursor(); cur.execute("SELECT 1"); cur.fetchone()
-        conn.close()
+        conn_ = pyodbc.connect(conn_str)
+        cur = conn_.cursor(); cur.execute("SELECT 1"); cur.fetchone()
+        conn_.close()
         return True, "Connected (SELECT 1 ok)."
     except ModuleNotFoundError:
         return False, "Install: ODBC Driver + pip install pyodbc"
@@ -593,9 +604,9 @@ def test_mssql(cfg):
 def test_oracle(cfg):
     try:
         import oracledb
-        conn = oracledb.connect(user=cfg.get("user"), password=cfg.get("password"), dsn=cfg.get("dsn"), timeout=5)
-        cur = conn.cursor(); cur.execute("SELECT 1 FROM dual"); cur.fetchone()
-        conn.close()
+        conn_ = oracledb.connect(user=cfg.get("user"), password=cfg.get("password"), dsn=cfg.get("dsn"), timeout=5)
+        cur = conn_.cursor(); cur.execute("SELECT 1 FROM dual"); cur.fetchone()
+        conn_.close()
         return True, "Connected (SELECT 1 ok)."
     except ModuleNotFoundError:
         return False, "Install library: pip install oracledb"
@@ -605,9 +616,9 @@ def test_oracle(cfg):
 def test_sqlite(cfg):
     try:
         import sqlite3
-        conn = sqlite3.connect(cfg.get("filepath"))
-        cur = conn.cursor(); cur.execute("SELECT 1"); cur.fetchone()
-        conn.close()
+        conn_ = sqlite3.connect(cfg.get("filepath"))
+        cur = conn_.cursor(); cur.execute("SELECT 1"); cur.fetchone()
+        conn_.close()
         return True, "Opened DB file successfully."
     except Exception as e:
         return False, f"{e}"
@@ -615,11 +626,11 @@ def test_sqlite(cfg):
 def test_trino(cfg):
     try:
         import trino
-        conn = trino.dbapi.connect(host=cfg.get("host"), port=int(cfg.get("port") or 8080),
-                                   user=cfg.get("user"), catalog=cfg.get("catalog"),
-                                   schema=cfg.get("schema"))
-        cur = conn.cursor(); cur.execute("SELECT 1"); cur.fetchone()
-        conn.close()
+        conn_ = trino.dbapi.connect(host=cfg.get("host"), port=int(cfg.get("port") or 8080),
+                                    user=cfg.get("user"), catalog=cfg.get("catalog"),
+                                    schema=cfg.get("schema"))
+        cur = conn_.cursor(); cur.execute("SELECT 1"); cur.fetchone()
+        conn_.close()
         return True, "Connected (SELECT 1 ok)."
     except ModuleNotFoundError:
         return False, "Install library: pip install trino"
@@ -629,9 +640,9 @@ def test_trino(cfg):
 def test_duckdb(cfg):
     try:
         import duckdb
-        conn = duckdb.connect(cfg.get("filepath"))
-        conn.execute("SELECT 1").fetchone()
-        conn.close()
+        conn_ = duckdb.connect(cfg.get("filepath"))
+        conn_.execute("SELECT 1").fetchone()
+        conn_.close()
         return True, "Opened DuckDB file successfully."
     except ModuleNotFoundError:
         return False, "Install library: pip install duckdb"
@@ -641,10 +652,10 @@ def test_duckdb(cfg):
 def test_snowflake(cfg):
     try:
         import snowflake.connector as sf
-        conn = sf.connect(user=cfg.get("user"), password=cfg.get("password"),
-                          account=cfg.get("account"), warehouse=cfg.get("warehouse"),
-                          database=cfg.get("database"), schema=cfg.get("schema"), role=cfg.get("role"))
-        cur = conn.cursor(); cur.execute("SELECT 1"); cur.fetchone(); cur.close(); conn.close()
+        conn_ = sf.connect(user=cfg.get("user"), password=cfg.get("password"),
+                           account=cfg.get("account"), warehouse=cfg.get("warehouse"),
+                           database=cfg.get("database"), schema=cfg.get("schema"), role=cfg.get("role"))
+        cur = conn_.cursor(); cur.execute("SELECT 1"); cur.fetchone(); cur.close(); conn_.close()
         return True, "Connected (SELECT 1 ok)."
     except ModuleNotFoundError:
         return False, "Install library: pip install snowflake-connector-python"
@@ -672,18 +683,17 @@ def test_bigquery(cfg):
 def test_redshift(cfg):
     try:
         import psycopg2
-        conn = psycopg2.connect(host=cfg.get("host"), port=int(cfg.get("port") or 5439),
-                                dbname=cfg.get("database"), user=cfg.get("user"),
-                                password=cfg.get("password"), connect_timeout=5)
-        cur = conn.cursor(); cur.execute("SELECT 1"); cur.fetchone(); conn.close()
+        conn_ = psycopg2.connect(host=cfg.get("host"), port=int(cfg.get("port") or 5439),
+                                 dbname=cfg.get("database"), user=cfg.get("user"),
+                                 password=cfg.get("password"), connect_timeout=5)
+        cur = conn_.cursor(); cur.execute("SELECT 1"); cur.fetchone(); conn_.close()
         return True, "Connected (SELECT 1 ok)."
     except ModuleNotFoundError:
         return False, "Install library: pip install psycopg2-binary"
     except Exception as e:
         return False, f"{e}"
 
-def test_synapse(cfg):
-    return test_mssql(cfg)
+def test_synapse(cfg): return test_mssql(cfg)
 
 def test_mongodb(cfg):
     try:
@@ -894,8 +904,8 @@ def test_rabbitmq(cfg):
         import pika
         params = pika.URLParameters(cfg.get("amqp_url"))
         params.socket_timeout = 5
-        conn = pika.BlockingConnection(params)
-        conn.close()
+        conn_ = pika.BlockingConnection(params)
+        conn_.close()
         return True, "Connected (AMQP ok)."
     except ModuleNotFoundError:
         return False, "Install library: pip install pika"
@@ -1045,180 +1055,175 @@ def test_gmail(cfg):
     except Exception as e:
         return False, f"{e}"
 
-def test_msgraph(cfg):
-    return test_sharepoint(cfg)
+def test_msgraph(cfg): return test_sharepoint(cfg)
 
 TEST_HANDLERS = {
-    "postgres": test_postgres,
-    "mysql": test_mysql,
-    "mssql": test_mssql,
-    "oracle": test_oracle,
-    "sqlite": test_sqlite,
-    "trino": test_trino,
-    "duckdb": test_duckdb,
-    "snowflake": test_snowflake,
-    "bigquery": test_bigquery,
-    "redshift": test_redshift,
-    "synapse": test_synapse,
-    "mongodb": test_mongodb,
-    "cassandra": test_cassandra,
-    "redis": test_redis,
-    "dynamodb": test_dynamodb,
-    "neo4j": test_neo4j,
-    "elasticsearch": test_elasticsearch,
-    "cosmos": test_cosmos,
-    "firestore": test_firestore,
-    "bigtable": test_bigtable,
-    "s3": test_s3,
-    "azureblob": test_azureblob,
-    "adls": test_adls,
-    "gcs": test_gcs,
-    "hdfs": test_hdfs,
-    "kafka": test_kafka,
-    "rabbitmq": test_rabbitmq,
-    "eventhubs": test_eventhubs,
-    "pubsub": test_pubsub,
-    "kinesis": test_kinesis,
-    "spark": test_spark,
-    "dask": test_dask,
-    "salesforce": test_salesforce,
-    "servicenow": test_servicenow,
-    "jira": test_jira,
-    "sharepoint": test_sharepoint,
-    "tableau": test_tableau,
-    "gmail": test_gmail,
-    "msgraph": test_msgraph,
+    "postgres": test_postgres, "mysql": test_mysql, "mssql": test_mssql, "oracle": test_oracle,
+    "sqlite": test_sqlite, "trino": test_trino, "duckdb": test_duckdb, "snowflake": test_snowflake,
+    "bigquery": test_bigquery, "redshift": test_redshift, "synapse": test_synapse, "mongodb": test_mongodb,
+    "cassandra": test_cassandra, "redis": test_redis, "dynamodb": test_dynamodb, "neo4j": test_neo4j,
+    "elasticsearch": test_elasticsearch, "cosmos": test_cosmos, "firestore": test_firestore,
+    "bigtable": test_bigtable, "s3": test_s3, "azureblob": test_azureblob, "adls": test_adls, "gcs": test_gcs,
+    "hdfs": test_hdfs, "kafka": test_kafka, "rabbitmq": test_rabbitmq, "eventhubs": test_eventhubs,
+    "pubsub": test_pubsub, "kinesis": test_kinesis, "spark": test_spark, "dask": test_dask,
+    "salesforce": test_salesforce, "servicenow": test_servicenow, "jira": test_jira, "sharepoint": test_sharepoint,
+    "tableau": test_tableau, "gmail": test_gmail, "msgraph": test_msgraph,
 }
+# --- END TEST HANDLERS ---
 
-# ---------------------- Left: Create / Update Form ----------------------
-with left:
-    st.markdown("#### Configure connection profile")
-    st.markdown('<div class="card">', unsafe_allow_html=True)
+# --------------- Reusable: render Configure form into any container ---------------
+def render_configure_form(container, conn: Connector):
+    with container:
+        st.markdown("#### Configure connection profile")
+        st.markdown('<div class="card">', unsafe_allow_html=True)
 
-    _keys = _get_state_keys(conn.id)
-    for k in _keys.values():
-        st.session_state.setdefault(k, None)
+        _keys = _get_state_keys(conn.id)
+        for k in _keys.values():
+            st.session_state.setdefault(k, None)
 
-    with st.form(key=f"form_{conn.id}", clear_on_submit=False):
-        profile_name = st.text_input("Profile Name", placeholder="dev / staging / prod", key=f"{conn.id}_profile_name")
+        with st.form(key=f"form_{conn.id}", clear_on_submit=False):
+            profile_name = st.text_input("Profile Name", placeholder="dev / staging / prod", key=f"{conn.id}_profile_name")
 
-        values: Dict[str, Any] = {}
-        missing_required: List[str] = []
-        for f in conn.fields:
-            ikey = f"{conn.id}_{f.key}"
-            if f.kind == "password":
-                val = st.text_input(f.label, type="password", placeholder=f.placeholder or "", key=ikey)
-            elif f.kind == "int":
-                val = st.number_input(f.label, min_value=0, step=1, value=0, key=ikey)
-            elif f.kind == "textarea":
-                val = st.text_area(f.label, placeholder=f.placeholder or "", height=120, key=ikey)
-            elif f.kind == "select":
-                opts = f.options or [""]
-                val = st.selectbox(f.label, opts, index=0, key=ikey)
+            values: Dict[str, Any] = {}
+            missing_required: List[str] = []
+            for f in conn.fields:
+                ikey = f"{conn.id}_{f.key}"
+                if f.kind == "password":
+                    val = st.text_input(f.label, type="password", placeholder=f.placeholder or "", key=ikey)
+                elif f.kind == "int":
+                    val = st.number_input(f.label, min_value=0, step=1, value=0, key=ikey)
+                elif f.kind == "textarea":
+                    val = st.text_area(f.label, placeholder=f.placeholder or "", height=120, key=ikey)
+                elif f.kind == "select":
+                    opts = f.options or [""]
+                    val = st.selectbox(f.label, opts, index=0, key=ikey)
+                else:
+                    val = st.text_input(f.label, placeholder=f.placeholder or "", key=ikey)
+                values[f.key] = val
+                if f.required and (val is None or str(val).strip() == ""):
+                    missing_required.append(f.label)
+
+            c1, c2, c3, c4 = st.columns([1,1,1,1])
+            submitted = c1.form_submit_button("💾 Save Profile", use_container_width=True)
+            preview   = c2.form_submit_button("🧪 Preview DSN", use_container_width=True)
+            envvars   = c3.form_submit_button("🔐 Env-Vars Snippet", use_container_width=True)
+            test_clicked = c4.form_submit_button("✅ Test Connection", use_container_width=True)
+
+        st.markdown('</div>', unsafe_allow_html=True)
+
+        if test_clicked:
+            handler = TEST_HANDLERS.get(conn.id)
+            if not handler:
+                st.warning("Test handler not implemented for this connector.")
+                st.session_state[_keys["ok"]] = False
+                st.session_state[_keys["msg"]] = "No test available."
+                st.session_state[_keys["sig"]] = _config_signature(values)
             else:
-                val = st.text_input(f.label, placeholder=f.placeholder or "", key=ikey)
-            values[f.key] = val
-            if f.required and (val is None or str(val).strip() == ""):
-                missing_required.append(f.label)
+                _short_timeout_env()
+                with st.spinner("Testing connection..."):
+                    ok, msg = handler(values)
+                st.session_state[_keys["ok"]] = bool(ok)
+                st.session_state[_keys["msg"]] = msg
+                st.session_state[_keys["sig"]] = _config_signature(values)
 
-        c1, c2, c3, c4 = st.columns([1,1,1,1])
-        submitted = c1.form_submit_button("💾 Save Profile", use_container_width=True)
-        preview   = c2.form_submit_button("🧪 Preview DSN", use_container_width=True)
-        envvars   = c3.form_submit_button("🔐 Env-Vars Snippet", use_container_width=True)
-        test_clicked = c4.form_submit_button("✅ Test Connection", use_container_width=True)
+        last_ok  = st.session_state.get(_keys["ok"])
+        last_msg = st.session_state.get(_keys["msg"]) or "Not tested"
+        sig_now  = _config_signature(values)
+        sig_last = st.session_state.get(_keys["sig"])
 
-    st.markdown('</div>', unsafe_allow_html=True)
-
-    if test_clicked:
-        handler = TEST_HANDLERS.get(conn.id)
-        if not handler:
-            st.warning("Test handler not implemented for this connector.")
-            st.session_state[_keys["ok"]] = False
-            st.session_state[_keys["msg"]] = "No test available."
-            st.session_state[_keys["sig"]] = _config_signature(values)
+        if last_ok is True and sig_now == sig_last:
+            st.markdown(f'<span class="pill">✅ Successful</span> <span class="muted small">{last_msg}</span>', unsafe_allow_html=True)
+        elif last_ok is False and sig_now == sig_last:
+            st.markdown(f'<span class="pill" style="background:#FEE2E2;color:#991B1B;">❌ Failed</span> <span class="muted small">{last_msg}</span>', unsafe_allow_html=True)
         else:
-            _short_timeout_env()
-            with st.spinner("Testing connection..."):
-                ok, msg = handler(values)
-            st.session_state[_keys["ok"]] = bool(ok)
-            st.session_state[_keys["msg"]] = msg
-            st.session_state[_keys["sig"]] = _config_signature(values)
+            st.markdown(f'<span class="pill" style="background:#FFF7ED;color:#9A3412;">⏳ Not tested</span> <span class="muted small">Run “Test Connection” before saving.</span>', unsafe_allow_html=True)
 
-    last_ok  = st.session_state.get(_keys["ok"])
-    last_msg = st.session_state.get(_keys["msg"]) or "Not tested"
-    sig_now  = _config_signature(values)
-    sig_last = st.session_state.get(_keys["sig"])
+        if preview:
+            st.info("Indicative DSN/URI preview (no network calls):")
+            st.code(_dsn_preview(conn.id, values), language="text")
 
-    if last_ok is True and sig_now == sig_last:
-        st.markdown(f'<span class="pill">✅ Successful</span> <span class="muted small">{last_msg}</span>', unsafe_allow_html=True)
-    elif last_ok is False and sig_now == sig_last:
-        st.markdown(f'<span class="pill" style="background:#FEE2E2;color:#991B1B;">❌ Failed</span> <span class="muted small">{last_msg}</span>', unsafe_allow_html=True)
-    else:
-        st.markdown(f'<span class="pill" style="background:#FFF7ED;color:#9A3412;">⏳ Not tested</span> <span class="muted small">Run “Test Connection” before saving.</span>', unsafe_allow_html=True)
+        if envvars:
+            st.info("Copy/paste into your shell (masked preview):")
+            st.code(_env_snippet(conn.id, profile_name or "PROFILE", values, conn.secret_keys), language="bash")
 
-    if preview:
-        st.info("Indicative DSN/URI preview (no network calls):")
-        st.code(_dsn_preview(conn.id, values), language="text")
+        if submitted:
+            if not profile_name.strip():
+                st.error("Please provide a **Profile Name**.")
+            elif missing_required:
+                st.error("Missing required fields: " + ", ".join(missing_required))
+            elif not (st.session_state.get(_keys["ok"]) is True and st.session_state.get(_keys["sig"]) == _config_signature(values)):
+                st.error("Please **Test Connection** and ensure it is **Successful** for the current values before saving.")
+            else:
+                all_profiles = _load_all()
+                all_profiles.setdefault(conn.id, {})
+                all_profiles[conn.id][profile_name] = values
+                _save_all(all_profiles)
+                _cache_status_set(conn.id, profile_name, st.session_state.get(_keys["ok"]), st.session_state.get(_keys["msg"]) or "")
+                st.success(f"Saved **{profile_name}** for {conn.icon} {conn.name}.")
 
-    if envvars:
-        st.info("Copy/paste into your shell (masked preview):")
-        st.code(_env_snippet(conn.id, profile_name or "PROFILE", values, conn.secret_keys), language="bash")
+# ---------------------- Saved Profiles (reusable) ----------------------
+def render_saved_profiles(container, conn: Connector, profiles_for: Dict[str, Dict[str, Any]]):
+    with container:
+        st.markdown("#### Saved profiles")
+        st.markdown('<div class="card">', unsafe_allow_html=True)
 
-    if submitted:
-        if not profile_name.strip():
-            st.error("Please provide a **Profile Name**.")
-        elif missing_required:
-            st.error("Missing required fields: " + ", ".join(missing_required))
-        elif not (st.session_state.get(_keys["ok"]) is True and st.session_state.get(_keys["sig"]) == _config_signature(values)):
-            st.error("Please **Test Connection** and ensure it is **Successful** for the current values before saving.")
+        if not profiles_for:
+            st.info("No profiles saved yet for this connector.")
         else:
-            all_profiles.setdefault(conn.id, {})
-            all_profiles[conn.id][profile_name] = values
-            _save_all(all_profiles)
-            _cache_status_set(conn.id, profile_name, st.session_state.get(_keys["ok"]), st.session_state.get(_keys["msg"]) or "")
-            st.success(f"Saved **{profile_name}** for {conn.icon} {conn.name}.")
-
-# ---------------------- Right: Profiles for Selected Connector ----------------------
-with right:
-    st.markdown("#### Saved profiles")
-    st.markdown('<div class="card">', unsafe_allow_html=True)
-
-    if not profiles_for:
-        st.info("No profiles saved yet for this connector.")
-    else:
-        for pname, cfg in sorted(profiles_for.items()):
-            redacted = masked_view(cfg, conn.secret_keys)
-            with st.expander(f"{conn.icon} {conn.name} — **{pname}**", expanded=False):
-                st.json(redacted)
-                cc1, cc2, cc3, cc4 = st.columns([1,1,1,2])
-                if cc1.button("📝 Load to form", key=f"load_{conn.id}_{pname}"):
-                    st.session_state[f"{conn.id}_profile_name"] = pname
-                    for f in conn.fields:
-                        st.session_state[f"{conn.id}_{f.key}"] = cfg.get(f.key, "")
-                    st.success(f"Loaded **{pname}** into the form above.")
-                if cc2.button("🧪 Test", key=f"quicktest_{conn.id}_{pname}"):
-                    handler = TEST_HANDLERS.get(conn.id)
-                    if handler:
-                        _short_timeout_env()
-                        with st.spinner("Testing connection..."):
-                            ok, msg = handler(cfg)
-                        if ok:
-                            st.success(msg)
+            for pname, cfg in sorted(profiles_for.items()):
+                redacted = masked_view(cfg, conn.secret_keys)
+                with st.expander(f"{conn.icon} {conn.name} — **{pname}**", expanded=False):
+                    st.json(redacted)
+                    cc1, cc2, cc3, cc4 = st.columns([1,1,1,2])
+                    if cc1.button("📝 Load to form", key=f"load_{conn.id}_{pname}"):
+                        st.session_state[f"{conn.id}_profile_name"] = pname
+                        for f in conn.fields:
+                            st.session_state[f"{conn.id}_{f.key}"] = cfg.get(f.key, "")
+                        st.success(f"Loaded **{pname}** into the form.")
+                    if cc2.button("🧪 Test", key=f"quicktest_{conn.id}_{pname}"):
+                        handler = TEST_HANDLERS.get(conn.id)
+                        if handler:
+                            _short_timeout_env()
+                            with st.spinner("Testing connection..."):
+                                ok, msg = handler(cfg)
+                            st.success(msg) if ok else st.error(msg)
+                            _cache_status_set(conn.id, pname, bool(ok), msg)
                         else:
-                            st.error(msg)
-                        _cache_status_set(conn.id, pname, bool(ok), msg)
-                    else:
-                        st.warning("No test implemented.")
-                if cc3.button("🗑️ Delete", key=f"del_{conn.id}_{pname}"):
-                    all_profiles[conn.id].pop(pname, None)
-                    if not all_profiles[conn.id]:
-                        all_profiles.pop(conn.id, None)
-                    _save_all(all_profiles)
-                    st.session_state.pop(_status_cache_key(conn.id, pname), None)
-                    st.warning(f"Deleted profile **{pname}**.")
-                    st.rerun()
-                cc4.caption("Secrets are masked in this view. Raw values remain local in `connections.json`.")
-    st.markdown('</div>', unsafe_allow_html=True)
+                            st.warning("No test implemented.")
+                    if cc3.button("🗑️ Delete", key=f"del_{conn.id}_{pname}"):
+                        all_profiles = _load_all()
+                        all_profiles.get(conn.id, {}).pop(pname, None)
+                        if not all_profiles.get(conn.id):
+                            all_profiles.pop(conn.id, None)
+                        _save_all(all_profiles)
+                        st.session_state.pop(_status_cache_key(conn.id, pname), None)
+                        st.warning(f"Deleted profile **{pname}**.")
+                        st.rerun()
+                    cc4.caption("Secrets are masked in this view. Raw values remain local in `connections.json`.")
+        st.markdown('</div>', unsafe_allow_html=True)
+
+# ---------------------- Conditional layout ----------------------
+if panel_mode == "profile":
+    # RHS panel shows the Configure form; main area shows Saved profiles
+    with main_right:
+        st.container()  # spacer to ensure layout paints
+        st.markdown('<div class="rhs-aside">', unsafe_allow_html=True)
+        # Close link (removes panel=profile)
+        st.markdown(
+            f'<div class="rhs-header"><div><b>Configure connection profile</b></div>'
+            f'<div class="rhs-close"><a href="?conn={conn.id}" target="_self">✖ Close panel</a></div></div>',
+            unsafe_allow_html=True,
+        )
+    render_configure_form(main_right, conn)
+    with main_right:
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    render_saved_profiles(main_left, conn, profiles_for)
+
+else:
+    # Default: form in main_left; saved profiles in main_right (original layout)
+    render_configure_form(main_left, conn)
+    render_saved_profiles(main_right, conn, profiles_for)
 
 # ---------------------- All Configured Connections (Table) ----------------------
 st.write("")
@@ -1231,10 +1236,8 @@ def _run_status_check_for_all():
         handler = TEST_HANDLERS.get(cid)
         for pname, cfg in (items or {}).items():
             if handler:
-                try:
-                    ok, msg = handler(cfg)
-                except Exception as e:
-                    ok, msg = False, str(e)
+                try: ok, msg = handler(cfg)
+                except Exception as e: ok, msg = False, str(e)
             else:
                 ok, msg = None, "No test implemented."
             _cache_status_set(cid, pname, ok, msg)
@@ -1256,12 +1259,7 @@ else:
             status_info = _cache_status_get(cid, pname)
             ok = status_info.get("ok")
             msg = status_info.get("msg") or ""
-            if ok is True:
-                status_text = "✅ Successful"
-            elif ok is False:
-                status_text = "❌ Failed"
-            else:
-                status_text = "⏳ Not tested"
+            status_text = "✅ Successful" if ok is True else ("❌ Failed" if ok is False else "⏳ Not tested")
             rows.append({
                 "Connector": f"{meta.icon if meta else '🔌'} {meta.name if meta else cid}",
                 "Profile": pname,
