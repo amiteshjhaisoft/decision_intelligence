@@ -16,6 +16,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from textwrap import dedent  # <-- added
 
 import pandas as pd
 import streamlit as st
@@ -488,27 +489,24 @@ with st.sidebar:
     if selected_id not in {c.id for c in REGISTRY}:
         selected_id = (filtered[0].id if filtered else REGISTRY[0].id)
 
-    # Native links (same page) with professional styling
+    # Native links (same page) with professional styling — IMPORTANT: one-line <a> to avoid code blocks
     rows_html = []
     for c in filtered:
         active = "is-active" if c.id == selected_id else ""
         rows_html.append(
-            f"""
-            <a class="sidebar-row {active}" href="?conn={c.id}" target="_self" title="{c.name}">
-              <span class="sidebar-ico">{c.icon}</span>
-              <span class="sidebar-name">{c.name}</span>
-            </a>
-            """
+            f'<a class="sidebar-row {active}" href="?conn={c.id}" target="_self" title="{c.name}"><span class="sidebar-ico">{c.icon}</span><span class="sidebar-name">{c.name}</span></a>'
         )
 
     st.markdown(
-        f"""
-        <div class="sidebar-wrap">
-          <div class="sidebar-scroll">
-            {''.join(rows_html)}
-          </div>
-        </div>
-        """,
+        dedent(
+            f"""
+            <div class="sidebar-wrap">
+              <div class="sidebar-scroll">
+                {''.join(rows_html)}
+              </div>
+            </div>
+            """
+        ),
         unsafe_allow_html=True,
     )
 
