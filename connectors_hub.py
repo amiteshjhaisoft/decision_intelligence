@@ -1087,7 +1087,7 @@ TEST_HANDLERS = {
 def render_configure_form(container, conn: Connector):
     with container:
         # Card shell
-        st.markdown('<div class="card">', unsafe_allow_html=True)
+        # st.markdown('<div class="card">', unsafe_allow_html=True)
 
         # Header row with inline Close (top-right) inside the card
         title_col, close_col = st.columns([10, 1])
