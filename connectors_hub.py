@@ -9,6 +9,7 @@
 # - "Test Connection" for ALL registered connectors (best-effort, short timeouts, safe)
 # - RHS panel (pseudo-sidebar) that shows the Configure form as a slide-in panel
 # - NEW: SPA navigation (no hard refresh); header moves into RHS when panel is open
+# - NEW: Left content always shows "All configured connections" in a card; auto status checks (no manual button)
 
 from __future__ import annotations
 
@@ -109,7 +110,7 @@ def _logo_html(basename: str, size: int = 22) -> Optional[str]:
         return None
     base = basename.lower().replace(" ", "").replace("/", "").replace("-", "")
     for ext in (".svg", ".png", ".jpg", ".jpeg", ".webp"):
-        p = ASSETS_DIR / f"{base}{ext}"
+        p = ASSETS_DIR / f"{base}{ext}"]
         if p.exists():
             try:
                 b64 = base64.b64encode(p.read_bytes()).decode("utf-8")
@@ -515,7 +516,7 @@ def render_header(container, conn: Connector, total_connectors: int, total_profi
                                unsafe_allow_html=True)
 
 # ---------------------- Test handlers (per connector) ----------------------
-# (All handlers below remain unchanged from the previous version.)
+# (All handlers remain unchanged; omitted comments for brevity.)
 def test_postgres(cfg):
     try:
         import psycopg2
@@ -1129,13 +1130,12 @@ def render_configure_form(container, conn: Connector):
                 _cache_status_set(conn.id, profile_name, st.session_state.get(_keys["ok"]), st.session_state.get(_keys["msg"]) or "")
                 st.success(f"Saved **{profile_name}** for {conn.icon} {conn.name}.")
 
-# ---------------------- Conditional layout ----------------------
+# ---------------------- RHS panel ----------------------
 if st.session_state["rhs_open"]:
     with main_right:
         st.markdown('<div class="rhs-aside">', unsafe_allow_html=True)
         render_header(main_right, conn, len(REGISTRY), total_profiles_all, in_rhs=True)
 
-        # Title row + Close
         col_a, col_b = st.columns([3,1])
         with col_a:
             st.markdown("#### Configure connection profile")
@@ -1146,14 +1146,10 @@ if st.session_state["rhs_open"]:
         render_configure_form(main_right, conn)
         st.markdown('</div>', unsafe_allow_html=True)
 else:
-    with main_left:
+    with main_right:
         st.info("Select a connector from the left to open the configuration panel →")
 
-# ---------------------- All Configured Connections (Table) ----------------------
-st.write("")
-st.markdown("### 📚 All configured connections")
-st.markdown('<div class="card">', unsafe_allow_html=True)
-
+# ---------------------- All Configured Connections (ALWAYS in left box) ----------------------
 def _run_status_check_for_all():
     _short_timeout_env()
     for cid, items in (_load_all() or {}).items():
@@ -1168,35 +1164,33 @@ def _run_status_check_for_all():
                 ok, msg = None, "No test implemented."
             _cache_status_set(cid, pname, ok, msg)
 
-cA, cB = st.columns([1,3])
-with cA:
-    if st.button("🔁 Test all saved connections now", use_container_width=True):
-        with st.spinner("Running status checks..."):
-            _run_status_check_for_all()
+with main_left:
+    st.markdown("### 📚 All configured connections")
+    st.markdown('<div class="card">', unsafe_allow_html=True)
 
-all_profiles = _load_all()  # re-read after potential changes above
-if not all_profiles:
-    st.info("You haven’t saved any connections yet.")
-else:
-    rows: List[Dict[str, Any]] = []
-    for cid, items in all_profiles.items():
-        meta = REG_BY_ID.get(cid)
-        for pname, cfg in items.items():
-            status_info = _cache_status_get(cid, pname)
-            ok = status_info.get("ok")
-            msg = status_info.get("msg") or ""
-            status_text = "✅ Successful" if ok is True else ("❌ Failed" if ok is False else "⏳ Not tested")
-            rows.append({
-                "Connector": f"{meta.icon if meta else '🔌'} {meta.name if meta else cid}",
-                "Profile": pname,
-                "Fields": ", ".join(cfg.keys()),
-                "Status": status_text,
-                "Details": msg,
-            })
-    df = pd.DataFrame(rows).sort_values(["Connector", "Profile"])
-    st.dataframe(df, hide_index=True, use_container_width=True)
+    # Auto-check status every render to keep it up-to-date
+    _run_status_check_for_all()
+    all_profiles = _load_all()
 
-st.markdown('</div>', unsafe_allow_html=True)
+    if not all_profiles:
+        st.info("You haven’t saved any connections yet.")
+    else:
+        rows: List[Dict[str, Any]] = []
+        for cid, items in all_profiles.items():
+            meta = REG_BY_ID.get(cid)
+            for pname in items.keys():
+                status_info = _cache_status_get(cid, pname)
+                ok = status_info.get("ok")
+                status_text = "✅ Successful" if ok is True else ("❌ Failed" if ok is False else "⏳ Not tested")
+                rows.append({
+                    "Connector": f"{meta.icon if meta else '🔌'} {meta.name if meta else cid}",
+                    "Profile": pname,
+                    "Status": status_text,
+                })
+        df = pd.DataFrame(rows).sort_values(["Connector", "Profile"])
+        st.dataframe(df, hide_index=True, use_container_width=True)
+
+    st.markdown('</div>', unsafe_allow_html=True)
 
 # ---------------------- Import / Export JSON ----------------------
 st.write("")
