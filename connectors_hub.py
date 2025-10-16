@@ -7,7 +7,8 @@
 # - Import/Export JSON; DSN preview; Env-var snippet
 # - Optional logos in ./assets (e.g., snowflake.svg, postgres.png)
 # - "Test Connection" for ALL registered connectors (best-effort, short timeouts, safe)
-# - NEW: RHS panel (pseudo-sidebar) that shows the Configure form when opened via panel=profile
+# - RHS panel (pseudo-sidebar) that shows the Configure form when opened via panel=profile
+# - NEW: When RHS panel is open, the connector header (logo/name/category/ID) moves into that panel
 
 from __future__ import annotations
 
@@ -125,7 +126,7 @@ def _mask(val: Any) -> Any:
 def masked_view(d: Dict[str, Any], secret_keys: List[str]) -> Dict[str, Any]:
     return {k: (_mask(v) if k in secret_keys else v) for k, v in d.items()}
 
-def _logo_html(basename: str, size: int = 20) -> Optional[str]:
+def _logo_html(basename: str, size: int = 22) -> Optional[str]:
     if not ASSETS_DIR.exists():
         return None
     base = basename.lower().replace(" ", "").replace("/", "").replace("-", "")
@@ -532,20 +533,31 @@ panel_mode = (qp.get("panel")[0] if isinstance(qp.get("panel"), list) else qp.ge
 all_profiles = _load_all()
 profiles_for = all_profiles.get(conn.id, {})
 
-# ---------------------- Header / Overview ----------------------
-k1, k2, k3 = st.columns([2,1,1])
-with k1:
-    thumb = _logo_html(conn.logo_key or conn.id, size=22)
-    if thumb:
-        st.markdown(f'<div class="logo-wrap">{thumb}<h2 style="margin:0;">{conn.icon} {conn.name}</h2></div>', unsafe_allow_html=True)
-    else:
-        st.markdown(f"## {conn.icon} {conn.name}")
-    st.caption(f"Category: **{conn.category}** · ID: `{conn.id}`")
+# ---------------------- Header renderer ----------------------
+def render_header(container, conn: Connector, total_connectors: int, total_profiles: int, *, in_rhs: bool):
+    with container:
+        # Top summary chips stay in page header; this is the per-connector header.
+        thumb = _logo_html(conn.logo_key or conn.id, size=22)
+        if thumb:
+            container.markdown(
+                f'<div class="logo-wrap">{thumb}<h2 style="margin:0;">{conn.icon} {conn.name}</h2></div>',
+                unsafe_allow_html=True,
+            )
+        else:
+            container.markdown(f"## {conn.icon} {conn.name}")
+        container.caption(f"Category: **{conn.category}** · ID: `{conn.id}`")
+        if in_rhs:
+            # Small divider so the form has a visual separation
+            container.markdown("<hr style='border:none;border-top:1px solid #E5E7EB;margin:0.4rem 0 0.6rem;'>",
+                               unsafe_allow_html=True)
+
+# ---------------------- KPIs row (global) ----------------------
+k2, k3 = st.columns([1,1])
 with k2:
     st.markdown(f'<div class="kpi">🧩 Connectors: <b>{len(REGISTRY)}</b></div>', unsafe_allow_html=True)
 with k3:
-    total_profiles = sum(len(v) for v in all_profiles.values())
-    st.markdown(f'<div class="kpi">🗂️ Profiles: <b>{total_profiles}</b></div>', unsafe_allow_html=True)
+    total_profiles_all = sum(len(v) for v in all_profiles.values())
+    st.markdown(f'<div class="kpi">🗂️ Profiles: <b>{total_profiles_all}</b></div>', unsafe_allow_html=True)
 
 st.write("")
 
@@ -553,6 +565,8 @@ st.write("")
 main_left, main_right = st.columns([7, 5], gap="large")
 
 # ---------------------- Test handlers (per connector) ----------------------
+# (Handlers identical to previous message; to keep this file self-contained, they are included below.)
+
 def test_postgres(cfg):
     try:
         import psycopg2
@@ -1210,9 +1224,12 @@ def render_saved_profiles(container, conn: Connector, profiles_for: Dict[str, Di
 
 # ---------------------- Conditional layout ----------------------
 if panel_mode == "profile":
-    # RHS panel shows the Configure form; main area shows Saved profiles
+    # RHS panel shows Header + Configure form; main area shows Saved profiles
     with main_right:
         st.markdown('<div class="rhs-aside">', unsafe_allow_html=True)
+        # Header MOVED into the RHS panel:
+        render_header(main_right, conn, len(REGISTRY), total_profiles_all, in_rhs=True)
+        # Close link (removes panel=profile)
         st.markdown(
             f'<div class="rhs-header"><div><b>Configure connection profile</b></div>'
             f'<div class="rhs-close"><a href="?conn={conn.id}" target="_self">✖ Close panel</a></div></div>',
@@ -1222,10 +1239,12 @@ if panel_mode == "profile":
     with main_right:
         st.markdown('</div>', unsafe_allow_html=True)
 
+    # Left shows the saved profiles list
     render_saved_profiles(main_left, conn, profiles_for)
 
 else:
-    # Default: form in main_left; saved profiles in main_right (original layout)
+    # Default: header in main_left; form in main_left; saved profiles in main_right
+    render_header(main_left, conn, len(REGISTRY), total_profiles_all, in_rhs=False)
     render_configure_form(main_left, conn)
     render_saved_profiles(main_right, conn, profiles_for)
 
