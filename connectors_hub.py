@@ -546,8 +546,6 @@ st.write("")
 main_left, main_right = st.columns([7, 5], gap="large")
 
 # ---------------------- Test handlers (per connector) ----------------------
-# (unchanged handlers – omitted here for brevity in this comment block; they remain identical)
-# --- BEGIN TEST HANDLERS ---
 def test_postgres(cfg):
     try:
         import psycopg2
@@ -1069,7 +1067,6 @@ TEST_HANDLERS = {
     "salesforce": test_salesforce, "servicenow": test_servicenow, "jira": test_jira, "sharepoint": test_sharepoint,
     "tableau": test_tableau, "gmail": test_gmail, "msgraph": test_msgraph,
 }
-# --- END TEST HANDLERS ---
 
 # --------------- Reusable: render Configure form into any container ---------------
 def render_configure_form(container, conn: Connector):
