@@ -1399,6 +1399,84 @@ with main_left:
 
 
 # ====================================================================================================================================================================
+# --- helpers (top of Pipelines page, or above the form) ---
+from pathlib import Path
+import json
+
+try:
+    APP_DIR = Path(__file__).parent
+except NameError:
+    APP_DIR = Path.cwd()
+CONN_STORE = APP_DIR / "connections.json"
+
+def _load_profiles_store() -> dict:
+    if not CONN_STORE.exists():
+        return {}
+    try:
+        return json.loads(CONN_STORE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+def _profiles_for(connector_id: str) -> list[str]:
+    store = _load_profiles_store()
+    profs = store.get(connector_id, {}) or {}
+    # return sorted list of profile names
+    return sorted(profs.keys(), key=str.lower)
+
+# --- inside the Create Pipeline form UI ---
+st.subheader("Source")
+
+# 1) Choose source connector
+src_connector = st.selectbox(
+    "Source Connector",
+    options=[c.id for c in REGISTRY],                    # or filter to ingest types only
+    format_func=lambda cid: REG_BY_ID[cid].name,
+    key="pipe_src_connector",
+)
+
+# 2) Force a re-render when connector changes so the profiles refresh
+if "pipe__last_src_connector" not in st.session_state:
+    st.session_state["pipe__last_src_connector"] = src_connector
+elif st.session_state["pipe__last_src_connector"] != src_connector:
+    st.session_state["pipe__last_src_connector"] = src_connector
+    st.rerun()
+
+# 3) Populate Source Profile choices from connections.json
+src_profiles = _profiles_for(src_connector)
+
+src_profile = st.selectbox(
+    "Source Profile",
+    options=src_profiles if src_profiles else ["(no profiles found)"],
+    key="pipe_src_profile",
+)
+
+if not src_profiles:
+    st.caption(
+        "No saved profiles found for this connector. "
+        "Open the connector, fill credentials, **Test Connection**, then **Save Profile**."
+    )
+    # Optional “jump” to the connector editor in the same app session:
+    jump_col1, _ = st.columns([1,3])
+    if jump_col1.button("Create profile now"):
+        # if your app keeps the same state across pages:
+        st.session_state["selected_id"] = src_connector
+        st.session_state["rhs_open"] = True
+        st.experimental_set_query_params(tab="connectors")  # if you use tabs/query params
+        st.rerun()
+
+# 4) Weaviate profile selection (targets the destination vector DB)
+st.subheader("Destination (Weaviate)")
+weaviate_profiles = _profiles_for("weaviate")
+weaviate_profile = st.selectbox(
+    "Weaviate Profile",
+    options=weaviate_profiles if weaviate_profiles else ["(no profiles found)"],
+    key="pipe_weaviate_profile",
+)
+if not weaviate_profiles:
+    st.caption(
+        "No Weaviate profiles found. Open the Weaviate connector, test and save a profile first."
+    )
+
 # ==================== Pipelines: storage & helpers ====================
 PIPE_STORE = APP_DIR / "pipelines.json"
 
