@@ -1546,7 +1546,7 @@ with st.container():
                 index=src_connector_opts.index(initial.get("source_connector", ""))
                 if initial.get("source_connector", "") in src_connector_opts
                 else 0,
-                key="pipe_src_connector",  # (optional) keep a stable key for this too
+                key="pipe_src_connector",
             )
             
             # Re-render when connector changes so profiles refresh
@@ -1554,33 +1554,24 @@ with st.container():
                 st.session_state["pipe__last_src_connector"] = src_connector
             elif st.session_state["pipe__last_src_connector"] != src_connector:
                 st.session_state["pipe__last_src_connector"] = src_connector
+                # also clear any stale profile selection
+                st.session_state["pipe_src_profile"] = ""
                 st.rerun()
             
             # Populate profiles for the selected connector
             src_profiles = _profiles_for_connector(src_connector) if src_connector else []
-            src_profile_opts = [""] + src_profiles if src_profiles else [""]
+            src_profile_opts = ([""] + src_profiles) if src_profiles else [""]
             
-            # (3) add a stable key for the Source Profile selectbox here
+            # 🔧 KEY CHANGE: make the key depend on connector so Streamlit resets it per connector
             src_profile = st.selectbox(
                 "Source Profile",
                 options=src_profile_opts,
                 index=src_profile_opts.index(initial.get("source_profile", ""))
                 if initial.get("source_profile", "") in src_profile_opts
                 else 0,
-                key="pipe_src_profile",   # ← this is step 3
+                key=f"pipe_src_profile__{src_connector or 'none'}",
             )
-            
-            # Optional helper to jump to connector editor if no profiles exist
-            if src_connector and not src_profiles:
-                st.caption(
-                    "No saved profiles found for this connector. Open the connector, "
-                    "fill credentials, **Test Connection**, then **Save Profile**."
-                )
-                jump_col1, _ = st.columns([1, 3])
-                if jump_col1.button("Create profile now"):
-                    st.session_state["selected_id"] = src_connector
-                    st.session_state["rhs_open"] = True
-                    st.rerun()
+
 
 
             # -------------------- Destination (Weaviate) --------------------
