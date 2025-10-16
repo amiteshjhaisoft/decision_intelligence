@@ -201,6 +201,16 @@ def _dsn_preview(conn_id: str, cfg: Dict[str, Any]) -> str:
             return "gmail:// (OAuth/Service Account JSON provided)"
         if conn_id == "msgraph":
             return f"msgraph://tenant={cfg.get('tenant_id')}"
+        if conn_id == "weaviate":
+            # Accept either full URL or host+port fields; prefer url if present.
+            url = (cfg.get("url") or "").strip()
+            if not url:
+                scheme = (cfg.get("scheme") or "https").lower()
+                host = (cfg.get("host") or "").strip()
+                port = cfg.get("port") or (443 if scheme == "https" else 80)
+                url = f"{scheme}://{host}:{port}"
+            mt = " (multi-tenancy)" if str(cfg.get("multi_tenancy") or "").lower() in ("true", "yes", "1") else ""
+            return f"weaviate://{url}{mt}"     
     except Exception:
         pass
     return "(preview unavailable)"
@@ -436,6 +446,18 @@ REGISTRY: List[Connector] = [
               [F("tenant_id","Tenant ID",required=True), F("client_id","Client ID",required=True),
                F("client_secret","Client Secret",required=True,kind="password")],
               ["client_secret"], "Email / Collaboration", "msgraph"),
+    Connector("weaviate", "Weaviate (Vector DB)", "🧠",
+              [F("url","Cluster URL", required=False, placeholder="https://your-cluster.weaviate.network"),
+               F("scheme","Scheme", kind="select", options=["https","http"]),
+               F("host","Host", placeholder="your-cluster.weaviate.network"),
+               F("port","Port", kind="int"),
+               F("api_key","API Key", kind="password"),
+               F("multi_tenancy","Multi-Tenancy", kind="select", options=["", "true", "false"])
+              ],
+              ["api_key"],
+              "NoSQL / Graph / Search",
+              "weaviate"),
+
 ]
 
 REG_BY_ID: Dict[str, Connector] = {c.id: c for c in REGISTRY}
@@ -1070,6 +1092,92 @@ def test_gmail(cfg):
 def test_msgraph(cfg):
     return test_sharepoint(cfg)
 
+def test_weaviate(cfg):
+    """
+    Tries both v3.x and v4.x weaviate client styles.
+    Pass if the cluster responds to readiness/meta call.
+    """
+    try:
+        import weaviate  # ensure client is installed
+    except ModuleNotFoundError:
+        return False, "Install library: pip install weaviate-client"
+
+    # Build URL: prefer explicit url, else compose from scheme/host/port
+    url = (cfg.get("url") or "").strip()
+    if not url:
+        scheme = (cfg.get("scheme") or "https").lower()
+        host = (cfg.get("host") or "").strip()
+        port = cfg.get("port")
+        if not host:
+            return False, "Provide either full URL or host (with optional port)."
+        if port:
+            url = f"{scheme}://{host}:{int(port)}"
+        else:
+            url = f"{scheme}://{host}"
+
+    api_key = (cfg.get("api_key") or "").strip()
+
+    # Try v3-style first
+    try:
+        from weaviate import Client, AuthApiKey  # v3.x
+        auth = AuthApiKey(api_key) if api_key else None
+        client = Client(url=url, auth_client_secret=auth, timeout_config=(5, 5))
+        # Quick health probe
+        if hasattr(client, "is_ready") and client.is_ready():
+            # Optional: fetch meta to prove connectivity
+            _ = client.cluster.get_meta()
+            return True, "Connected (is_ready & meta ok)."
+    except Exception as e_v3:
+        v3_err = str(e_v3)
+    else:
+        # If no exception but not ready
+        return False, "Client created but readiness failed."
+
+    # Try v4-style (if installed)
+    try:
+        # v4 offers different entrypoints; attempt a generic connect
+        # Some installs expose connect_to_custom or WeaviateClient; handle lightly.
+        try:
+            from weaviate import connect_to_custom, auth as wvauth  # type: ignore
+            auth = wvauth.ApiKey(api_key) if (api_key and hasattr(wvauth, "ApiKey")) else None
+            client = connect_to_custom(
+                http_host=url, grpc_host=None, auth_credentials=auth, timeout=(5, 5)  # type: ignore
+            )
+            # v4 health: client.is_ready() or client.health.get_nodes() / .get_live()
+            ready = False
+            if hasattr(client, "is_ready"):
+                ready = bool(client.is_ready())
+            elif hasattr(client, "cluster") and hasattr(client.cluster, "nodes"):
+                _ = client.cluster.nodes()  # a simple call
+                ready = True
+            if ready:
+                if hasattr(client, "close"):
+                    client.close()
+                return True, "Connected (v4 client ok)."
+        except Exception as e_v4a:
+            v4a_err = str(e_v4a)
+
+        # Fallback: generic import path
+        try:
+            from weaviate import Client as WvClient  # sometimes still available
+            client = WvClient(url=url, auth_client_secret=(AuthApiKey(api_key) if api_key else None), timeout_config=(5,5))  # type: ignore
+            if hasattr(client, "is_ready") and client.is_ready():
+                return True, "Connected (fallback client ok)."
+        except Exception as e_v4b:
+            v4b_err = str(e_v4b)
+    except Exception as e_v4:
+        v4_err = str(e_v4)
+
+    # If we got here, both paths failed; return best error we captured
+    msg = "Failed to connect to Weaviate."
+    for extra in [locals().get("v3_err"), locals().get("v4a_err"), locals().get("v4b_err"), locals().get("v4_err")]:
+        if extra:
+            msg += f" {extra}"
+            break
+    return False, msg
+
+    
+
 TEST_HANDLERS = {
     "postgres": test_postgres, "mysql": test_mysql, "mssql": test_mssql, "oracle": test_oracle,
     "sqlite": test_sqlite, "trino": test_trino, "duckdb": test_duckdb, "snowflake": test_snowflake,
@@ -1080,7 +1188,7 @@ TEST_HANDLERS = {
     "hdfs": test_hdfs, "kafka": test_kafka, "rabbitmq": test_rabbitmq, "eventhubs": test_eventhubs,
     "pubsub": test_pubsub, "kinesis": test_kinesis, "spark": test_spark, "dask": test_dask,
     "salesforce": test_salesforce, "servicenow": test_servicenow, "jira": test_jira, "sharepoint": test_sharepoint,
-    "tableau": test_tableau, "gmail": test_gmail, "msgraph": test_msgraph,
+    "tableau": test_tableau, "gmail": test_gmail, "msgraph": test_msgraph, "weaviate": test_weaviate,
 }
 
 # --------------- Reusable: render Configure form into any container ---------------
