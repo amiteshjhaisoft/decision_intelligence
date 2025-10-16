@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Optional
 
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components  # NEW: to render same-page links with JS
 
 APP_TITLE = "🔌 Data Connectors Hub"
 APP_TAGLINE = "Configure, validate, and organize connection profiles for databases, warehouses, NoSQL, storage, streaming, and SaaS."
@@ -58,9 +59,11 @@ st.markdown(
       section[data-testid="stSidebar"] { width: 340px !important; }
       .sidebar-caption { margin: .3rem 0 .4rem 0; color:#6b7280; font-size:.92rem; }
       .sidebar-section { margin-top:.6rem; padding-top:.6rem; border-top:1px dashed #E5E7EB; }
+
+      /* Sidebar links: no underline, same-page styling */
       .sidebar-links a {
-        display:block; padding:.35rem .3rem; text-decoration:none;
-        border-radius:8px; color:#111827; font-weight:500;
+        display:block; padding:.35rem .3rem; text-decoration:none !important;
+        border-radius:8px; color:#111827; font-weight:500; cursor:pointer;
       }
       .sidebar-links a:hover { background:#F3F4F6; }
       .sidebar-links a.active { background:#EEF2FF; color:#3730A3; }
@@ -443,7 +446,7 @@ REGISTRY: List[Connector] = [
 
 REG_BY_ID: Dict[str, Connector] = {c.id: c for c in REGISTRY}
 
-# ---------------------- Sidebar (All connectors as links) ----------------------
+# ---------------------- Sidebar (All connectors as links; no underline; same page) ----------------------
 def _sorted_filtered_connectors(q: str) -> List[Connector]:
     items = sorted(REGISTRY, key=lambda x: x.name.lower())
     if not q:
@@ -452,17 +455,10 @@ def _sorted_filtered_connectors(q: str) -> List[Connector]:
     return [c for c in items if ql in c.name.lower() or ql in c.id.lower() or ql in c.category.lower()]
 
 def _get_query_params() -> Dict[str, List[str]]:
-    # Streamlit 1.30+: st.query_params; older: experimental_get_query_params
     try:
-        return dict(st.query_params)  # type: ignore[attr-defined]
+        return dict(st.query_params)  # Streamlit >=1.30
     except Exception:
         return st.experimental_get_query_params()
-
-def _set_query_params(**params):
-    try:
-        st.query_params.update(params)  # type: ignore[attr-defined]
-    except Exception:
-        st.experimental_set_query_params(**params)
 
 with st.sidebar:
     logo_path = ASSETS_DIR / "logo.png"
@@ -483,13 +479,31 @@ with st.sidebar:
     if selected_id not in {c.id for c in REGISTRY}:
         selected_id = filtered[0].id if filtered else REGISTRY[0].id
 
-    # Render link list
-    st.markdown('<div class="sidebar-links">', unsafe_allow_html=True)
+    # Build HTML list (no underline) and force same-page navigation via JS
+    # Clicking updates parent window's query string, which triggers a normal rerun.
+    link_items = []
     for c in filtered:
-        href = f"?conn={c.id}"
         active_cls = "active" if c.id == selected_id else ""
-        st.markdown(f'<a class="{active_cls}" href="{href}">{c.icon} {c.name}</a>', unsafe_allow_html=True)
-    st.markdown('</div>', unsafe_allow_html=True)
+        link_items.append(f'<a href="#" data-cid="{c.id}" class="{active_cls}">{c.icon} {c.name}</a>')
+    html = f"""
+    <div class="sidebar-links">
+        {''.join(link_items)}
+    </div>
+    <script>
+      // Attach click handlers to stay on the same page, just swap ?conn=
+      for (const a of document.querySelectorAll('.sidebar-links a')) {{
+        a.addEventListener('click', function(e) {{
+          e.preventDefault();
+          const cid = this.getAttribute('data-cid');
+          // Update the parent (Streamlit app) location to same page with new query
+          const url = new URL(parent.window.location.href);
+          url.searchParams.set('conn', cid);
+          parent.window.location.href = url.toString();
+        }});
+      }}
+    </script>
+    """
+    components.html(html, height=min(600, 40 * max(3, len(filtered))), scrolling=True)
 
 # Resolve current connector
 conn: Connector = REG_BY_ID[selected_id]  # type: ignore[index]
@@ -518,7 +532,7 @@ st.write("")
 left, right = st.columns([7, 5], gap="large")
 
 # ---------------------- Test handlers (per connector) ----------------------
-# Each returns (ok: bool, message: str). Uses short timeouts where possible.
+# (unchanged; kept for completeness)
 def test_postgres(cfg):
     try:
         import psycopg2
