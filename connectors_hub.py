@@ -479,9 +479,50 @@ with st.sidebar:
     filtered = _sorted_filtered_connectors(q)
     for c in filtered:
         is_active = (st.session_state["selected_id"] == c.id and st.session_state["rhs_open"])
-        if st.button(f"{c.icon}  {c.name}", key=f"nav_{c.id}", type=("primary" if is_active else "secondary"),
+        if st.button(f"{c.icon}  {c.name}", key=f"nav_{c.id}",
+                     type=("primary" if is_active else "secondary"),
                      use_container_width=True):
             _set_active(c.id)
+
+    # ---------- Import / Export moved into the sidebar ----------
+    st.divider()
+    with st.expander("🔄 Import / Export", expanded=False):
+        sidebar_profiles = _load_all()
+
+        # Export
+        st.markdown("**Export connections**")
+        if sidebar_profiles:
+            export_json = json.dumps(sidebar_profiles, indent=2).encode("utf-8")
+            st.download_button(
+                "⬇️ Download connections.json",
+                data=export_json,
+                file_name="connections.json",
+                mime="application/json",
+                use_container_width=True,
+            )
+        else:
+            st.caption("Nothing to export yet.")
+
+        st.write("")
+
+        # Import
+        st.markdown("**Import connections**")
+        up = st.file_uploader("Upload a connections.json", type=["json"])
+        if up:
+            try:
+                data = json.loads(up.read().decode("utf-8"))
+                if isinstance(data, dict):
+                    merged = _load_all()
+                    for cid, profs in data.items():
+                        merged.setdefault(cid, {})
+                        merged[cid].update(profs or {})
+                    _save_all(merged)
+                    st.success("Imported connections successfully.")
+                    st.rerun()
+                else:
+                    st.error("Invalid format. Expected a JSON object.")
+            except Exception as e:
+                st.error(f"Failed to import: {e}")
 
 # Resolve current connector from state
 conn: Connector = REG_BY_ID[st.session_state["selected_id"]]
@@ -1192,44 +1233,44 @@ with main_left:
 
     st.markdown('</div>', unsafe_allow_html=True)
 
-# ---------------------- Import / Export JSON ----------------------
-st.write("")
-st.markdown("### 🔄 Import / Export")
-cA, cB = st.columns([1,1])
+# # ---------------------- Import / Export JSON ----------------------
+# st.write("")
+# st.markdown("### 🔄 Import / Export")
+# cA, cB = st.columns([1,1])
 
-with cA:
-    st.markdown("#### Export connections")
-    st.markdown('<div class="card">', unsafe_allow_html=True)
-    if all_profiles:
-        export_json = json.dumps(all_profiles, indent=2).encode("utf-8")
-        st.download_button(
-            "⬇️ Download connections.json",
-            data=export_json,
-            file_name="connections.json",
-            mime="application/json",
-            use_container_width=True,
-        )
-    else:
-        st.caption("Nothing to export yet.")
-    st.markdown('</div>', unsafe_allow_html=True)
+# with cA:
+#     st.markdown("#### Export connections")
+#     st.markdown('<div class="card">', unsafe_allow_html=True)
+#     if all_profiles:
+#         export_json = json.dumps(all_profiles, indent=2).encode("utf-8")
+#         st.download_button(
+#             "⬇️ Download connections.json",
+#             data=export_json,
+#             file_name="connections.json",
+#             mime="application/json",
+#             use_container_width=True,
+#         )
+#     else:
+#         st.caption("Nothing to export yet.")
+#     st.markdown('</div>', unsafe_allow_html=True)
 
-with cB:
-    st.markdown("#### Import connections")
-    st.markdown('<div class="card">', unsafe_allow_html=True)
-    up = st.file_uploader("Upload a connections.json", type=["json"])
-    if up:
-        try:
-            data = json.loads(up.read().decode("utf-8"))
-            if isinstance(data, dict):
-                merged = _load_all()
-                for cid, profs in data.items():
-                    merged.setdefault(cid, {})
-                    merged[cid].update(profs or {})
-                _save_all(merged)
-                st.success("Imported connections successfully.")
-                st.rerun()
-            else:
-                st.error("Invalid format. Expected a JSON object.")
-        except Exception as e:
-            st.error(f"Failed to import: {e}")
-    st.markdown('</div>', unsafe_allow_html=True)
+# with cB:
+#     st.markdown("#### Import connections")
+#     st.markdown('<div class="card">', unsafe_allow_html=True)
+#     up = st.file_uploader("Upload a connections.json", type=["json"])
+#     if up:
+#         try:
+#             data = json.loads(up.read().decode("utf-8"))
+#             if isinstance(data, dict):
+#                 merged = _load_all()
+#                 for cid, profs in data.items():
+#                     merged.setdefault(cid, {})
+#                     merged[cid].update(profs or {})
+#                 _save_all(merged)
+#                 st.success("Imported connections successfully.")
+#                 st.rerun()
+#             else:
+#                 st.error("Invalid format. Expected a JSON object.")
+#         except Exception as e:
+#             st.error(f"Failed to import: {e}")
+#     st.markdown('</div>', unsafe_allow_html=True)
