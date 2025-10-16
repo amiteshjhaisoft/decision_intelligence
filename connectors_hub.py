@@ -24,6 +24,7 @@ except NameError:
     APP_DIR = Path.cwd()
 
 CONN_STORE = APP_DIR / "connections.json"
+PIPE_STORE = APP_DIR / "pipelines.json"   # <-- add this line
 ASSETS_DIR = APP_DIR / "assets"  # optional logo files
 
 # ---------------------- Page Config & Global Style ----------------------
