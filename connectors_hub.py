@@ -1179,6 +1179,7 @@ else:
     with main_right:
         # Keep the blue info prompt (requested)
         # st.info("Select a connector from the left to open the configuration panel →")
+        st.markdown()
 
 # ---------------------- All Configured Connections (ALWAYS in left box) ----------------------
 def _run_status_check_for_all():
