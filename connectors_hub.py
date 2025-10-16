@@ -1107,87 +1107,51 @@ def test_msgraph(cfg):
 
 def test_weaviate(cfg):
     """
-    Tries both v3.x and v4.x weaviate client styles.
-    Pass if the cluster responds to readiness/meta call.
+    Test Weaviate connectivity with the v4 client.
+    Supports: WCS via cluster_url, or self-hosted via scheme/host/port.
+    Auth: API key (optional).
     """
     try:
-        import weaviate  # ensure client is installed
+        from weaviate import connect_to_wcs, connect_to_custom
+        from weaviate.classes.init import Auth
     except ModuleNotFoundError:
-        return False, "Install library: pip install weaviate-client"
+        return False, "Install library: pip install 'weaviate-client>=4,<5'"
 
-    # Build URL: prefer explicit url, else compose from scheme/host/port
-    url = (cfg.get("url") or "").strip()
-    if not url:
+    try:
+        # Inputs
+        cluster_url = (cfg.get("cluster_url") or cfg.get("url") or "").strip().rstrip("/")
+        api_key = (cfg.get("api_key") or "").strip() or None
         scheme = (cfg.get("scheme") or "https").lower()
         host = (cfg.get("host") or "").strip()
-        port = cfg.get("port")
-        if not host:
-            return False, "Provide either full URL or host (with optional port)."
-        if port:
-            url = f"{scheme}://{host}:{int(port)}"
+        port = int(cfg.get("port") or (443 if scheme == "https" else 80))
+
+        auth = Auth.api_key(api_key) if api_key else None
+
+        # Connect (prefer WCS)
+        if cluster_url:
+            client = connect_to_wcs(cluster_url=cluster_url, auth_credentials=auth, timeout=5.0)
         else:
-            url = f"{scheme}://{host}"
+            base_url = f"{scheme}://{host}" + ("" if (scheme == "https" and port == 443) or (scheme == "http" and port == 80) else f":{port}")
+            client = connect_to_custom(http_host=base_url, auth_credentials=auth, timeout=5.0)
 
-    api_key = (cfg.get("api_key") or "").strip()
-
-    # Try v3-style first
-    try:
-        from weaviate import Client, AuthApiKey  # v3.x
-        auth = AuthApiKey(api_key) if api_key else None
-        client = Client(url=url, auth_client_secret=auth, timeout_config=(5, 5))
-        # Quick health probe
-        if hasattr(client, "is_ready") and client.is_ready():
-            # Optional: fetch meta to prove connectivity
-            _ = client.cluster.get_meta()
-            return True, "Connected (is_ready & meta ok)."
-    except Exception as e_v3:
-        v3_err = str(e_v3)
-    else:
-        # If no exception but not ready
-        return False, "Client created but readiness failed."
-
-    # Try v4-style (if installed)
-    try:
-        # v4 offers different entrypoints; attempt a generic connect
-        # Some installs expose connect_to_custom or WeaviateClient; handle lightly.
+        # Lightweight check; any call will validate auth + reachability.
         try:
-            from weaviate import connect_to_custom, auth as wvauth  # type: ignore
-            auth = wvauth.ApiKey(api_key) if (api_key and hasattr(wvauth, "ApiKey")) else None
-            client = connect_to_custom(
-                http_host=url, grpc_host=None, auth_credentials=auth, timeout=(5, 5)  # type: ignore
-            )
-            # v4 health: client.is_ready() or client.health.get_nodes() / .get_live()
-            ready = False
-            if hasattr(client, "is_ready"):
-                ready = bool(client.is_ready())
-            elif hasattr(client, "cluster") and hasattr(client.cluster, "nodes"):
-                _ = client.cluster.nodes()  # a simple call
-                ready = True
-            if ready:
-                if hasattr(client, "close"):
-                    client.close()
-                return True, "Connected (v4 client ok)."
-        except Exception as e_v4a:
-            v4a_err = str(e_v4a)
+            ready = client.is_ready()  # v4 readiness probe
+        except AttributeError:
+            # Fallback if the client version lacks is_ready()
+            # Listing collections is also a cheap, auth-protected call.
+            _ = list(getattr(client, "collections").list_all())  # will raise on failure
+            ready = True
 
-        # Fallback: generic import path
+        client.close()
+        return (True, "Connected to Weaviate.") if ready else (False, "Weaviate is not ready.")
+    except Exception as e:
         try:
-            from weaviate import Client as WvClient  # sometimes still available
-            client = WvClient(url=url, auth_client_secret=(AuthApiKey(api_key) if api_key else None), timeout_config=(5,5))  # type: ignore
-            if hasattr(client, "is_ready") and client.is_ready():
-                return True, "Connected (fallback client ok)."
-        except Exception as e_v4b:
-            v4b_err = str(e_v4b)
-    except Exception as e_v4:
-        v4_err = str(e_v4)
+            client.close()  # just in case it was created
+        except Exception:
+            pass
+        return False, f"Failed to connect to Weaviate: {e}"
 
-    # If we got here, both paths failed; return best error we captured
-    msg = "Failed to connect to Weaviate."
-    for extra in [locals().get("v3_err"), locals().get("v4a_err"), locals().get("v4b_err"), locals().get("v4_err")]:
-        if extra:
-            msg += f" {extra}"
-            break
-    return False, msg
 
     
 
