@@ -7,8 +7,8 @@
 # - Import/Export JSON; DSN preview; Env-var snippet
 # - Optional logos in ./assets (e.g., snowflake.svg, postgres.png)
 # - "Test Connection" for ALL registered connectors (best-effort, short timeouts, safe)
-# - RHS panel (pseudo-sidebar) that shows the Configure form when opened via panel=profile
-# - NEW: When RHS panel is open, the connector header (logo/name/category/ID) moves into that panel
+# - RHS panel (pseudo-sidebar) that shows the Configure form as a slide-in panel
+# - NEW: SPA navigation (no hard refresh); header moves into RHS when panel is open
 
 from __future__ import annotations
 
@@ -61,26 +61,6 @@ st.markdown(
       section[data-testid="stSidebar"] { width: 340px !important; }
       .sidebar-caption { margin: .3rem 0 .4rem 0; color:#6b7280; font-size:.92rem; }
 
-      /* --- Professional sidebar link list (native links, no underline) --- */
-      .sidebar-wrap{
-        width:100%; background:#fff; border:1px solid #E5E7EB; border-radius:10px; overflow:hidden;
-      }
-      .sidebar-scroll{ max-height:520px; overflow:auto; }
-      .sidebar-row{
-        display:grid; grid-template-columns:26px 1fr; align-items:center;
-        height:38px; padding:0 .55rem 0 .45rem;
-        border-bottom:1px dashed #F1F5F9;
-        text-decoration:none; border-radius:0;
-        color:#111827; background:transparent;
-        transition:background .12s ease-in-out, color .12s ease-in-out;
-      }
-      .sidebar-row:last-child{ border-bottom:0; }
-      .sidebar-row:hover{ background:#F3F4F6; }
-      .sidebar-row.is-active{ background:#EEF2FF; color:#3730A3; font-weight:600; }
-      .sidebar-ico{ font-size:16px; opacity:.95; }
-      .sidebar-name{ font-size:14px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-      .sidebar-wrap a{ text-decoration:none !important; color:inherit !important; }
-
       /* --- RHS "sidebar" panel look/feel --- */
       .rhs-aside {
         position: sticky; top: 10px;
@@ -92,9 +72,7 @@ st.markdown(
       .rhs-aside .stMarkdown, .rhs-aside .stForm, .rhs-aside .stButton, .rhs-aside .stTextInput,
       .rhs-aside .stTextArea, .rhs-aside .stNumberInput, .rhs-aside .stSelectbox { font-size: 0.95rem; }
       .rhs-aside .card { border-color:#E5E7EB; }
-      .rhs-header { display:flex; align-items:center; justify-content:space-between; margin-bottom:.3rem; }
-      .rhs-close a { text-decoration:none; color:#6b7280; }
-      .rhs-close a:hover { color:#111827; }
+      .rhs-header { display:flex; align-items:center; justify-content:space-between; margin:.25rem 0 .5rem; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -470,7 +448,7 @@ REGISTRY: List[Connector] = [
 
 REG_BY_ID: Dict[str, Connector] = {c.id: c for c in REGISTRY}
 
-# ---------------------- Sidebar (Professional native link list) ----------------------
+# ---------------------- Sidebar (SPA navigation: no hard refresh) ----------------------
 def _sorted_filtered_connectors(q: str) -> List[Connector]:
     items = sorted(REGISTRY, key=lambda x: x.name.lower())
     if not q:
@@ -478,11 +456,13 @@ def _sorted_filtered_connectors(q: str) -> List[Connector]:
     ql = q.lower()
     return [c for c in items if ql in c.name.lower() or ql in c.id.lower() or ql in c.category.lower()]
 
-def _get_query_params() -> Dict[str, List[str]]:
-    try:
-        return dict(st.query_params)  # Streamlit >=1.30
-    except Exception:
-        return st.experimental_get_query_params()
+# Session state defaults
+st.session_state.setdefault("selected_id", REGISTRY[0].id)
+st.session_state.setdefault("rhs_open", False)
+
+def _set_active(conn_id: str):
+    st.session_state["selected_id"] = conn_id
+    st.session_state["rhs_open"] = True
 
 with st.sidebar:
     logo_path = ASSETS_DIR / "logo.png"
@@ -493,50 +473,34 @@ with st.sidebar:
 
     st.markdown("### 🔎 Search")
     q = st.text_input("Search connectors", placeholder="snowflake, postgres, blob, kafka...").strip()
-
     st.markdown('<div class="sidebar-caption">All connectors</div>', unsafe_allow_html=True)
+
     filtered = _sorted_filtered_connectors(q)
-
-    qp = _get_query_params()
-    selected_id = (qp.get("conn")[0] if isinstance(qp.get("conn"), list) else qp.get("conn")) if qp.get("conn") else None
-    if selected_id not in {c.id for c in REGISTRY}:
-        selected_id = (filtered[0].id if filtered else REGISTRY[0].id)
-
-    # Include panel=profile so clicking opens RHS panel
-    rows_html = []
     for c in filtered:
-        active = "is-active" if c.id == selected_id and (qp.get("panel", [""])[0] == "profile") else ""
-        rows_html.append(
-            f'<a class="sidebar-row {active}" href="?conn={c.id}&panel=profile" target="_self" title="{c.name}">'
-            f'<span class="sidebar-ico">{c.icon}</span><span class="sidebar-name">{c.name}</span></a>'
-        )
+        is_active = (st.session_state["selected_id"] == c.id and st.session_state["rhs_open"])
+        if st.button(f"{c.icon}  {c.name}", key=f"nav_{c.id}", type=("primary" if is_active else "secondary"),
+                     use_container_width=True):
+            _set_active(c.id)
 
-    st.markdown(
-        dedent(
-            f"""
-            <div class="sidebar-wrap">
-              <div class="sidebar-scroll">
-                {''.join(rows_html)}
-              </div>
-            </div>
-            """
-        ),
-        unsafe_allow_html=True,
-    )
+# Resolve current connector from state
+conn: Connector = REG_BY_ID[st.session_state["selected_id"]]
 
-# Resolve current connector and panel mode
-conn: Connector = REG_BY_ID[selected_id]  # type: ignore[index]
-qp = _get_query_params()
-panel_mode = (qp.get("panel")[0] if isinstance(qp.get("panel"), list) else qp.get("panel")) if qp.get("panel") else ""
-
-# ---------------------- Load / Save storage ----------------------
+# ---------------------- Load store & KPIs ----------------------
 all_profiles = _load_all()
-profiles_for = all_profiles.get(conn.id, {})
+total_profiles_all = sum(len(v) for v in all_profiles.values())
+
+k2, k3 = st.columns([1,1])
+with k2:
+    st.markdown(f'<div class="kpi">🧩 Connectors: <b>{len(REGISTRY)}</b></div>', unsafe_allow_html=True)
+with k3:
+    st.markdown(f'<div class="kpi">🗂️ Profiles: <b>{total_profiles_all}</b></div>', unsafe_allow_html=True)
+
+st.write("")
+main_left, main_right = st.columns([7, 5], gap="large")
 
 # ---------------------- Header renderer ----------------------
 def render_header(container, conn: Connector, total_connectors: int, total_profiles: int, *, in_rhs: bool):
     with container:
-        # Top summary chips stay in page header; this is the per-connector header.
         thumb = _logo_html(conn.logo_key or conn.id, size=22)
         if thumb:
             container.markdown(
@@ -547,26 +511,11 @@ def render_header(container, conn: Connector, total_connectors: int, total_profi
             container.markdown(f"## {conn.icon} {conn.name}")
         container.caption(f"Category: **{conn.category}** · ID: `{conn.id}`")
         if in_rhs:
-            # Small divider so the form has a visual separation
             container.markdown("<hr style='border:none;border-top:1px solid #E5E7EB;margin:0.4rem 0 0.6rem;'>",
                                unsafe_allow_html=True)
 
-# ---------------------- KPIs row (global) ----------------------
-k2, k3 = st.columns([1,1])
-with k2:
-    st.markdown(f'<div class="kpi">🧩 Connectors: <b>{len(REGISTRY)}</b></div>', unsafe_allow_html=True)
-with k3:
-    total_profiles_all = sum(len(v) for v in all_profiles.values())
-    st.markdown(f'<div class="kpi">🗂️ Profiles: <b>{total_profiles_all}</b></div>', unsafe_allow_html=True)
-
-st.write("")
-
-# Layout: when panel=profile → render Configure form in the RHS column (pseudo-sidebar)
-main_left, main_right = st.columns([7, 5], gap="large")
-
 # ---------------------- Test handlers (per connector) ----------------------
-# (Handlers identical to previous message; to keep this file self-contained, they are included below.)
-
+# (All handlers below remain unchanged from the previous version.)
 def test_postgres(cfg):
     try:
         import psycopg2
@@ -1094,7 +1043,6 @@ TEST_HANDLERS = {
 # --------------- Reusable: render Configure form into any container ---------------
 def render_configure_form(container, conn: Connector):
     with container:
-        st.markdown("#### Configure connection profile")
         st.markdown('<div class="card">', unsafe_allow_html=True)
 
         _keys = _get_state_keys(conn.id)
@@ -1181,72 +1129,25 @@ def render_configure_form(container, conn: Connector):
                 _cache_status_set(conn.id, profile_name, st.session_state.get(_keys["ok"]), st.session_state.get(_keys["msg"]) or "")
                 st.success(f"Saved **{profile_name}** for {conn.icon} {conn.name}.")
 
-# ---------------------- Saved Profiles (reusable) ----------------------
-def render_saved_profiles(container, conn: Connector, profiles_for: Dict[str, Dict[str, Any]]):
-    with container:
-        st.markdown("#### Saved profiles")
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-
-        if not profiles_for:
-            st.info("No profiles saved yet for this connector.")
-        else:
-            for pname, cfg in sorted(profiles_for.items()):
-                redacted = masked_view(cfg, conn.secret_keys)
-                with st.expander(f"{conn.icon} {conn.name} — **{pname}**", expanded=False):
-                    st.json(redacted)
-                    cc1, cc2, cc3, cc4 = st.columns([1,1,1,2])
-                    if cc1.button("📝 Load to form", key=f"load_{conn.id}_{pname}"):
-                        st.session_state[f"{conn.id}_profile_name"] = pname
-                        for f in conn.fields:
-                            st.session_state[f"{conn.id}_{f.key}"] = cfg.get(f.key, "")
-                        st.success(f"Loaded **{pname}** into the form.")
-                    if cc2.button("🧪 Test", key=f"quicktest_{conn.id}_{pname}"):
-                        handler = TEST_HANDLERS.get(conn.id)
-                        if handler:
-                            _short_timeout_env()
-                            with st.spinner("Testing connection..."):
-                                ok, msg = handler(cfg)
-                            st.success(msg) if ok else st.error(msg)
-                            _cache_status_set(conn.id, pname, bool(ok), msg)
-                        else:
-                            st.warning("No test implemented.")
-                    if cc3.button("🗑️ Delete", key=f"del_{conn.id}_{pname}"):
-                        all_profiles = _load_all()
-                        all_profiles.get(conn.id, {}).pop(pname, None)
-                        if not all_profiles.get(conn.id):
-                            all_profiles.pop(conn.id, None)
-                        _save_all(all_profiles)
-                        st.session_state.pop(_status_cache_key(conn.id, pname), None)
-                        st.warning(f"Deleted profile **{pname}**.")
-                        st.rerun()
-                    cc4.caption("Secrets are masked in this view. Raw values remain local in `connections.json`.")
-        st.markdown('</div>', unsafe_allow_html=True)
-
 # ---------------------- Conditional layout ----------------------
-if panel_mode == "profile":
-    # RHS panel shows Header + Configure form; main area shows Saved profiles
+if st.session_state["rhs_open"]:
     with main_right:
         st.markdown('<div class="rhs-aside">', unsafe_allow_html=True)
-        # Header MOVED into the RHS panel:
         render_header(main_right, conn, len(REGISTRY), total_profiles_all, in_rhs=True)
-        # Close link (removes panel=profile)
-        st.markdown(
-            f'<div class="rhs-header"><div><b>Configure connection profile</b></div>'
-            f'<div class="rhs-close"><a href="?conn={conn.id}" target="_self">✖ Close panel</a></div></div>',
-            unsafe_allow_html=True,
-        )
-    render_configure_form(main_right, conn)
-    with main_right:
+
+        # Title row + Close
+        col_a, col_b = st.columns([3,1])
+        with col_a:
+            st.markdown("#### Configure connection profile")
+        with col_b:
+            if st.button("✖ Close", key="close_rhs", use_container_width=True):
+                st.session_state["rhs_open"] = False
+
+        render_configure_form(main_right, conn)
         st.markdown('</div>', unsafe_allow_html=True)
-
-    # Left shows the saved profiles list
-    render_saved_profiles(main_left, conn, profiles_for)
-
 else:
-    # Default: header in main_left; form in main_left; saved profiles in main_right
-    render_header(main_left, conn, len(REGISTRY), total_profiles_all, in_rhs=False)
-    render_configure_form(main_left, conn)
-    render_saved_profiles(main_right, conn, profiles_for)
+    with main_left:
+        st.info("Select a connector from the left to open the configuration panel →")
 
 # ---------------------- All Configured Connections (Table) ----------------------
 st.write("")
