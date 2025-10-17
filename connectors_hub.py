@@ -1398,7 +1398,6 @@ with main_left:
 
     st.markdown('</div>', unsafe_allow_html=True)
 
-
 # =================================================================================================
 # Pipelines helpers & UI (drop into your Streamlit page)
 # =================================================================================================
@@ -1407,7 +1406,6 @@ with main_left:
 # Connections store helpers (read-only here)
 # ---------------------------------------------------------------------------------
 def _load_profiles_store() -> dict:
-    # single source of truth
     if not CONN_STORE.exists():
         return {}
     try:
@@ -1419,16 +1417,11 @@ def _profiles_for_connector(conn_id: str) -> List[str]:
     store = _load_profiles_store()
     return sorted(list((store.get(conn_id) or {}).keys()), key=str.lower)
 
-
 def _profiles_for(connector_id: str) -> List[str]:
     """Return sorted list of saved profile names for a connector (from connections.json)."""
     store = _load_profiles_store()
     profs = store.get(connector_id, {}) or {}
     return sorted(profs.keys(), key=str.lower)
-
-# def _profiles_for_connector(conn_id: str) -> List[str]:
-#     """Same as _profiles_for; kept for backwards compatibility with the app."""
-#     return _profiles_for(conn_id)
 
 # ---------------------------------------------------------------------------------
 # Pipelines store helpers
@@ -1484,104 +1477,122 @@ with st.container(border=True):
     pipelines = _pipelines_load_all()
 
     if st.session_state["pipeline_form_open"]:
-        title = "Edit Pipeline" if st.session_state["editing_pipeline_id"] else "Create Pipeline"
+        # Figure out if we're creating or editing
+        is_edit = st.session_state["editing_pipeline_id"] is not None
         pid = st.session_state["editing_pipeline_id"]
         initial = pipelines.get(pid, _pipeline_defaults())
-        st.subheader(title)
+        st.subheader("Edit Pipeline" if is_edit else "Create Pipeline")
 
-        with st.form("pipeline_form", clear_on_submit=False):
-            # put the name at the top
-            name = st.text_input("Pipeline Name", value=initial.get("name",""), placeholder="My First Pipeline")
+        # -------------------- SOURCE CARD (OUTSIDE FORM) --------------------
+        # Hydrate stable state keys for the source pickers
+        st.session_state.setdefault("pipe_src_connector", initial.get("source_connector", ""))
+        st.session_state.setdefault("pipe_src_profile",   initial.get("source_profile", ""))
+        st.session_state.setdefault("pipe__last_src_connector", st.session_state["pipe_src_connector"])
 
-            # --- SOURCE CARD ---
-            with st.container(border=True):
-                st.markdown("**Source**")
-                profiles_store = _load_profiles_store()
-                avail_sources = [cid for cid, profs in profiles_store.items() if profs]
-                avail_sources = [c for c in avail_sources if c != "weaviate"] or avail_sources
+        with st.container(border=True):
+            st.markdown("**Source**")
 
-                src_connector_opts = [""] + avail_sources
-                src_connector = st.selectbox(
-                    "Source Connector",
-                    options=src_connector_opts,
-                    index=src_connector_opts.index(initial.get("source_connector","")) 
-                          if initial.get("source_connector","") in src_connector_opts else 0,
-                    key="pipe_src_connector",
+            profiles_store = _load_profiles_store()
+            avail_sources = [cid for cid, profs in profiles_store.items() if profs]
+            # Prefer non-Weaviate as source
+            avail_sources = [c for c in avail_sources if c != "weaviate"] or avail_sources
+
+            src_connector = st.selectbox(
+                "Source Connector",
+                options=[""] + avail_sources,
+                key="pipe_src_connector",
+            )
+
+            # If connector changed, clear profile and rerun so options refresh
+            if st.session_state.get("pipe__last_src_connector") != src_connector:
+                st.session_state["pipe__last_src_connector"] = src_connector
+                st.session_state["pipe_src_profile"] = ""
+                st.rerun()
+
+            # Populate profiles for the chosen connector
+            src_profiles = _profiles_for_connector(src_connector) if src_connector else []
+            st.selectbox(
+                "Source Profile",
+                options=[""] + src_profiles if src_profiles else [""],
+                key="pipe_src_profile",
+            )
+
+            if src_connector and not src_profiles:
+                st.caption(
+                    "No saved profiles for this connector. Open the connector, test, then save a profile."
                 )
-
-                if "pipe__last_src_connector" not in st.session_state:
-                    st.session_state["pipe__last_src_connector"] = src_connector
-                elif st.session_state["pipe__last_src_connector"] != src_connector:
-                    st.session_state["pipe__last_src_connector"] = src_connector
+                jump_col1, _ = st.columns([1, 3])
+                if jump_col1.button("Create profile now"):
+                    st.session_state["selected_id"] = src_connector
+                    st.session_state["rhs_open"] = True
                     st.rerun()
 
-                src_profiles = _profiles_for_connector(src_connector) if src_connector else []
-                src_profile_opts = [""] + src_profiles if src_profiles else [""]
-                src_profile = st.selectbox(
-                    "Source Profile",
-                    options=src_profile_opts,
-                    index=src_profile_opts.index(initial.get("source_profile",""))
-                          if initial.get("source_profile","") in src_profile_opts else 0,
-                    key="pipe_src_profile",
-                )
+        # -------------------- FORM (NAME, DESTINATION, PROCESSING, SAVE) --------------------
+        with st.form("pipeline_form", clear_on_submit=False):
+            # Name
+            name = st.text_input(
+                "Pipeline Name",
+                value=initial.get("name", ""),
+                placeholder="My First Pipeline",
+            )
 
-                if src_connector and not src_profiles:
-                    st.caption("No saved profiles for this connector. Open the connector, test, then save a profile.")
-                    jump_col1, _ = st.columns([1,3])
-                    if jump_col1.button("Create profile now"):
-                        st.session_state["selected_id"] = src_connector
-                        st.session_state["rhs_open"] = True
-                        st.rerun()
-
-            # --- DESTINATION CARD ---
+            # Destination
             with st.container(border=True):
                 st.markdown("**Destination (Weaviate)**")
                 dest_connector = "weaviate"
                 weaviate_profiles = _profiles_for_connector(dest_connector)
-                dest_profile_opts = [""] + weaviate_profiles if weaviate_profiles else [""]
                 dest_profile = st.selectbox(
                     "Weaviate Profile",
-                    options=dest_profile_opts,
-                    index=dest_profile_opts.index(initial.get("destination_profile",""))
-                          if initial.get("destination_profile","") in dest_profile_opts else 0,
+                    options=([""] + weaviate_profiles) if weaviate_profiles else [""],
+                    index=([""] + weaviate_profiles).index(initial.get("destination_profile", ""))
+                          if weaviate_profiles and initial.get("destination_profile", "") in ([""] + weaviate_profiles)
+                          else 0,
                 )
                 collection = st.text_input(
                     "Weaviate Collection (Class) Name",
-                    value=initial.get("collection","Documents"),
+                    value=initial.get("collection", "Documents"),
                     placeholder="Documents",
                     help="Letters, digits, underscore; start with a letter/underscore.",
                 )
 
-            # --- PROCESSING CARD ---
+            # Processing
             with st.container(border=True):
                 st.markdown("**Processing Settings**")
                 c1, c2 = st.columns(2)
                 with c1:
-                    chunk_size = st.number_input("Chunk Size (chars)", min_value=100, step=50,
-                                                 value=int(initial.get("chunk_size",1000)))
-                    max_docs   = st.number_input("Max Docs (for quick runs)", min_value=1, step=10,
-                                                 value=int(initial.get("max_docs",50)))
+                    chunk_size = st.number_input(
+                        "Chunk Size (chars)", min_value=100, step=50,
+                        value=int(initial.get("chunk_size", 1000))
+                    )
+                    max_docs = st.number_input(
+                        "Max Docs (for quick runs)", min_value=1, step=10,
+                        value=int(initial.get("max_docs", 50))
+                    )
                 with c2:
-                    chunk_overlap  = st.number_input("Chunk Overlap (chars)", min_value=0, step=10,
-                                                     value=int(initial.get("chunk_overlap",150)))
-                    embedding_model = st.text_input("Embedding Model (placeholder)",
-                                                    value=initial.get("embedding_model","sentence-transformers/all-MiniLM-L6-v2"))
-                notes = st.text_area("Notes (optional)", value=initial.get("notes",""))
+                    chunk_overlap = st.number_input(
+                        "Chunk Overlap (chars)", min_value=0, step=10,
+                        value=int(initial.get("chunk_overlap", 150))
+                    )
+                    embedding_model = st.text_input(
+                        "Embedding Model (placeholder)",
+                        value=initial.get("embedding_model", "sentence-transformers/all-MiniLM-L6-v2"),
+                    )
+                notes = st.text_area("Notes (optional)", value=initial.get("notes", ""))
 
-            csave, ccancel = st.columns([1,1])
+            csave, ccancel = st.columns([1, 1])
             submit = csave.form_submit_button("💾 Save Pipeline", use_container_width=True)
             cancel = ccancel.form_submit_button("Cancel", use_container_width=True)
-        
+
         if cancel:
             st.session_state["pipeline_form_open"] = False
             st.session_state["editing_pipeline_id"] = None
             st.rerun()
-        
+
         if submit:
-            # read the source selections from session_state (since they’re outside the form)
+            # Read source selections from session state (since they’re outside the form)
             src_connector = st.session_state.get("pipe_src_connector", "")
             src_profile   = st.session_state.get("pipe_src_profile", "")
-        
+
             errors = []
             if not name.strip():
                 errors.append("Pipeline Name is required.")
@@ -1593,20 +1604,20 @@ with st.container(border=True):
                 errors.append("Weaviate Profile is required.")
             if not collection.strip():
                 errors.append("Weaviate Collection is required.")
-        
+
             if errors:
                 st.error("Please fix the following:\n" + "\n".join(f"- {e}" for e in errors))
             else:
-                if st.session_state["editing_pipeline_id"]:
+                # Stable ID if editing; make a unique one if creating
+                if is_edit:
                     pid_new = st.session_state["editing_pipeline_id"]
                 else:
                     base = name.strip().lower().replace(" ", "_") or "pipeline"
-                    pid_new = base
-                    i = 2
+                    pid_new, i = base, 2
                     while pid_new in pipelines:
                         pid_new = f"{base}_{i}"
                         i += 1
-        
+
                 pipelines[pid_new] = {
                     "name": name.strip(),
                     "source_connector": src_connector,
@@ -1625,7 +1636,6 @@ with st.container(border=True):
                 st.session_state["pipeline_form_open"] = False
                 st.session_state["editing_pipeline_id"] = None
                 st.rerun()
-
 
     # --- List all pipelines ---
     pipelines = _pipelines_load_all()
@@ -1652,7 +1662,7 @@ with st.container(border=True):
             c2.markdown(f"{src_label} → {dst_label}")
             c3.markdown(f"`{p['collection']}`")
 
-            # Manual Run (stub for now)
+            # Manual Run (stub)
             if c4.button("▶️", key=f"run::{pid}", help="Run this pipeline now"):
                 st.info(f"Starting pipeline **{p['name']}**… (execution wiring will be added next)")
 
@@ -1676,6 +1686,7 @@ with st.container(border=True):
 
     st.markdown("</div>", unsafe_allow_html=True)
 # =================================================================================================
+
 
 
 
