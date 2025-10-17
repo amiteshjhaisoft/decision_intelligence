@@ -1399,6 +1399,295 @@ with main_left:
     st.markdown('</div>', unsafe_allow_html=True)
 
 # =================================================================================================
+# Pipelines helpers & UI (drop into your Streamlit page)
+# =================================================================================================
+
+# ---------------------------------------------------------------------------------
+# Connections store helpers (read-only here)
+# ---------------------------------------------------------------------------------
+def _load_profiles_store() -> dict:
+    if not CONN_STORE.exists():
+        return {}
+    try:
+        return json.loads(CONN_STORE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+def _profiles_for_connector(conn_id: str) -> List[str]:
+    store = _load_profiles_store()
+    return sorted(list((store.get(conn_id) or {}).keys()), key=str.lower)
+
+def _profiles_for(connector_id: str) -> List[str]:
+    """Return sorted list of saved profile names for a connector (from connections.json)."""
+    store = _load_profiles_store()
+    profs = store.get(connector_id, {}) or {}
+    return sorted(profs.keys(), key=str.lower)
+
+# ---------------------------------------------------------------------------------
+# Pipelines store helpers
+# ---------------------------------------------------------------------------------
+def _pipelines_load_all() -> Dict[str, Dict[str, Any]]:
+    if not PIPE_STORE.exists():
+        return {}
+    try:
+        return json.loads(PIPE_STORE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+def _pipelines_save_all(data: Dict[str, Dict[str, Any]]) -> None:
+    PIPE_STORE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+def _pipeline_defaults() -> Dict[str, Any]:
+    return {
+        "name": "",
+        "source_connector": "",
+        "source_profile": "",
+        "destination_connector": "weaviate",
+        "destination_profile": "",
+        "collection": "Documents",
+        # Execution knobs (placeholders for later steps)
+        "chunk_size": 1000,
+        "chunk_overlap": 150,
+        "embedding_model": "sentence-transformers/all-MiniLM-L6-v2",
+        "max_docs": 50,
+        "notes": "",
+    }
+
+# ---------------------------------------------------------------------------------
+# Session defaults for pipeline editor
+# ---------------------------------------------------------------------------------
+st.session_state.setdefault("editing_pipeline_id", None)   # pipeline id (key in pipelines.json)
+st.session_state.setdefault("pipeline_form_open", False)
+
+# =================================================================================================
+# UI: Pipelines Card
+# =================================================================================================
+with st.container(border=True):
+    st.markdown("### 🧪 Pipelines")
+
+    # Top bar
+    c_a, c_b = st.columns([5, 1])
+    with c_a:
+        st.caption("Create, save, edit, delete and manually run pipelines that move data from a source connector to Weaviate.")
+    with c_b:
+        if st.button("➕ New Pipeline", use_container_width=True, key="btn_new_pipeline"):
+            st.session_state["editing_pipeline_id"] = None
+            st.session_state["pipeline_form_open"] = True
+
+    pipelines = _pipelines_load_all()
+
+    if st.session_state["pipeline_form_open"]:
+        # Figure out if we're creating or editing
+        is_edit = st.session_state["editing_pipeline_id"] is not None
+        pid = st.session_state["editing_pipeline_id"]
+        initial = pipelines.get(pid, _pipeline_defaults())
+        st.subheader("Edit Pipeline" if is_edit else "Create Pipeline")
+
+        # -------------------- SOURCE CARD (OUTSIDE FORM) --------------------
+        # Hydrate stable state keys for the source pickers
+        st.session_state.setdefault("pipe_src_connector", initial.get("source_connector", ""))
+        st.session_state.setdefault("pipe_src_profile",   initial.get("source_profile", ""))
+        st.session_state.setdefault("pipe__last_src_connector", st.session_state["pipe_src_connector"])
+
+        with st.container(border=True):
+            st.markdown("**Source**")
+
+            profiles_store = _load_profiles_store()
+            avail_sources = [cid for cid, profs in profiles_store.items() if profs]
+            # Prefer non-Weaviate as source
+            avail_sources = [c for c in avail_sources if c != "weaviate"] or avail_sources
+
+            src_connector = st.selectbox(
+                "Source Connector",
+                options=[""] + avail_sources,
+                key="pipe_src_connector",
+            )
+
+            # If connector changed, clear profile and rerun so options refresh
+            if st.session_state.get("pipe__last_src_connector") != src_connector:
+                st.session_state["pipe__last_src_connector"] = src_connector
+                st.session_state["pipe_src_profile"] = ""
+                st.rerun()
+
+            # Populate profiles for the chosen connector
+            src_profiles = _profiles_for_connector(src_connector) if src_connector else []
+            st.selectbox(
+                "Source Profile",
+                options=[""] + src_profiles if src_profiles else [""],
+                key="pipe_src_profile",
+            )
+
+            if src_connector and not src_profiles:
+                st.caption(
+                    "No saved profiles for this connector. Open the connector, test, then save a profile."
+                )
+                jump_col1, _ = st.columns([1, 3])
+                if jump_col1.button("Create profile now"):
+                    st.session_state["selected_id"] = src_connector
+                    st.session_state["rhs_open"] = True
+                    st.rerun()
+
+        # -------------------- FORM (NAME, DESTINATION, PROCESSING, SAVE) --------------------
+        with st.form("pipeline_form", clear_on_submit=False):
+            # Name
+            name = st.text_input(
+                "Pipeline Name",
+                value=initial.get("name", ""),
+                placeholder="My First Pipeline",
+            )
+
+            # Destination
+            with st.container(border=True):
+                st.markdown("**Destination (Weaviate)**")
+                dest_connector = "weaviate"
+                weaviate_profiles = _profiles_for_connector(dest_connector)
+                dest_profile = st.selectbox(
+                    "Weaviate Profile",
+                    options=([""] + weaviate_profiles) if weaviate_profiles else [""],
+                    index=([""] + weaviate_profiles).index(initial.get("destination_profile", ""))
+                          if weaviate_profiles and initial.get("destination_profile", "") in ([""] + weaviate_profiles)
+                          else 0,
+                )
+                collection = st.text_input(
+                    "Weaviate Collection (Class) Name",
+                    value=initial.get("collection", "Documents"),
+                    placeholder="Documents",
+                    help="Letters, digits, underscore; start with a letter/underscore.",
+                )
+
+            # Processing
+            with st.container(border=True):
+                st.markdown("**Processing Settings**")
+                c1, c2 = st.columns(2)
+                with c1:
+                    chunk_size = st.number_input(
+                        "Chunk Size (chars)", min_value=100, step=50,
+                        value=int(initial.get("chunk_size", 1000))
+                    )
+                    max_docs = st.number_input(
+                        "Max Docs (for quick runs)", min_value=1, step=10,
+                        value=int(initial.get("max_docs", 50))
+                    )
+                with c2:
+                    chunk_overlap = st.number_input(
+                        "Chunk Overlap (chars)", min_value=0, step=10,
+                        value=int(initial.get("chunk_overlap", 150))
+                    )
+                    embedding_model = st.text_input(
+                        "Embedding Model (placeholder)",
+                        value=initial.get("embedding_model", "sentence-transformers/all-MiniLM-L6-v2"),
+                    )
+                notes = st.text_area("Notes (optional)", value=initial.get("notes", ""))
+
+            csave, ccancel = st.columns([1, 1])
+            submit = csave.form_submit_button("💾 Save Pipeline", use_container_width=True)
+            cancel = ccancel.form_submit_button("Cancel", use_container_width=True)
+
+        if cancel:
+            st.session_state["pipeline_form_open"] = False
+            st.session_state["editing_pipeline_id"] = None
+            st.rerun()
+
+        if submit:
+            # Read source selections from session state (since they’re outside the form)
+            src_connector = st.session_state.get("pipe_src_connector", "")
+            src_profile   = st.session_state.get("pipe_src_profile", "")
+
+            errors = []
+            if not name.strip():
+                errors.append("Pipeline Name is required.")
+            if not src_connector:
+                errors.append("Source Connector is required.")
+            if not src_profile:
+                errors.append("Source Profile is required.")
+            if not dest_profile:
+                errors.append("Weaviate Profile is required.")
+            if not collection.strip():
+                errors.append("Weaviate Collection is required.")
+
+            if errors:
+                st.error("Please fix the following:\n" + "\n".join(f"- {e}" for e in errors))
+            else:
+                # Stable ID if editing; make a unique one if creating
+                if is_edit:
+                    pid_new = st.session_state["editing_pipeline_id"]
+                else:
+                    base = name.strip().lower().replace(" ", "_") or "pipeline"
+                    pid_new, i = base, 2
+                    while pid_new in pipelines:
+                        pid_new = f"{base}_{i}"
+                        i += 1
+
+                pipelines[pid_new] = {
+                    "name": name.strip(),
+                    "source_connector": src_connector,
+                    "source_profile": src_profile,
+                    "destination_connector": "weaviate",
+                    "destination_profile": dest_profile,
+                    "collection": collection.strip(),
+                    "chunk_size": int(chunk_size),
+                    "chunk_overlap": int(chunk_overlap),
+                    "embedding_model": embedding_model.strip(),
+                    "max_docs": int(max_docs),
+                    "notes": notes,
+                }
+                _pipelines_save_all(pipelines)
+                st.success(f"Saved pipeline **{name}**.")
+                st.session_state["pipeline_form_open"] = False
+                st.session_state["editing_pipeline_id"] = None
+                st.rerun()
+
+    # --- List all pipelines ---
+    pipelines = _pipelines_load_all()
+    if not pipelines:
+        st.info("No pipelines yet. Click **New Pipeline** to create one.")
+    else:
+        st.markdown("**Saved Pipelines**")
+        h1, h2, h3, h4, h5 = st.columns([4, 3, 2, 1, 2])
+        h1.markdown('<div class="rowhead">Name</div>', unsafe_allow_html=True)
+        h2.markdown('<div class="rowhead">Source → Destination</div>', unsafe_allow_html=True)
+        h3.markdown('<div class="rowhead">Collection</div>', unsafe_allow_html=True)
+        h4.markdown('<div class="rowhead"></div>', unsafe_allow_html=True)
+        h5.markdown('<div class="rowhead"></div>', unsafe_allow_html=True)
+
+        for pid in sorted(pipelines.keys(), key=lambda x: pipelines[x]["name"].lower()):
+            p = pipelines[pid]
+            c1, c2, c3, c4, c5 = st.columns([4, 3, 2, 1, 2])
+            c1.markdown(f"**{p['name']}**")
+
+            # Pretty source label
+            src_meta = REG_BY_ID.get(p["source_connector"])
+            src_label = f"{(src_meta.icon + ' ' + src_meta.name) if src_meta else p['source_connector']} `{p['source_profile']}`"
+            dst_label = f"🧠 Weaviate `{p['destination_profile']}`"
+            c2.markdown(f"{src_label} → {dst_label}")
+            c3.markdown(f"`{p['collection']}`")
+
+            # Manual Run (stub)
+            if c4.button("▶️", key=f"run::{pid}", help="Run this pipeline now"):
+                st.info(f"Starting pipeline **{p['name']}**… (execution wiring will be added next)")
+
+            # Edit / Delete
+            e_col, d_col = c5.columns([1, 1])
+            if e_col.button("📝", key=f"edit_pipe::{pid}", help="Edit"):
+                st.session_state["editing_pipeline_id"] = pid
+                st.session_state["pipeline_form_open"] = True
+                st.rerun()
+
+            if d_col.button("🗑️", key=f"delete_pipe::{pid}", help="Delete"):
+                try:
+                    allp = _pipelines_load_all()
+                    if pid in allp:
+                        del allp[pid]
+                        _pipelines_save_all(allp)
+                        st.success(f"Deleted pipeline **{p['name']}**.")
+                        st.rerun()
+                except Exception as e:
+                    st.error(f"Failed to delete: {e}")
+
+    st.markdown("</div>", unsafe_allow_html=True)
+# =================================================================================================
+
+# =================================================================================================
 # Pipeline executor helpers (drop under the "Pipeline execution wiring" section)
 # - Works with Weaviate v4 (preferred) and v3 as a fallback
 # - Minimal text parsing / chunking / embedding
@@ -1757,535 +2046,9 @@ class ConnectorHub:
             yield Asset(name=str(p.relative_to(base)), local_path=str(p), size_bytes=size)
 
 
-# =================================================================================================
-# Pipelines helpers & UI (drop into your Streamlit page)
-# =================================================================================================
 
-# ---------------------------------------------------------------------------------
-# Connections store helpers (read-only here)
-# ---------------------------------------------------------------------------------
-def _load_profiles_store() -> dict:
-    if not CONN_STORE.exists():
-        return {}
-    try:
-        return json.loads(CONN_STORE.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
 
-def _profiles_for_connector(conn_id: str) -> List[str]:
-    store = _load_profiles_store()
-    return sorted(list((store.get(conn_id) or {}).keys()), key=str.lower)
 
-def _profiles_for(connector_id: str) -> List[str]:
-    """Return sorted list of saved profile names for a connector (from connections.json)."""
-    store = _load_profiles_store()
-    profs = store.get(connector_id, {}) or {}
-    return sorted(profs.keys(), key=str.lower)
 
-# ---------------------------------------------------------------------------------
-# Pipelines store helpers
-# ---------------------------------------------------------------------------------
-def _pipelines_load_all() -> Dict[str, Dict[str, Any]]:
-    if not PIPE_STORE.exists():
-        return {}
-    try:
-        return json.loads(PIPE_STORE.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
 
-def _pipelines_save_all(data: Dict[str, Dict[str, Any]]) -> None:
-    PIPE_STORE.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
-def _pipeline_defaults() -> Dict[str, Any]:
-    return {
-        "name": "",
-        "source_connector": "",
-        "source_profile": "",
-        "destination_connector": "weaviate",
-        "destination_profile": "",
-        "collection": "Documents",
-        # Execution knobs
-        "chunk_size": 1000,
-        "chunk_overlap": 150,
-        "embedding_model": "sentence-transformers/all-MiniLM-L6-v2",
-        "max_docs": 50,
-        "notes": "",
-    }
-
-# ---------------------------------------------------------------------------------
-# Session defaults for pipeline editor
-# ---------------------------------------------------------------------------------
-st.session_state.setdefault("editing_pipeline_id", None)   # pipeline id (key in pipelines.json)
-st.session_state.setdefault("pipeline_form_open", False)
-
-# =================================================================================================
-# UI: Pipelines Card (Editor + Saved list)
-# =================================================================================================
-with st.container(border=True):
-    st.markdown("### 🧪 Pipelines")
-
-    # Top bar
-    c_a, c_b = st.columns([5, 1])
-    with c_a:
-        st.caption("Create, save, edit, delete and manually run pipelines that move data from a source connector to Weaviate.")
-    with c_b:
-        if st.button("➕ New Pipeline", use_container_width=True, key="btn_new_pipeline"):
-            st.session_state["editing_pipeline_id"] = None
-            st.session_state["pipeline_form_open"] = True
-
-    pipelines = _pipelines_load_all()
-
-    if st.session_state["pipeline_form_open"]:
-        # Figure out if we're creating or editing
-        is_edit = st.session_state["editing_pipeline_id"] is not None
-        pid = st.session_state["editing_pipeline_id"]
-        initial = pipelines.get(pid, _pipeline_defaults())
-        st.subheader("Edit Pipeline" if is_edit else "Create Pipeline")
-
-        # -------------------- SOURCE CARD (OUTSIDE FORM) --------------------
-        # Hydrate stable state keys for the source pickers
-        st.session_state.setdefault("pipe_src_connector", initial.get("source_connector", ""))
-        st.session_state.setdefault("pipe_src_profile",   initial.get("source_profile", ""))
-        st.session_state.setdefault("pipe__last_src_connector", st.session_state["pipe_src_connector"])
-
-        with st.container(border=True):
-            st.markdown("**Source**")
-
-            profiles_store = _load_profiles_store()
-            avail_sources = [cid for cid, profs in profiles_store.items() if profs]
-            # Prefer non-Weaviate as source
-            avail_sources = [c for c in avail_sources if c != "weaviate"] or avail_sources
-
-            src_connector = st.selectbox(
-                "Source Connector",
-                options=[""] + avail_sources,
-                key="pipe_src_connector",
-            )
-
-            # If connector changed, clear profile and rerun so options refresh
-            if st.session_state.get("pipe__last_src_connector") != src_connector:
-                st.session_state["pipe__last_src_connector"] = src_connector
-                st.session_state["pipe_src_profile"] = ""
-                st.rerun()
-
-            # Populate profiles for the chosen connector
-            src_profiles = _profiles_for_connector(src_connector) if src_connector else []
-            st.selectbox(
-                "Source Profile",
-                options=[""] + src_profiles if src_profiles else [""],
-                key="pipe_src_profile",
-            )
-
-            if src_connector and not src_profiles:
-                st.caption("No saved profiles for this connector. Open the connector, test, then save a profile.")
-                jump_col1, _ = st.columns([1, 3])
-                if jump_col1.button("Create profile now", key="btn_jump_to_connector"):
-                    st.session_state["selected_id"] = src_connector
-                    st.session_state["rhs_open"] = True
-                    st.rerun()
-
-        # -------------------- FORM (NAME, DESTINATION, PROCESSING, SAVE) --------------------
-        with st.form("pipeline_form", clear_on_submit=False):
-            # Name
-            name = st.text_input(
-                "Pipeline Name",
-                value=initial.get("name", ""),
-                placeholder="My First Pipeline",
-            )
-
-            # Destination
-            with st.container(border=True):
-                st.markdown("**Destination (Weaviate)**")
-                dest_connector = "weaviate"
-                weaviate_profiles = _profiles_for_connector(dest_connector)
-                dest_profile = st.selectbox(
-                    "Weaviate Profile",
-                    options=([""] + weaviate_profiles) if weaviate_profiles else [""],
-                    index=([""] + weaviate_profiles).index(initial.get("destination_profile", ""))
-                          if weaviate_profiles and initial.get("destination_profile", "") in ([""] + weaviate_profiles)
-                          else 0,
-                    key="sel_weaviate_profile",
-                )
-                collection = st.text_input(
-                    "Weaviate Collection (Class) Name",
-                    value=initial.get("collection", "Documents"),
-                    placeholder="Documents",
-                    help="Letters, digits, underscore; start with a letter/underscore.",
-                    key="txt_collection",
-                )
-
-            # Processing
-            with st.container(border=True):
-                st.markdown("**Processing Settings**")
-                c1, c2 = st.columns(2)
-                with c1:
-                    chunk_size = st.number_input(
-                        "Chunk Size (chars)", min_value=100, step=50,
-                        value=int(initial.get("chunk_size", 1000)),
-                        key="num_chunk_size",
-                    )
-                    max_docs = st.number_input(
-                        "Max Docs (for quick runs)", min_value=1, step=10,
-                        value=int(initial.get("max_docs", 50)),
-                        key="num_max_docs",
-                    )
-                with c2:
-                    chunk_overlap = st.number_input(
-                        "Chunk Overlap (chars)", min_value=0, step=10,
-                        value=int(initial.get("chunk_overlap", 150)),
-                        key="num_chunk_overlap",
-                    )
-                    embedding_model = st.text_input(
-                        "Embedding Model (placeholder)",
-                        value=initial.get("embedding_model", "sentence-transformers/all-MiniLM-L6-v2"),
-                        key="txt_embedding_model",
-                    )
-                notes = st.text_area("Notes (optional)", value=initial.get("notes", ""), key="txt_notes")
-
-            csave, ccancel = st.columns([1, 1])
-            submit = csave.form_submit_button("💾 Save Pipeline", use_container_width=True)
-            cancel = ccancel.form_submit_button("Cancel", use_container_width=True)
-
-        if cancel:
-            st.session_state["pipeline_form_open"] = False
-            st.session_state["editing_pipeline_id"] = None
-            st.rerun()
-
-        if submit:
-            # Read source selections from session state (since they’re outside the form)
-            src_connector = st.session_state.get("pipe_src_connector", "")
-            src_profile   = st.session_state.get("pipe_src_profile", "")
-
-            errors = []
-            if not name.strip():
-                errors.append("Pipeline Name is required.")
-            if not src_connector:
-                errors.append("Source Connector is required.")
-            if not src_profile:
-                errors.append("Source Profile is required.")
-            if not dest_profile:
-                errors.append("Weaviate Profile is required.")
-            if not collection.strip():
-                errors.append("Weaviate Collection is required.")
-
-            if errors:
-                st.error("Please fix the following:\n" + "\n".join(f"- {e}" for e in errors))
-            else:
-                # Stable ID if editing; make a unique one if creating
-                if is_edit:
-                    pid_new = st.session_state["editing_pipeline_id"]
-                else:
-                    base = name.strip().lower().replace(" ", "_") or "pipeline"
-                    pid_new, i = base, 2
-                    while pid_new in pipelines:
-                        pid_new = f"{base}_{i}"
-                        i += 1
-
-                pipelines[pid_new] = {
-                    "name": name.strip(),
-                    "source_connector": src_connector,
-                    "source_profile": src_profile,
-                    "destination_connector": "weaviate",
-                    "destination_profile": dest_profile,
-                    "collection": collection.strip(),
-                    "chunk_size": int(chunk_size),
-                    "chunk_overlap": int(chunk_overlap),
-                    "embedding_model": embedding_model.strip(),
-                    "max_docs": int(max_docs),
-                    "notes": notes,
-                }
-                _pipelines_save_all(pipelines)
-                st.success(f"Saved pipeline **{name}**.")
-                st.session_state["pipeline_form_open"] = False
-                st.session_state["editing_pipeline_id"] = None
-                st.rerun()
-
-    # --- List all pipelines ---
-    pipelines = _pipelines_load_all()
-    if not pipelines:
-        st.info("No pipelines yet. Click **New Pipeline** to create one.")
-    else:
-        st.markdown("**Saved Pipelines**")
-        h1, h2, h3, h4, h5 = st.columns([4, 3, 2, 1, 2])
-        h1.markdown('<div class="rowhead">Name</div>', unsafe_allow_html=True)
-        h2.markdown('<div class="rowhead">Source → Destination</div>', unsafe_allow_html=True)
-        h3.markdown('<div class="rowhead">Collection</div>', unsafe_allow_html=True)
-        h4.markdown('<div class="rowhead"></div>', unsafe_allow_html=True)
-        h5.markdown('<div class="rowhead"></div>', unsafe_allow_html=True)
-
-        for pid in sorted(pipelines.keys(), key=lambda x: pipelines[x]["name"].lower()):
-            p = pipelines[pid]
-            c1, c2, c3, c4, c5 = st.columns([4, 3, 2, 1, 2])
-            c1.markdown(f"**{p['name']}**")
-
-            # Pretty source label
-            src_meta = REG_BY_ID.get(p["source_connector"])
-            src_label = f"{(src_meta.icon + ' ' + src_meta.name) if src_meta else p['source_connector']} `{p['source_profile']}`"
-            dst_label = f"🧠 Weaviate `{p['destination_profile']}`"
-            c2.markdown(f"{src_label} → {dst_label}")
-            c3.markdown(f"`{p['collection']}`")
-
-            # Manual Run (placeholder here; real buttons are added in the executor section below)
-            if c4.button("▶️", key=f"run_stub::{pid}", help="Run (wired below)"):
-                st.info(f"Starting pipeline **{p['name']}**… (execution wiring is below)")
-
-            # Edit / Delete
-            e_col, d_col = c5.columns([1, 1])
-            if e_col.button("📝", key=f"edit_stub::{pid}", help="Edit"):
-                st.session_state["editing_pipeline_id"] = pid
-                st.session_state["pipeline_form_open"] = True
-                st.rerun()
-
-            if d_col.button("🗑️", key=f"delete_stub::{pid}", help="Delete"):
-                try:
-                    allp = _pipelines_load_all()
-                    if pid in allp:
-                        del allp[pid]
-                        _pipelines_save_all(allp)
-                        st.success(f"Deleted pipeline **{p['name']}**.")
-                        st.rerun()
-                except Exception as e:
-                    st.error(f"Failed to delete: {e}")
-
-    st.markdown("</div>", unsafe_allow_html=True)
-
-# =================================================================================================
-# Pipeline execution wiring
-#   - Resolves source/destination profiles
-#   - Streams assets via ConnectorHub
-#   - Parses → chunks → embeds → upserts to Weaviate
-# =================================================================================================
-
-from pathlib import Path
-import tempfile
-from typing import Dict, Any, List
-
-# Try to import the external ConnectorHub. If not found, define a tiny stub that errors helpfully.
-try:
-    from connector_hub import ConnectorHub  # separate module (recommended)
-except Exception:
-    class ConnectorHub:  # fallback stub so the error is descriptive
-        def __init__(self, *args, **kwargs):
-            self._why = "ConnectorHub class not found. Ensure connector_hub.py is present and importable."
-        def stream(self):
-            raise RuntimeError(self._why)
-        def count(self):
-            return None
-
-# ---------- Helpers to resolve connection profiles ----------
-def _get_profile(connector_id: str, profile_name: str) -> Dict[str, Any]:
-    store = _load_profiles_store()
-    profiles = store.get(connector_id, {}) or {}
-    prof = profiles.get(profile_name or "", {}) or {}
-    if not prof:
-        raise RuntimeError(f"Profile '{profile_name}' not found for connector '{connector_id}'.")
-    return prof
-
-def _make_weaviate_from_profile(dest_profile: Dict[str, Any]):
-    """
-    Build a Weaviate client from a saved profile. Call ensure_collection()
-    later, when you actually know the target collection name.
-    """
-    url = dest_profile.get("url") or dest_profile.get("cluster_url") or ""
-    if not url:
-        raise RuntimeError("Weaviate profile is missing 'url'.")
-    api_key = dest_profile.get("api_key") or None
-    tenancy = dest_profile.get("tenancy") or None
-    client = make_weaviate_client(url, api_key)
-    return client, tenancy
-
-# ---------- Core runner ----------
-def _run_pipeline(pipeline: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Execute a single pipeline dict from pipelines.json.
-    Returns a summary stats dict.
-    """
-    # 1) Resolve source + destination profiles (defensive)
-    src_conn_id = pipeline.get("source_connector") or ""
-    src_prof_id = pipeline.get("source_profile") or ""
-    dst_prof_id = pipeline.get("destination_profile") or ""
-    collection  = (pipeline.get("collection") or "Documents").strip()
-
-    if not src_conn_id or not src_prof_id:
-        raise RuntimeError("Pipeline is missing source connector/profile.")
-    if not dst_prof_id:
-        raise RuntimeError("Pipeline is missing Weaviate destination profile.")
-    if not collection:
-        raise RuntimeError("Collection name is empty.")
-
-    src_prof = _get_profile(src_conn_id, src_prof_id)
-    dst_prof = _get_profile("weaviate", dst_prof_id)
-
-    # 2) Build ConnectorHub with one source (extendable later)
-    cache_root = Path(tempfile.gettempdir()) / "kb_connectors_cache"
-    state_root = Path(tempfile.gettempdir()) / "kb_connectors_state"
-    connector_cfg: Dict[str, Any] = {"kind": src_conn_id}
-    connector_cfg.update(src_prof)
-    connector_cfg.setdefault("prefix", src_prof.get("prefix", ""))
-    connector_cfg.setdefault("max_bytes", 50 * 1024 * 1024)
-
-    hub = ConnectorHub(cache_root, state_root, configs=[connector_cfg])
-
-    # 3) Destination client
-    w_client, tenancy = _make_weaviate_from_profile(dst_prof)
-
-    # 4) Execution knobs
-    chunk_size    = int(pipeline.get("chunk_size", 1000))
-    chunk_overlap = int(pipeline.get("chunk_overlap", 150))
-    max_docs      = int(pipeline.get("max_docs", 50))
-
-    # 5) Ensure collection exists
-    ensure_collection(w_client, class_name=collection, tenancy=tenancy)
-
-    # 6) Temps + stats
-    tmp_dir = Path(tempfile.gettempdir()) / "kb_tmp_pipeline"
-    tmp_dir.mkdir(parents=True, exist_ok=True)
-
-    processed_files   = 0
-    processed_chunks  = 0
-    skipped_files     = 0
-    errors: List[str] = []
-
-    # 7) Stream, parse, chunk, embed, upsert
-    with st.status(f"Starting pipeline **{pipeline.get('name','(unnamed)')}**", expanded=True) as status:
-        try:
-            total_estimate = getattr(hub, "count", None)()
-        except Exception:
-            total_estimate = None
-
-        prog = st.progress(0.0) if isinstance(total_estimate, int) and total_estimate > 0 else None
-        seen = 0
-
-        for asset in hub.stream():
-            if processed_files >= max_docs:
-                st.write(f"⏹️ Reached max_docs={max_docs}, stopping.")
-                break
-
-            try:
-                txt = guess_and_read_path(asset.name, asset.local_path, asset.size_bytes, tmp_dir).strip()
-                if not txt:
-                    st.write(f"⚠️ No extractable text: {asset.name}")
-                    skipped_files += 1
-                else:
-                    chunks_raw = RecursiveCharacterTextSplitter(
-                        chunk_size=chunk_size, chunk_overlap=chunk_overlap,
-                        separators=["\n\n", "\n", ". ", " ", ""]
-                    ).split_text(txt)
-
-                    if not chunks_raw:
-                        st.write(f"⚠️ No chunks produced: {asset.name}")
-                        skipped_files += 1
-                    else:
-                        doc_id = _hash(asset.name)
-                        chunks = [f"FILE: {asset.name}\n{ch}" for ch in chunks_raw]
-                        vecs   = embed_texts(chunks)
-
-                        items = []
-                        for i, ch in enumerate(chunks):
-                            items.append({
-                                "id": _hash(f"{doc_id}:{i}"),
-                                "properties": {
-                                    "doc_id": doc_id,
-                                    "source": asset.name,
-                                    "chunk_index": i,
-                                    "text": ch,
-                                },
-                            })
-
-                        upserted = upsert_chunks(w_client, collection, items, vecs, tenancy=tenancy)
-                        st.write(f"📄 {asset.name} → {upserted} chunks")
-                        processed_chunks += upserted
-                        processed_files  += 1
-
-            except Exception as e:
-                err = f"{getattr(asset, 'name', '(unknown)')}: {e}"
-                errors.append(err)
-                st.write(f"❌ {err}")
-
-            seen += 1
-            if prog is not None and total_estimate:
-                prog.progress(min(1.0, seen / float(total_estimate)))
-
-        status.update(
-            label=f"Finished pipeline **{pipeline.get('name','(unnamed)')}**",
-            state="complete"
-        )
-
-    # 8) Close client (v4)
-    if V4:
-        try:
-            w_client.close()
-        except Exception:
-            pass
-
-    return {
-        "files": processed_files,
-        "chunks": processed_chunks,
-        "skipped": skipped_files,
-        "errors": errors,
-    }
-
-# ---------- Hook the “Run” buttons (unique keys; safe even if section is re-rendered) ----------
-SECTION_TAG = "pipelines_exec_v1"  # bump this if you ever render another table elsewhere
-
-def _safe_key(s: str) -> str:
-    # Self-contained sanitizer (works even if `re` isn't globally imported)
-    try:
-        import re as _re
-        return _re.sub(r"[^a-zA-Z0-9_-]+", "_", str(s))
-    except Exception:
-        return "".join(ch if (ch.isalnum() or ch in "-_") else "_" for ch in str(s))
-
-# Guard if `pipelines` not defined yet
-pipelines = _pipelines_load_all() if 'pipelines' not in globals() else pipelines
-
-for pid in sorted(pipelines.keys(), key=lambda x: pipelines[x]["name"].lower()):
-    p = pipelines[pid]
-    row_key = _safe_key(pid)  # stable per pipeline
-
-    c1, c2, c3, c4, c5 = st.columns([4, 3, 2, 1, 2])
-
-    c1.markdown(f"**{p['name']}**")
-
-    src_meta = REG_BY_ID.get(p["source_connector"]) if 'REG_BY_ID' in globals() else None
-    src_label = f"{(src_meta.icon + ' ' + src_meta.name) if src_meta else p['source_connector']} `{p['source_profile']}`"
-    dst_label = f"🧠 Weaviate `{p['destination_profile']}`"
-
-    c2.markdown(f"{src_label} → {dst_label}")
-    c3.markdown(f"`{p['collection']}`")
-
-    # Unique keys per section + pipeline
-    run_key    = f"run::{SECTION_TAG}::{row_key}"
-    edit_key   = f"edit_pipe::{SECTION_TAG}::{row_key}"
-    delete_key = f"delete_pipe::{SECTION_TAG}::{row_key}"
-
-    if c4.button("▶️", key=run_key, help="Run this pipeline now"):
-        try:
-            summary = _run_pipeline(p)
-            st.success(
-                f"✅ Pipeline **{p['name']}** complete — "
-                f"files: {summary['files']}, chunks: {summary['chunks']}, skipped: {summary['skipped']}."
-            )
-            if summary["errors"]:
-                with st.expander("View errors"):
-                    for e in summary["errors"]:
-                        st.write(f"- {e}")
-        except Exception as e:
-            st.error(f"Pipeline failed: {e}")
-
-    e_col, d_col = c5.columns([1, 1])
-    if e_col.button("📝", key=edit_key, help="Edit"):
-        st.session_state["editing_pipeline_id"] = pid
-        st.session_state["pipeline_form_open"] = True
-        st.rerun()
-
-    if d_col.button("🗑️", key=delete_key, help="Delete"):
-        try:
-            allp = _pipelines_load_all()
-            if pid in allp:
-                del allp[pid]
-                _pipelines_save_all(allp)
-                st.success(f"Deleted pipeline **{p['name']}**.")
-                st.rerun()
-        except Exception as e:
-            st.error(f"Failed to delete: {e}")
