@@ -1445,7 +1445,7 @@ def _pipeline_defaults() -> Dict[str, Any]:
         "destination_connector": "weaviate",
         "destination_profile": "",
         "collection": "Documents",
-        # Execution knobs (placeholders for later steps)
+        # Execution knobs
         "chunk_size": 1000,
         "chunk_overlap": 150,
         "embedding_model": "sentence-transformers/all-MiniLM-L6-v2",
@@ -1460,7 +1460,7 @@ st.session_state.setdefault("editing_pipeline_id", None)   # pipeline id (key in
 st.session_state.setdefault("pipeline_form_open", False)
 
 # =================================================================================================
-# UI: Pipelines Card
+# UI: Pipelines Card (Editor + Saved list)
 # =================================================================================================
 with st.container(border=True):
     st.markdown("### 🧪 Pipelines")
@@ -1518,11 +1518,9 @@ with st.container(border=True):
             )
 
             if src_connector and not src_profiles:
-                st.caption(
-                    "No saved profiles for this connector. Open the connector, test, then save a profile."
-                )
+                st.caption("No saved profiles for this connector. Open the connector, test, then save a profile.")
                 jump_col1, _ = st.columns([1, 3])
-                if jump_col1.button("Create profile now"):
+                if jump_col1.button("Create profile now", key="btn_jump_to_connector"):
                     st.session_state["selected_id"] = src_connector
                     st.session_state["rhs_open"] = True
                     st.rerun()
@@ -1547,12 +1545,14 @@ with st.container(border=True):
                     index=([""] + weaviate_profiles).index(initial.get("destination_profile", ""))
                           if weaviate_profiles and initial.get("destination_profile", "") in ([""] + weaviate_profiles)
                           else 0,
+                    key="sel_weaviate_profile",
                 )
                 collection = st.text_input(
                     "Weaviate Collection (Class) Name",
                     value=initial.get("collection", "Documents"),
                     placeholder="Documents",
                     help="Letters, digits, underscore; start with a letter/underscore.",
+                    key="txt_collection",
                 )
 
             # Processing
@@ -1562,22 +1562,26 @@ with st.container(border=True):
                 with c1:
                     chunk_size = st.number_input(
                         "Chunk Size (chars)", min_value=100, step=50,
-                        value=int(initial.get("chunk_size", 1000))
+                        value=int(initial.get("chunk_size", 1000)),
+                        key="num_chunk_size",
                     )
                     max_docs = st.number_input(
                         "Max Docs (for quick runs)", min_value=1, step=10,
-                        value=int(initial.get("max_docs", 50))
+                        value=int(initial.get("max_docs", 50)),
+                        key="num_max_docs",
                     )
                 with c2:
                     chunk_overlap = st.number_input(
                         "Chunk Overlap (chars)", min_value=0, step=10,
-                        value=int(initial.get("chunk_overlap", 150))
+                        value=int(initial.get("chunk_overlap", 150)),
+                        key="num_chunk_overlap",
                     )
                     embedding_model = st.text_input(
                         "Embedding Model (placeholder)",
                         value=initial.get("embedding_model", "sentence-transformers/all-MiniLM-L6-v2"),
+                        key="txt_embedding_model",
                     )
-                notes = st.text_area("Notes (optional)", value=initial.get("notes", ""))
+                notes = st.text_area("Notes (optional)", value=initial.get("notes", ""), key="txt_notes")
 
             csave, ccancel = st.columns([1, 1])
             submit = csave.form_submit_button("💾 Save Pipeline", use_container_width=True)
@@ -1662,18 +1666,18 @@ with st.container(border=True):
             c2.markdown(f"{src_label} → {dst_label}")
             c3.markdown(f"`{p['collection']}`")
 
-            # Manual Run (stub)
-            if c4.button("▶️", key=f"run::{pid}", help="Run this pipeline now"):
-                st.info(f"Starting pipeline **{p['name']}**… (execution wiring will be added next)")
+            # Manual Run (placeholder here; real buttons are added in the executor section below)
+            if c4.button("▶️", key=f"run_stub::{pid}", help="Run (wired below)"):
+                st.info(f"Starting pipeline **{p['name']}**… (execution wiring is below)")
 
             # Edit / Delete
             e_col, d_col = c5.columns([1, 1])
-            if e_col.button("📝", key=f"edit_pipe::{pid}", help="Edit"):
+            if e_col.button("📝", key=f"edit_stub::{pid}", help="Edit"):
                 st.session_state["editing_pipeline_id"] = pid
                 st.session_state["pipeline_form_open"] = True
                 st.rerun()
 
-            if d_col.button("🗑️", key=f"delete_pipe::{pid}", help="Delete"):
+            if d_col.button("🗑️", key=f"delete_stub::{pid}", help="Delete"):
                 try:
                     allp = _pipelines_load_all()
                     if pid in allp:
@@ -1685,7 +1689,7 @@ with st.container(border=True):
                     st.error(f"Failed to delete: {e}")
 
     st.markdown("</div>", unsafe_allow_html=True)
-# =================================================================================================
+
 # =================================================================================================
 # Pipeline execution wiring
 #   - Resolves source/destination profiles
@@ -1695,10 +1699,19 @@ with st.container(border=True):
 
 from pathlib import Path
 import tempfile
-from typing import Iterable, Dict, Any, List
+from typing import Dict, Any, List
 
-# If you've placed connector_hub.py next to this app:
-# from connector_hub import ConnectorHub
+# Try to import the external ConnectorHub. If not found, define a tiny stub that errors helpfully.
+try:
+    from connector_hub import ConnectorHub  # separate module (recommended)
+except Exception:
+    class ConnectorHub:  # fallback stub so the error is descriptive
+        def __init__(self, *args, **kwargs):
+            self._why = "ConnectorHub class not found. Ensure connector_hub.py is present and importable."
+        def stream(self):
+            raise RuntimeError(self._why)
+        def count(self):
+            return None
 
 # ---------- Helpers to resolve connection profiles ----------
 def _get_profile(connector_id: str, profile_name: str) -> Dict[str, Any]:
@@ -1839,6 +1852,7 @@ def _run_pipeline(pipeline: Dict[str, Any]) -> Dict[str, Any]:
             state="complete"
         )
 
+    # 8) Close client (v4)
     if V4:
         try:
             w_client.close()
@@ -1852,9 +1866,8 @@ def _run_pipeline(pipeline: Dict[str, Any]) -> Dict[str, Any]:
         "errors": errors,
     }
 
-
-# ---------- Hook the “Run” buttons (keys made unique to this section) ----------
-SECTION_TAG = "pipelines_exec_v1"  # change if you render another table elsewhere
+# ---------- Hook the “Run” buttons (unique keys; safe even if section is re-rendered) ----------
+SECTION_TAG = "pipelines_exec_v1"  # bump this if you ever render another table elsewhere
 
 def _safe_key(s: str) -> str:
     # Self-contained sanitizer (works even if `re` isn't globally imported)
@@ -1917,4 +1930,3 @@ for pid in sorted(pipelines.keys(), key=lambda x: pipelines[x]["name"].lower()):
                 st.rerun()
         except Exception as e:
             st.error(f"Failed to delete: {e}")
-
