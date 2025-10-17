@@ -1523,58 +1523,56 @@ with st.container():
             title = "Create Pipeline"
 
         st.markdown(f"#### {title}")
-        with st.form("pipeline_form", clear_on_submit=False):
-            name = st.text_input(
-                "Pipeline Name",
-                value=initial.get("name", ""),
-                placeholder="My First Pipeline",
-            )
 
-            # -------------------- Source --------------------
-            st.markdown("**Source**")
-            
-            # Allow only connectors that have at least one saved profile
-            profiles_store = _load_profiles_store()
-            avail_sources = [cid for cid, profs in profiles_store.items() if profs]
-            # Prefer non-Weaviate for source
-            avail_sources = [c for c in avail_sources if c != "weaviate"] or avail_sources
-            
-            src_connector_opts = [""] + avail_sources
-            src_connector = st.selectbox(
-                "Source Connector",
-                options=src_connector_opts,
-                index=src_connector_opts.index(initial.get("source_connector", ""))
-                if initial.get("source_connector", "") in src_connector_opts
-                else 0,
-                key="pipe_src_connector",
+        # ---------- Source (outside the form so it reruns immediately) ----------
+        st.markdown("**Source**")
+        
+        profiles_store = _load_profiles_store()
+        avail_sources = [cid for cid, profs in profiles_store.items() if profs]
+        avail_sources = [c for c in avail_sources if c != "weaviate"] or avail_sources
+        
+        src_connector_opts = [""] + avail_sources
+        
+        # keep stable keys
+        st.session_state.setdefault("pipe_src_connector", initial.get("source_connector", ""))
+        st.session_state.setdefault("pipe_src_profile", initial.get("source_profile", ""))
+        
+        # connector select (outside the form -> reruns on change automatically)
+        src_connector = st.selectbox(
+            "Source Connector",
+            options=src_connector_opts,
+            index=src_connector_opts.index(st.session_state["pipe_src_connector"])
+                   if st.session_state["pipe_src_connector"] in src_connector_opts else 0,
+            key="pipe_src_connector",
+        )
+        
+        # dependent profile options
+        src_profiles = _profiles_for_connector(src_connector) if src_connector else []
+        src_profile_opts = [""] + src_profiles if src_profiles else [""]
+        
+        src_profile = st.selectbox(
+            "Source Profile",
+            options=src_profile_opts,
+            index=src_profile_opts.index(st.session_state["pipe_src_profile"])
+                   if st.session_state["pipe_src_profile"] in src_profile_opts else 0,
+            key="pipe_src_profile",
+        )
+        
+        if src_connector and not src_profiles:
+            st.caption(
+                "No saved profiles found for this connector. Open the connector, "
+                "fill credentials, **Test Connection**, then **Save Profile**."
             )
-            
-            # Re-render when connector changes so profiles refresh
-            if "pipe__last_src_connector" not in st.session_state:
-                st.session_state["pipe__last_src_connector"] = src_connector
-            elif st.session_state["pipe__last_src_connector"] != src_connector:
-                st.session_state["pipe__last_src_connector"] = src_connector
-                # also clear any stale profile selection
-                st.session_state["pipe_src_profile"] = ""
+            j1, _ = st.columns([1,3])
+            if j1.button("Create profile now"):
+                st.session_state["selected_id"] = src_connector
+                st.session_state["rhs_open"] = True
                 st.rerun()
-            
-            # Populate profiles for the selected connector
-            src_profiles = _profiles_for_connector(src_connector) if src_connector else []
-            src_profile_opts = ([""] + src_profiles) if src_profiles else [""]
-            
-            # 🔧 KEY CHANGE: make the key depend on connector so Streamlit resets it per connector
-            src_profile = st.selectbox(
-                "Source Profile",
-                options=src_profile_opts,
-                index=src_profile_opts.index(initial.get("source_profile", ""))
-                if initial.get("source_profile", "") in src_profile_opts
-                else 0,
-                key=f"pipe_src_profile__{src_connector or 'none'}",
-            )
-
-
-
-            # -------------------- Destination (Weaviate) --------------------
+        
+        # ---------- Destination + the rest (can stay in a form) ----------
+        with st.form("pipeline_form", clear_on_submit=False):
+            name = st.text_input("Pipeline Name", value=initial.get("name",""), placeholder="My First Pipeline")
+        
             st.markdown("**Destination (Weaviate)**")
             dest_connector = "weaviate"
             weaviate_profiles = _profiles_for_connector(dest_connector)
@@ -1582,54 +1580,45 @@ with st.container():
             dest_profile = st.selectbox(
                 "Weaviate Profile",
                 options=dest_profile_opts,
-                index=dest_profile_opts.index(initial.get("destination_profile", ""))
-                if initial.get("destination_profile", "") in dest_profile_opts
-                else 0,
+                index=dest_profile_opts.index(initial.get("destination_profile",""))
+                      if initial.get("destination_profile","") in dest_profile_opts else 0,
+                key="pipe_weaviate_profile",
             )
             if not weaviate_profiles:
-                st.caption(
-                    "No Weaviate profiles found. Open the Weaviate connector, test and save a profile first."
-                )
-
+                st.caption("No Weaviate profiles found. Open the Weaviate connector, test and save a profile first.")
+        
             collection = st.text_input(
                 "Weaviate Collection (Class) Name",
-                value=initial.get("collection", "Documents"),
+                value=initial.get("collection","Documents"),
                 placeholder="Documents",
                 help="Case-sensitive. Letters, digits and underscore; must start with a letter/underscore.",
             )
-
-            # -------------------- Processing Settings --------------------
+        
             st.markdown("**Processing Settings**")
             c1, c2 = st.columns(2)
             with c1:
-                chunk_size = st.number_input(
-                    "Chunk Size (chars)", min_value=100, step=50, value=int(initial.get("chunk_size", 1000))
-                )
-                max_docs = st.number_input(
-                    "Max Docs (for quick runs)", min_value=1, step=10, value=int(initial.get("max_docs", 50))
-                )
+                chunk_size = st.number_input("Chunk Size (chars)", min_value=100, step=50, value=int(initial.get("chunk_size", 1000)))
+                max_docs   = st.number_input("Max Docs (for quick runs)", min_value=1, step=10, value=int(initial.get("max_docs", 50)))
             with c2:
-                chunk_overlap = st.number_input(
-                    "Chunk Overlap (chars)", min_value=0, step=10, value=int(initial.get("chunk_overlap", 150))
-                )
-                embedding_model = st.text_input(
-                    "Embedding Model (placeholder)",
-                    value=initial.get("embedding_model", "sentence-transformers/all-MiniLM-L6-v2"),
-                )
-
-            notes = st.text_area("Notes (optional)", value=initial.get("notes", ""))
-
-            csave, ccancel = st.columns([1, 1])
+                chunk_overlap   = st.number_input("Chunk Overlap (chars)", min_value=0, step=10, value=int(initial.get("chunk_overlap", 150)))
+                embedding_model = st.text_input("Embedding Model (placeholder)", value=initial.get("embedding_model","sentence-transformers/all-MiniLM-L6-v2"))
+        
+            notes = st.text_area("Notes (optional)", value=initial.get("notes",""))
+        
+            csave, ccancel = st.columns([1,1])
             submit = csave.form_submit_button("💾 Save Pipeline", use_container_width=True)
             cancel = ccancel.form_submit_button("Cancel", use_container_width=True)
-
+        
         if cancel:
             st.session_state["pipeline_form_open"] = False
             st.session_state["editing_pipeline_id"] = None
             st.rerun()
-
+        
         if submit:
-            # Basic validations
+            # read the source selections from session_state (since they’re outside the form)
+            src_connector = st.session_state.get("pipe_src_connector", "")
+            src_profile   = st.session_state.get("pipe_src_profile", "")
+        
             errors = []
             if not name.strip():
                 errors.append("Pipeline Name is required.")
@@ -1641,26 +1630,25 @@ with st.container():
                 errors.append("Weaviate Profile is required.")
             if not collection.strip():
                 errors.append("Weaviate Collection is required.")
-
+        
             if errors:
                 st.error("Please fix the following:\n" + "\n".join(f"- {e}" for e in errors))
             else:
-                # Stable ID on edit; generate unique ID on create
                 if st.session_state["editing_pipeline_id"]:
                     pid_new = st.session_state["editing_pipeline_id"]
                 else:
-                    base = name.strip().lower().replace(" ", "_")
-                    pid_new = base or "pipeline"
+                    base = name.strip().lower().replace(" ", "_") or "pipeline"
+                    pid_new = base
                     i = 2
                     while pid_new in pipelines:
                         pid_new = f"{base}_{i}"
                         i += 1
-
+        
                 pipelines[pid_new] = {
                     "name": name.strip(),
                     "source_connector": src_connector,
                     "source_profile": src_profile,
-                    "destination_connector": dest_connector,
+                    "destination_connector": "weaviate",
                     "destination_profile": dest_profile,
                     "collection": collection.strip(),
                     "chunk_size": int(chunk_size),
@@ -1674,6 +1662,7 @@ with st.container():
                 st.session_state["pipeline_form_open"] = False
                 st.session_state["editing_pipeline_id"] = None
                 st.rerun()
+
 
     # --- List all pipelines ---
     pipelines = _pipelines_load_all()
