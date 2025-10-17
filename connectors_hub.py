@@ -1402,10 +1402,12 @@ with main_left:
 # Pipeline executor helpers (drop under the "Pipeline execution wiring" section)
 # - Works with Weaviate v4 (preferred) and v3 as a fallback
 # - Minimal text parsing / chunking / embedding
+# - Includes a small built-in ConnectorHub with Azure Blob support
 # =================================================================================================
-from typing import Optional, Sequence
+from typing import Optional, Sequence, Iterable
 import hashlib
 from urllib.parse import urlparse
+from dataclasses import dataclass
 
 # ---- Detect Weaviate client generation (v4 vs v3) ----
 _V4_AVAILABLE = False
@@ -1548,7 +1550,6 @@ class RecursiveCharacterTextSplitter:
         self.separators = separators or ["\n\n", "\n", ". ", " ", ""]
 
     def split_text(self, text: str) -> List[str]:
-        # Greedy simple sliding window (fast, robust)
         if not text:
             return []
         chunks: List[str] = []
@@ -1626,6 +1627,135 @@ def upsert_chunks(client, class_name: str, items: List[Dict[str, Any]], vectors:
             return len(items)
     except Exception as e:
         raise RuntimeError(f"Upsert failed: {e}")
+
+# ---------------------------------------------------------------------------------
+# Built-in ConnectorHub (minimal) — supports Azure Blob and Local Folder
+# ---------------------------------------------------------------------------------
+@dataclass
+class Asset:
+    name: str
+    local_path: str
+    size_bytes: int
+
+class ConnectorHub:
+    """
+    Minimal in-file ConnectorHub so the app runs even when an external module
+    isn't present. Currently supports:
+      - kind = 'azureblob' with one of:
+          * connection_string
+          * sas_url (container SAS)
+          * account_name + account_key
+        plus an optional 'prefix' like:  "mycontainer/sub/folder"
+      - kind = 'local' with 'path' (directory) and optional 'prefix'
+    """
+    def __init__(self, cache_root: Path, state_root: Path, configs: List[Dict[str, Any]]):
+        self.cache_root = Path(cache_root)
+        self.state_root = Path(state_root)
+        self.cfg = (configs or [{}])[0]  # we support one source for now
+        self.kind = (self.cfg.get("kind") or "").lower().strip()
+        self.prefix = (self.cfg.get("prefix") or "").strip().strip("/")
+        self.max_bytes = int(self.cfg.get("max_bytes") or 50 * 1024 * 1024)
+        self.cache_root.mkdir(parents=True, exist_ok=True)
+
+    # --------- Public API expected by your runner ----------
+    def count(self) -> Optional[int]:
+        if self.kind == "azureblob":
+            try:
+                bls = list(self._azure_list_blobs(limit=5000, names_only=True))
+                return len(bls)
+            except Exception:
+                return None
+        if self.kind == "local":
+            try:
+                base = Path(self.cfg.get("path") or ".")
+                files = [p for p in base.rglob("*") if p.is_file()]
+                return len(files)
+            except Exception:
+                return None
+        return None
+
+    def stream(self) -> Iterable[Asset]:
+        if self.kind == "azureblob":
+            yield from self._stream_azureblob()
+        elif self.kind == "local":
+            yield from self._stream_local()
+        else:
+            raise RuntimeError(f"Unsupported connector kind: {self.kind}")
+
+    # --------- Azure Blob implementation ----------
+    def _get_blob_service(self):
+        from azure.storage.blob import BlobServiceClient
+        if self.cfg.get("connection_string"):
+            return BlobServiceClient.from_connection_string(self.cfg["connection_string"])
+        if self.cfg.get("sas_url"):
+            # sas_url like https://account.blob.core.windows.net/container?sv=...
+            return BlobServiceClient(account_url=self.cfg["sas_url"].split("?", 1)[0],
+                                     credential=self.cfg["sas_url"])
+        if self.cfg.get("account_name") and self.cfg.get("account_key"):
+            url = f"https://{self.cfg['account_name']}.blob.core.windows.net"
+            return BlobServiceClient(account_url=url, credential=self.cfg["account_key"])
+        raise RuntimeError("Azure Blob profile missing credentials: provide connection_string OR sas_url OR account_name+account_key.")
+
+    def _split_prefix(self):
+        """
+        Returns container, subpath from prefix like 'container/a/b' or just 'container'.
+        """
+        if not self.prefix:
+            raise RuntimeError("Azure Blob requires a prefix like 'container[/optional/path]'.")
+        parts = self.prefix.split("/", 1)
+        container = parts[0]
+        sub = parts[1] if len(parts) > 1 else ""
+        return container, sub
+
+    def _azure_list_blobs(self, limit: Optional[int] = None, names_only: bool = False):
+        svc = self._get_blob_service()
+        container, sub = self._split_prefix()
+        cont = svc.get_container_client(container)
+        n = 0
+        for blob in cont.list_blobs(name_starts_with=sub or None):
+            if limit is not None and n >= limit:
+                break
+            n += 1
+            if names_only:
+                yield blob.name
+            else:
+                yield blob
+
+    def _stream_azureblob(self) -> Iterable[Asset]:
+        from azure.storage.blob import BlobClient
+        svc = self._get_blob_service()
+        container, sub = self._split_prefix()
+        cont = svc.get_container_client(container)
+
+        for blob in cont.list_blobs(name_starts_with=sub or None):
+            size = int(getattr(blob, "size", 0) or 0)
+            if self.max_bytes and size > self.max_bytes:
+                continue
+            # download to cache
+            safe_name = blob.name.replace("/", "__")
+            dest = self.cache_root / f"az_{container}__{safe_name}"
+            if not dest.exists():
+                bc: BlobClient = cont.get_blob_client(blob)
+                with open(dest, "wb") as f:
+                    stream = bc.download_blob()
+                    f.write(stream.readall())
+            yield Asset(name=f"az://{container}/{blob.name}", local_path=str(dest), size_bytes=size)
+
+    # --------- Local folder implementation ----------
+    def _stream_local(self) -> Iterable[Asset]:
+        base = Path(self.cfg.get("path") or ".")
+        sub = self.prefix or ""
+        root = (base / sub) if sub else base
+        if not root.exists():
+            raise RuntimeError(f"Local path not found: {root}")
+        for p in root.rglob("*"):
+            if not p.is_file():
+                continue
+            size = p.stat().st_size
+            if self.max_bytes and size > self.max_bytes:
+                continue
+            yield Asset(name=str(p.relative_to(base)), local_path=str(p), size_bytes=size)
+
 
 # =================================================================================================
 # Pipelines helpers & UI (drop into your Streamlit page)
