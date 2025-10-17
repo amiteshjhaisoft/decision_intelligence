@@ -380,8 +380,19 @@ REGISTRY: List[Connector] = [
     # ... (registry identical to your current file; omitted here for brevity)
 ]
 
-# NOTE: Keep your full REGISTRY from your original file here (unchanged).
-# For clarity/space, paste your entire existing REGISTRY block verbatim.
+# ---- SAFETY FALLBACK: ensure registry is not empty so the app can boot
+if not REGISTRY:
+    REGISTRY = [
+        Connector(
+            id="sqlite",
+            name="SQLite",
+            icon="🗂️",
+            fields=[Field("filepath", "DB File Path", required=True, placeholder="./my.db")],
+            secret_keys=[],
+            category="SQL",
+            logo_key="sqlite",
+        )
+    ]
 
 REG_BY_ID: Dict[str, Connector] = {c.id: c for c in REGISTRY}
 
@@ -393,8 +404,10 @@ def _sorted_filtered_connectors(q: str) -> List[Connector]:
     ql = q.lower()
     return [c for c in items if ql in c.name.lower() or ql in c.id.lower() or ql in c.category.lower()]
 
-# Session state defaults
-st.session_state.setdefault("selected_id", REGISTRY[0].id)
+# Session state defaults (guarded)
+default_id = REGISTRY[0].id if REGISTRY else None
+if "selected_id" not in st.session_state:
+    st.session_state["selected_id"] = default_id
 st.session_state.setdefault("rhs_open", False)
 
 def _set_active(conn_id: str):
@@ -413,6 +426,8 @@ with st.sidebar:
     st.markdown('<div class="sidebar-caption">All connectors</div>', unsafe_allow_html=True)
 
     filtered = _sorted_filtered_connectors(q)
+    if not filtered:
+        st.caption("No connectors registered (using fallback).")
     for c in filtered:
         is_active = (st.session_state["selected_id"] == c.id and st.session_state["rhs_open"])
         if st.button(f"{c.icon}  {c.name}", key=f"nav_{c.id}",
@@ -474,8 +489,9 @@ with st.sidebar:
     with st.expander("🔄 Import / Export Pipelines", expanded=False):
         existing = None  # allocate after defining pipeline helpers
 
-# Resolve current connector from state
-conn: Connector = REG_BY_ID[st.session_state["selected_id"]]
+# Resolve current connector from state (guarded)
+active_id = st.session_state.get("selected_id")
+conn: Optional[Connector] = REG_BY_ID.get(active_id) if active_id else None
 
 # ---------------------- Load store & KPIs ----------------------
 all_profiles = _load_all()
@@ -495,7 +511,7 @@ def _prefill_and_open_editor(conn_id: str, profile: str, cfg: Dict[str, Any]) ->
     st.session_state["selected_id"] = conn_id
     st.session_state["rhs_open"] = True
     st.session_state[f"{conn_id}_profile_name"] = profile
-    for f in REG_BY_ID[conn_id].fields:
+    for f in (REG_BY_ID.get(conn_id).fields if REG_BY_ID.get(conn_id) else []):
         st.session_state[f"{conn_id}_{f.key}"] = cfg.get(f.key, "")
 
 # ---------------------- Header renderer ----------------------
@@ -594,7 +610,7 @@ def render_configure_form(container, conn: Connector):
             else:
                 _short_timeout_env()
                 with st.spinner("Testing connection..."):
-                    resolved = _resolve_secrets(values, REG_BY_ID[conn.id].secret_keys)
+                    resolved = _resolve_secrets(values, REG_BY_ID[conn.id].secret_keys if REG_BY_ID.get(conn.id) else [])
                     ok, msg = handler(resolved)
                 st.session_state[_keys["ok"]] = bool(ok)
                 st.session_state[_keys["msg"]] = msg
@@ -636,11 +652,11 @@ def render_configure_form(container, conn: Connector):
 
         if preview:
             st.info("Indicative DSN/URI preview (no network calls):")
-            st.code(_dsn_preview(conn.id, _resolve_secrets(values, REG_BY_ID[conn.id].secret_keys)), language="text")
+            st.code(_dsn_preview(conn.id, _resolve_secrets(values, REG_BY_ID[conn.id].secret_keys if REG_BY_ID.get(conn.id) else [])), language="text")
 
         if envvars:
             st.info("Copy/paste into your shell (masked preview; ENV refs remain dynamic):")
-            st.code(_env_snippet(conn.id, profile_name or "PROFILE", values, REG_BY_ID[conn.id].secret_keys), language="bash")
+            st.code(_env_snippet(conn.id, profile_name or "PROFILE", values, REG_BY_ID[conn.id].secret_keys if REG_BY_ID.get(conn.id) else []), language="bash")
 
         if submitted:
             if not profile_name.strip():
@@ -658,7 +674,7 @@ def render_configure_form(container, conn: Connector):
                 st.success(f"Saved **{profile_name}** for {conn.icon} {conn.name}.")
 
 # ---------------------- RHS panel ----------------------
-if st.session_state["rhs_open"]:
+if st.session_state["rhs_open"] and conn is not None:
     with main_right:
         st.markdown('<div class="rhs-aside">', unsafe_allow_html=True)
         render_header(main_right, conn, len(REGISTRY), total_profiles_all, in_rhs=True)
@@ -676,7 +692,8 @@ def _run_status_check_for_all():
         for pname, cfg in (items or {}).items():
             if handler:
                 try:
-                    resolved = _resolve_secrets(cfg, REG_BY_ID[cid].secret_keys)
+                    secret_keys = REG_BY_ID.get(cid).secret_keys if REG_BY_ID.get(cid) else []
+                    resolved = _resolve_secrets(cfg, secret_keys)
                     ok, msg = handler(resolved)
                 except Exception as e:
                     ok, msg = False, str(e)
