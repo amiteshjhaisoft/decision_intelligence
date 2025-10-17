@@ -1722,7 +1722,7 @@ def _make_weaviate_from_profile(dest_profile: Dict[str, Any]):
     client = make_weaviate_client(url, api_key)
     return client, tenancy
 
-# ---------- Core runner (unchanged) ----------
+# ---------- Core runner ----------
 def _run_pipeline(pipeline: Dict[str, Any]) -> Dict[str, Any]:
     """
     Execute a single pipeline dict from pipelines.json.
@@ -1857,8 +1857,15 @@ def _run_pipeline(pipeline: Dict[str, Any]) -> Dict[str, Any]:
 SECTION_TAG = "pipelines_exec_v1"  # change if you render another table elsewhere
 
 def _safe_key(s: str) -> str:
-    # sanitize to avoid collisions across different renders
-    return re.sub(r"[^a-zA-Z0-9_-]+", "_", str(s))
+    # Self-contained sanitizer (works even if `re` isn't globally imported)
+    try:
+        import re as _re
+        return _re.sub(r"[^a-zA-Z0-9_-]+", "_", str(s))
+    except Exception:
+        return "".join(ch if (ch.isalnum() or ch in "-_") else "_" for ch in str(s))
+
+# Guard if `pipelines` not defined yet
+pipelines = _pipelines_load_all() if 'pipelines' not in globals() else pipelines
 
 for pid in sorted(pipelines.keys(), key=lambda x: pipelines[x]["name"].lower()):
     p = pipelines[pid]
@@ -1876,9 +1883,9 @@ for pid in sorted(pipelines.keys(), key=lambda x: pipelines[x]["name"].lower()):
     c3.markdown(f"`{p['collection']}`")
 
     # Unique keys per section + pipeline
-    run_key   = f"run::{SECTION_TAG}::{row_key}"
-    edit_key  = f"edit_pipe::{SECTION_TAG}::{row_key}"
-    delete_key= f"delete_pipe::{SECTION_TAG}::{row_key}"
+    run_key    = f"run::{SECTION_TAG}::{row_key}"
+    edit_key   = f"edit_pipe::{SECTION_TAG}::{row_key}"
+    delete_key = f"delete_pipe::{SECTION_TAG}::{row_key}"
 
     if c4.button("▶️", key=run_key, help="Run this pipeline now"):
         try:
@@ -1910,3 +1917,4 @@ for pid in sorted(pipelines.keys(), key=lambda x: pipelines[x]["name"].lower()):
                 st.rerun()
         except Exception as e:
             st.error(f"Failed to delete: {e}")
+
