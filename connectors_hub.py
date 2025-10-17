@@ -1401,363 +1401,6 @@ with main_left:
 # =================================================================================================
 # Pipelines helpers & UI (drop into your Streamlit page)
 # =================================================================================================
-# =================================================================================================
-# Pipeline executor helpers (drop under the "Pipeline execution wiring" section)
-# - Works with Weaviate v4 (preferred) and v3 as a fallback
-# - Minimal text parsing / chunking / embedding
-# - Includes a small built-in ConnectorHub with Azure Blob support
-# =================================================================================================
-from typing import Optional, Sequence, Iterable
-import hashlib
-from urllib.parse import urlparse
-from dataclasses import dataclass
-
-# ---- Detect Weaviate client generation (v4 vs v3) ----
-_V4_AVAILABLE = False
-_V3_AVAILABLE = False
-try:
-    # v4 style imports
-    from weaviate import connect_to_wcs, connect_to_custom
-    from weaviate.classes.init import Auth as _WvAuth
-    _V4_AVAILABLE = True
-except Exception:
-    pass
-
-try:
-    # v3 client (classic)
-    import weaviate as _wv3
-    _V3_AVAILABLE = hasattr(_wv3, "Client")
-except Exception:
-    pass
-
-# Public flag used later in your code
-V4 = _V4_AVAILABLE
-
-# ---------------------------------------------------------------------------------
-# Weaviate client factory
-# ---------------------------------------------------------------------------------
-def make_weaviate_client(url_or_cluster: str, api_key: Optional[str] = None):
-    """
-    Returns a connected Weaviate client.
-    - v4: connect_to_wcs (if value looks like a cluster URL), else connect_to_custom (host/port/secure).
-    - v3: weaviate.Client(base_url, auth_client_secret=...)
-    """
-    if not url_or_cluster:
-        raise ValueError("Weaviate URL/cluster is required.")
-
-    # ---- v4 path (preferred) ----
-    if _V4_AVAILABLE:
-        auth = _WvAuth.api_key(api_key) if api_key else None
-        raw = url_or_cluster.strip()
-        # If it's a full http(s) URL, go custom; otherwise treat it as a WCS cluster URL.
-        if raw.startswith("http://") or raw.startswith("https://"):
-            u = urlparse(raw)
-            if not u.hostname:
-                raise ValueError(f"Invalid URL: {raw}")
-            http_secure = (u.scheme == "https")
-            http_port = u.port or (443 if http_secure else 80)
-            return connect_to_custom(
-                http_host=u.hostname,
-                http_port=http_port,
-                http_secure=http_secure,
-                auth_credentials=auth,
-            )
-        else:
-            return connect_to_wcs(cluster_url=raw, auth_credentials=auth)
-
-    # ---- v3 fallback ----
-    if _V3_AVAILABLE:
-        base = url_or_cluster
-        if not base.startswith("http"):
-            base = f"http://{base}"
-        if api_key:
-            from weaviate.auth import AuthApiKey as _AuthApiKey
-            return _wv3.Client(base, auth_client_secret=_AuthApiKey(api_key=api_key))
-        return _wv3.Client(base)
-
-    raise RuntimeError("weaviate-client is not installed. `pip install 'weaviate-client>=4,<5'` is recommended.")
-
-# ---------------------------------------------------------------------------------
-# Ensure collection / class exists
-# ---------------------------------------------------------------------------------
-def ensure_collection(client, class_name: str, tenancy: Optional[str] = None) -> None:
-    """
-    Creates the collection/class if missing with a minimal schema:
-      doc_id (text), source (text), chunk_index (int), text (text)
-    """
-    try:
-        if _V4_AVAILABLE:
-            # Try get; create if it fails.
-            try:
-                _ = client.collections.get(class_name, tenant=tenancy)
-                return
-            except Exception:
-                from weaviate.classes.config import Property, DataType, Configure
-                client.collections.create(
-                    name=class_name,
-                    properties=[
-                        Property(name="doc_id", data_type=DataType.TEXT),
-                        Property(name="source", data_type=DataType.TEXT),
-                        Property(name="chunk_index", data_type=DataType.INT),
-                        Property(name="text", data_type=DataType.TEXT),
-                    ],
-                    vectorizer_config=Configure.Vectorizer.none(),  # external embeddings
-                )
-                return
-        else:
-            # v3 schema
-            schema = client.schema.get()
-            classes = {c["class"] for c in schema.get("classes", [])}
-            if class_name in classes:
-                return
-            class_obj = {
-                "class": class_name,
-                "vectorizer": "none",
-                "properties": [
-                    {"name": "doc_id", "dataType": ["text"]},
-                    {"name": "source", "dataType": ["text"]},
-                    {"name": "chunk_index", "dataType": ["int"]},
-                    {"name": "text", "dataType": ["text"]},
-                ],
-            }
-            client.schema.create_class(class_obj)
-    except Exception as e:
-        raise RuntimeError(f"Failed to ensure collection '{class_name}': {e}")
-
-# ---------------------------------------------------------------------------------
-# Simple file-to-text reader (minimal formats)
-# ---------------------------------------------------------------------------------
-def guess_and_read_path(name: str, local_path: str, size_bytes: int, tmp_dir: Path) -> str:
-    """
-    Very small, dependency-light extractor:
-    - .txt/.md/.csv/.json → utf-8 text
-    - everything else → best-effort utf-8 decode
-    """
-    try:
-        p = Path(local_path)
-        ext = p.suffix.lower()
-        if ext in {".txt", ".md", ".csv", ".json", ".log"}:
-            return p.read_text(encoding="utf-8", errors="ignore")
-        # best-effort fallback
-        return p.read_bytes().decode("utf-8", errors="ignore")
-    except Exception as e:
-        raise RuntimeError(f"read error: {e}")
-
-# ---------------------------------------------------------------------------------
-# Minimal text splitter compatible with your usage
-# ---------------------------------------------------------------------------------
-class RecursiveCharacterTextSplitter:
-    def __init__(self, chunk_size: int = 1000, chunk_overlap: int = 150, separators: Optional[Sequence[str]] = None):
-        self.chunk_size = max(1, int(chunk_size))
-        self.chunk_overlap = max(0, int(chunk_overlap))
-        self.separators = separators or ["\n\n", "\n", ". ", " ", ""]
-
-    def split_text(self, text: str) -> List[str]:
-        if not text:
-            return []
-        chunks: List[str] = []
-        step = max(1, self.chunk_size - self.chunk_overlap)
-        for i in range(0, len(text), step):
-            chunk = text[i:i + self.chunk_size]
-            if not chunk:
-                break
-            chunks.append(chunk)
-        return chunks
-
-# ---------------------------------------------------------------------------------
-# Hash helper
-# ---------------------------------------------------------------------------------
-def _hash(s: str) -> str:
-    return hashlib.md5(s.encode("utf-8")).hexdigest()
-
-# ---------------------------------------------------------------------------------
-# Embeddings (Sentence-Transformers)
-# ---------------------------------------------------------------------------------
-def embed_texts(texts: List[str], model_name: str = "sentence-transformers/all-MiniLM-L6-v2") -> List[List[float]]:
-    try:
-        from sentence_transformers import SentenceTransformer
-    except ModuleNotFoundError as e:
-        raise RuntimeError(
-            "Embedding model not available. Install: pip install sentence-transformers"
-        ) from e
-
-    # Cache the model across Streamlit reruns
-    cache_key = f"_emb_model::{model_name}"
-    if cache_key not in st.session_state:
-        st.session_state[cache_key] = SentenceTransformer(model_name)
-    model = st.session_state[cache_key]
-
-    vecs = model.encode(texts, show_progress_bar=False, normalize_embeddings=True)
-    return [v.tolist() for v in vecs]
-
-# ---------------------------------------------------------------------------------
-# Upsert chunks (v4 / v3)
-# ---------------------------------------------------------------------------------
-def upsert_chunks(client, class_name: str, items: List[Dict[str, Any]], vectors: List[List[float]],
-                  tenancy: Optional[str] = None) -> int:
-    """
-    Inserts objects + vectors in a single batch.
-    Returns the number of successfully upserted chunks.
-    """
-    if not items:
-        return 0
-
-    try:
-        if _V4_AVAILABLE:
-            col = client.collections.get(class_name, tenant=tenancy)
-            # v4 supports vectors in insert_many
-            payload = [{"id": it["id"], **it["properties"]} for it in items]
-            try:
-                # new API (>=4.6) — vectors passed as list aligned with payload
-                col.data.insert_many(objects=payload, vectors=vectors)
-            except TypeError:
-                # older API: embed vectors inside each object
-                payload2 = [{"id": it["id"], "properties": it["properties"], "vector": vec}
-                            for it, vec in zip(items, vectors)]
-                col.data.insert_many(payload2)
-            return len(items)
-        else:
-            # v3 path: use batched add_data_object
-            with client.batch as b:
-                b.batch_size = 64
-                for it, vec in zip(items, vectors):
-                    b.add_data_object(
-                        data_object=it["properties"],
-                        class_name=class_name,
-                        uuid=it["id"],
-                        vector=vec,
-                    )
-            return len(items)
-    except Exception as e:
-        raise RuntimeError(f"Upsert failed: {e}")
-
-# ---------------------------------------------------------------------------------
-# Built-in ConnectorHub (minimal) — supports Azure Blob and Local Folder
-# ---------------------------------------------------------------------------------
-@dataclass
-class Asset:
-    name: str
-    local_path: str
-    size_bytes: int
-
-class ConnectorHub:
-    """
-    Minimal in-file ConnectorHub so the app runs even when an external module
-    isn't present. Currently supports:
-      - kind = 'azureblob' with one of:
-          * connection_string
-          * sas_url (container SAS)
-          * account_name + account_key
-        plus an optional 'prefix' like:  "mycontainer/sub/folder"
-      - kind = 'local' with 'path' (directory) and optional 'prefix'
-    """
-    def __init__(self, cache_root: Path, state_root: Path, configs: List[Dict[str, Any]]):
-        self.cache_root = Path(cache_root)
-        self.state_root = Path(state_root)
-        self.cfg = (configs or [{}])[0]  # we support one source for now
-        self.kind = (self.cfg.get("kind") or "").lower().strip()
-        self.prefix = (self.cfg.get("prefix") or "").strip().strip("/")
-        self.max_bytes = int(self.cfg.get("max_bytes") or 50 * 1024 * 1024)
-        self.cache_root.mkdir(parents=True, exist_ok=True)
-
-    # --------- Public API expected by your runner ----------
-    def count(self) -> Optional[int]:
-        if self.kind == "azureblob":
-            try:
-                bls = list(self._azure_list_blobs(limit=5000, names_only=True))
-                return len(bls)
-            except Exception:
-                return None
-        if self.kind == "local":
-            try:
-                base = Path(self.cfg.get("path") or ".")
-                files = [p for p in base.rglob("*") if p.is_file()]
-                return len(files)
-            except Exception:
-                return None
-        return None
-
-    def stream(self) -> Iterable[Asset]:
-        if self.kind == "azureblob":
-            yield from self._stream_azureblob()
-        elif self.kind == "local":
-            yield from self._stream_local()
-        else:
-            raise RuntimeError(f"Unsupported connector kind: {self.kind}")
-
-    # --------- Azure Blob implementation ----------
-    def _get_blob_service(self):
-        from azure.storage.blob import BlobServiceClient
-        if self.cfg.get("connection_string"):
-            return BlobServiceClient.from_connection_string(self.cfg["connection_string"])
-        if self.cfg.get("sas_url"):
-            # sas_url like https://account.blob.core.windows.net/container?sv=...
-            return BlobServiceClient(account_url=self.cfg["sas_url"].split("?", 1)[0],
-                                     credential=self.cfg["sas_url"])
-        if self.cfg.get("account_name") and self.cfg.get("account_key"):
-            url = f"https://{self.cfg['account_name']}.blob.core.windows.net"
-            return BlobServiceClient(account_url=url, credential=self.cfg["account_key"])
-        raise RuntimeError("Azure Blob profile missing credentials: provide connection_string OR sas_url OR account_name+account_key.")
-
-    def _split_prefix(self):
-        """
-        Returns container, subpath from prefix like 'container/a/b' or just 'container'.
-        """
-        if not self.prefix:
-            raise RuntimeError("Azure Blob requires a prefix like 'container[/optional/path]'.")
-        parts = self.prefix.split("/", 1)
-        container = parts[0]
-        sub = parts[1] if len(parts) > 1 else ""
-        return container, sub
-
-    def _azure_list_blobs(self, limit: Optional[int] = None, names_only: bool = False):
-        svc = self._get_blob_service()
-        container, sub = self._split_prefix()
-        cont = svc.get_container_client(container)
-        n = 0
-        for blob in cont.list_blobs(name_starts_with=sub or None):
-            if limit is not None and n >= limit:
-                break
-            n += 1
-            if names_only:
-                yield blob.name
-            else:
-                yield blob
-
-    def _stream_azureblob(self) -> Iterable[Asset]:
-        from azure.storage.blob import BlobClient
-        svc = self._get_blob_service()
-        container, sub = self._split_prefix()
-        cont = svc.get_container_client(container)
-
-        for blob in cont.list_blobs(name_starts_with=sub or None):
-            size = int(getattr(blob, "size", 0) or 0)
-            if self.max_bytes and size > self.max_bytes:
-                continue
-            # download to cache
-            safe_name = blob.name.replace("/", "__")
-            dest = self.cache_root / f"az_{container}__{safe_name}"
-            if not dest.exists():
-                bc: BlobClient = cont.get_blob_client(blob)
-                with open(dest, "wb") as f:
-                    stream = bc.download_blob()
-                    f.write(stream.readall())
-            yield Asset(name=f"az://{container}/{blob.name}", local_path=str(dest), size_bytes=size)
-
-    # --------- Local folder implementation ----------
-    def _stream_local(self) -> Iterable[Asset]:
-        base = Path(self.cfg.get("path") or ".")
-        sub = self.prefix or ""
-        root = (base / sub) if sub else base
-        if not root.exists():
-            raise RuntimeError(f"Local path not found: {root}")
-        for p in root.rglob("*"):
-            if not p.is_file():
-                continue
-            size = p.stat().st_size
-            if self.max_bytes and size > self.max_bytes:
-                continue
-            yield Asset(name=str(p.relative_to(base)), local_path=str(p), size_bytes=size)
 
 # ---------------------------------------------------------------------------------
 # Connections store helpers (read-only here)
@@ -2021,7 +1664,364 @@ with st.container(border=True):
 
             # Manual Run (stub)
             if c4.button("▶️", key=f"run::{pid}", help="Run this pipeline now"):
-                st.info(f"Starting pipeline **{p['name']}**… (execution wiring will be added next)")
+                # =================================================================================================
+                # Pipeline executor helpers (drop under the "Pipeline execution wiring" section)
+                # - Works with Weaviate v4 (preferred) and v3 as a fallback
+                # - Minimal text parsing / chunking / embedding
+                # - Includes a small built-in ConnectorHub with Azure Blob support
+                # =================================================================================================
+                from typing import Optional, Sequence, Iterable
+                import hashlib
+                from urllib.parse import urlparse
+                from dataclasses import dataclass
+                
+                # ---- Detect Weaviate client generation (v4 vs v3) ----
+                _V4_AVAILABLE = False
+                _V3_AVAILABLE = False
+                try:
+                    # v4 style imports
+                    from weaviate import connect_to_wcs, connect_to_custom
+                    from weaviate.classes.init import Auth as _WvAuth
+                    _V4_AVAILABLE = True
+                except Exception:
+                    pass
+                
+                try:
+                    # v3 client (classic)
+                    import weaviate as _wv3
+                    _V3_AVAILABLE = hasattr(_wv3, "Client")
+                except Exception:
+                    pass
+                
+                # Public flag used later in your code
+                V4 = _V4_AVAILABLE
+                
+                # ---------------------------------------------------------------------------------
+                # Weaviate client factory
+                # ---------------------------------------------------------------------------------
+                def make_weaviate_client(url_or_cluster: str, api_key: Optional[str] = None):
+                    """
+                    Returns a connected Weaviate client.
+                    - v4: connect_to_wcs (if value looks like a cluster URL), else connect_to_custom (host/port/secure).
+                    - v3: weaviate.Client(base_url, auth_client_secret=...)
+                    """
+                    if not url_or_cluster:
+                        raise ValueError("Weaviate URL/cluster is required.")
+                
+                    # ---- v4 path (preferred) ----
+                    if _V4_AVAILABLE:
+                        auth = _WvAuth.api_key(api_key) if api_key else None
+                        raw = url_or_cluster.strip()
+                        # If it's a full http(s) URL, go custom; otherwise treat it as a WCS cluster URL.
+                        if raw.startswith("http://") or raw.startswith("https://"):
+                            u = urlparse(raw)
+                            if not u.hostname:
+                                raise ValueError(f"Invalid URL: {raw}")
+                            http_secure = (u.scheme == "https")
+                            http_port = u.port or (443 if http_secure else 80)
+                            return connect_to_custom(
+                                http_host=u.hostname,
+                                http_port=http_port,
+                                http_secure=http_secure,
+                                auth_credentials=auth,
+                            )
+                        else:
+                            return connect_to_wcs(cluster_url=raw, auth_credentials=auth)
+                
+                    # ---- v3 fallback ----
+                    if _V3_AVAILABLE:
+                        base = url_or_cluster
+                        if not base.startswith("http"):
+                            base = f"http://{base}"
+                        if api_key:
+                            from weaviate.auth import AuthApiKey as _AuthApiKey
+                            return _wv3.Client(base, auth_client_secret=_AuthApiKey(api_key=api_key))
+                        return _wv3.Client(base)
+                
+                    raise RuntimeError("weaviate-client is not installed. `pip install 'weaviate-client>=4,<5'` is recommended.")
+                
+                # ---------------------------------------------------------------------------------
+                # Ensure collection / class exists
+                # ---------------------------------------------------------------------------------
+                def ensure_collection(client, class_name: str, tenancy: Optional[str] = None) -> None:
+                    """
+                    Creates the collection/class if missing with a minimal schema:
+                      doc_id (text), source (text), chunk_index (int), text (text)
+                    """
+                    try:
+                        if _V4_AVAILABLE:
+                            # Try get; create if it fails.
+                            try:
+                                _ = client.collections.get(class_name, tenant=tenancy)
+                                return
+                            except Exception:
+                                from weaviate.classes.config import Property, DataType, Configure
+                                client.collections.create(
+                                    name=class_name,
+                                    properties=[
+                                        Property(name="doc_id", data_type=DataType.TEXT),
+                                        Property(name="source", data_type=DataType.TEXT),
+                                        Property(name="chunk_index", data_type=DataType.INT),
+                                        Property(name="text", data_type=DataType.TEXT),
+                                    ],
+                                    vectorizer_config=Configure.Vectorizer.none(),  # external embeddings
+                                )
+                                return
+                        else:
+                            # v3 schema
+                            schema = client.schema.get()
+                            classes = {c["class"] for c in schema.get("classes", [])}
+                            if class_name in classes:
+                                return
+                            class_obj = {
+                                "class": class_name,
+                                "vectorizer": "none",
+                                "properties": [
+                                    {"name": "doc_id", "dataType": ["text"]},
+                                    {"name": "source", "dataType": ["text"]},
+                                    {"name": "chunk_index", "dataType": ["int"]},
+                                    {"name": "text", "dataType": ["text"]},
+                                ],
+                            }
+                            client.schema.create_class(class_obj)
+                    except Exception as e:
+                        raise RuntimeError(f"Failed to ensure collection '{class_name}': {e}")
+                
+                # ---------------------------------------------------------------------------------
+                # Simple file-to-text reader (minimal formats)
+                # ---------------------------------------------------------------------------------
+                def guess_and_read_path(name: str, local_path: str, size_bytes: int, tmp_dir: Path) -> str:
+                    """
+                    Very small, dependency-light extractor:
+                    - .txt/.md/.csv/.json → utf-8 text
+                    - everything else → best-effort utf-8 decode
+                    """
+                    try:
+                        p = Path(local_path)
+                        ext = p.suffix.lower()
+                        if ext in {".txt", ".md", ".csv", ".json", ".log"}:
+                            return p.read_text(encoding="utf-8", errors="ignore")
+                        # best-effort fallback
+                        return p.read_bytes().decode("utf-8", errors="ignore")
+                    except Exception as e:
+                        raise RuntimeError(f"read error: {e}")
+                
+                # ---------------------------------------------------------------------------------
+                # Minimal text splitter compatible with your usage
+                # ---------------------------------------------------------------------------------
+                class RecursiveCharacterTextSplitter:
+                    def __init__(self, chunk_size: int = 1000, chunk_overlap: int = 150, separators: Optional[Sequence[str]] = None):
+                        self.chunk_size = max(1, int(chunk_size))
+                        self.chunk_overlap = max(0, int(chunk_overlap))
+                        self.separators = separators or ["\n\n", "\n", ". ", " ", ""]
+                
+                    def split_text(self, text: str) -> List[str]:
+                        if not text:
+                            return []
+                        chunks: List[str] = []
+                        step = max(1, self.chunk_size - self.chunk_overlap)
+                        for i in range(0, len(text), step):
+                            chunk = text[i:i + self.chunk_size]
+                            if not chunk:
+                                break
+                            chunks.append(chunk)
+                        return chunks
+                
+                # ---------------------------------------------------------------------------------
+                # Hash helper
+                # ---------------------------------------------------------------------------------
+                def _hash(s: str) -> str:
+                    return hashlib.md5(s.encode("utf-8")).hexdigest()
+                
+                # ---------------------------------------------------------------------------------
+                # Embeddings (Sentence-Transformers)
+                # ---------------------------------------------------------------------------------
+                def embed_texts(texts: List[str], model_name: str = "sentence-transformers/all-MiniLM-L6-v2") -> List[List[float]]:
+                    try:
+                        from sentence_transformers import SentenceTransformer
+                    except ModuleNotFoundError as e:
+                        raise RuntimeError(
+                            "Embedding model not available. Install: pip install sentence-transformers"
+                        ) from e
+                
+                    # Cache the model across Streamlit reruns
+                    cache_key = f"_emb_model::{model_name}"
+                    if cache_key not in st.session_state:
+                        st.session_state[cache_key] = SentenceTransformer(model_name)
+                    model = st.session_state[cache_key]
+                
+                    vecs = model.encode(texts, show_progress_bar=False, normalize_embeddings=True)
+                    return [v.tolist() for v in vecs]
+                
+                # ---------------------------------------------------------------------------------
+                # Upsert chunks (v4 / v3)
+                # ---------------------------------------------------------------------------------
+                def upsert_chunks(client, class_name: str, items: List[Dict[str, Any]], vectors: List[List[float]],
+                                  tenancy: Optional[str] = None) -> int:
+                    """
+                    Inserts objects + vectors in a single batch.
+                    Returns the number of successfully upserted chunks.
+                    """
+                    if not items:
+                        return 0
+                
+                    try:
+                        if _V4_AVAILABLE:
+                            col = client.collections.get(class_name, tenant=tenancy)
+                            # v4 supports vectors in insert_many
+                            payload = [{"id": it["id"], **it["properties"]} for it in items]
+                            try:
+                                # new API (>=4.6) — vectors passed as list aligned with payload
+                                col.data.insert_many(objects=payload, vectors=vectors)
+                            except TypeError:
+                                # older API: embed vectors inside each object
+                                payload2 = [{"id": it["id"], "properties": it["properties"], "vector": vec}
+                                            for it, vec in zip(items, vectors)]
+                                col.data.insert_many(payload2)
+                            return len(items)
+                        else:
+                            # v3 path: use batched add_data_object
+                            with client.batch as b:
+                                b.batch_size = 64
+                                for it, vec in zip(items, vectors):
+                                    b.add_data_object(
+                                        data_object=it["properties"],
+                                        class_name=class_name,
+                                        uuid=it["id"],
+                                        vector=vec,
+                                    )
+                            return len(items)
+                    except Exception as e:
+                        raise RuntimeError(f"Upsert failed: {e}")
+                
+                # ---------------------------------------------------------------------------------
+                # Built-in ConnectorHub (minimal) — supports Azure Blob and Local Folder
+                # ---------------------------------------------------------------------------------
+                @dataclass
+                class Asset:
+                    name: str
+                    local_path: str
+                    size_bytes: int
+                
+                class ConnectorHub:
+                    """
+                    Minimal in-file ConnectorHub so the app runs even when an external module
+                    isn't present. Currently supports:
+                      - kind = 'azureblob' with one of:
+                          * connection_string
+                          * sas_url (container SAS)
+                          * account_name + account_key
+                        plus an optional 'prefix' like:  "mycontainer/sub/folder"
+                      - kind = 'local' with 'path' (directory) and optional 'prefix'
+                    """
+                    def __init__(self, cache_root: Path, state_root: Path, configs: List[Dict[str, Any]]):
+                        self.cache_root = Path(cache_root)
+                        self.state_root = Path(state_root)
+                        self.cfg = (configs or [{}])[0]  # we support one source for now
+                        self.kind = (self.cfg.get("kind") or "").lower().strip()
+                        self.prefix = (self.cfg.get("prefix") or "").strip().strip("/")
+                        self.max_bytes = int(self.cfg.get("max_bytes") or 50 * 1024 * 1024)
+                        self.cache_root.mkdir(parents=True, exist_ok=True)
+                
+                    # --------- Public API expected by your runner ----------
+                    def count(self) -> Optional[int]:
+                        if self.kind == "azureblob":
+                            try:
+                                bls = list(self._azure_list_blobs(limit=5000, names_only=True))
+                                return len(bls)
+                            except Exception:
+                                return None
+                        if self.kind == "local":
+                            try:
+                                base = Path(self.cfg.get("path") or ".")
+                                files = [p for p in base.rglob("*") if p.is_file()]
+                                return len(files)
+                            except Exception:
+                                return None
+                        return None
+                
+                    def stream(self) -> Iterable[Asset]:
+                        if self.kind == "azureblob":
+                            yield from self._stream_azureblob()
+                        elif self.kind == "local":
+                            yield from self._stream_local()
+                        else:
+                            raise RuntimeError(f"Unsupported connector kind: {self.kind}")
+                
+                    # --------- Azure Blob implementation ----------
+                    def _get_blob_service(self):
+                        from azure.storage.blob import BlobServiceClient
+                        if self.cfg.get("connection_string"):
+                            return BlobServiceClient.from_connection_string(self.cfg["connection_string"])
+                        if self.cfg.get("sas_url"):
+                            # sas_url like https://account.blob.core.windows.net/container?sv=...
+                            return BlobServiceClient(account_url=self.cfg["sas_url"].split("?", 1)[0],
+                                                     credential=self.cfg["sas_url"])
+                        if self.cfg.get("account_name") and self.cfg.get("account_key"):
+                            url = f"https://{self.cfg['account_name']}.blob.core.windows.net"
+                            return BlobServiceClient(account_url=url, credential=self.cfg["account_key"])
+                        raise RuntimeError("Azure Blob profile missing credentials: provide connection_string OR sas_url OR account_name+account_key.")
+                
+                    def _split_prefix(self):
+                        """
+                        Returns container, subpath from prefix like 'container/a/b' or just 'container'.
+                        """
+                        if not self.prefix:
+                            raise RuntimeError("Azure Blob requires a prefix like 'container[/optional/path]'.")
+                        parts = self.prefix.split("/", 1)
+                        container = parts[0]
+                        sub = parts[1] if len(parts) > 1 else ""
+                        return container, sub
+                
+                    def _azure_list_blobs(self, limit: Optional[int] = None, names_only: bool = False):
+                        svc = self._get_blob_service()
+                        container, sub = self._split_prefix()
+                        cont = svc.get_container_client(container)
+                        n = 0
+                        for blob in cont.list_blobs(name_starts_with=sub or None):
+                            if limit is not None and n >= limit:
+                                break
+                            n += 1
+                            if names_only:
+                                yield blob.name
+                            else:
+                                yield blob
+                
+                    def _stream_azureblob(self) -> Iterable[Asset]:
+                        from azure.storage.blob import BlobClient
+                        svc = self._get_blob_service()
+                        container, sub = self._split_prefix()
+                        cont = svc.get_container_client(container)
+                
+                        for blob in cont.list_blobs(name_starts_with=sub or None):
+                            size = int(getattr(blob, "size", 0) or 0)
+                            if self.max_bytes and size > self.max_bytes:
+                                continue
+                            # download to cache
+                            safe_name = blob.name.replace("/", "__")
+                            dest = self.cache_root / f"az_{container}__{safe_name}"
+                            if not dest.exists():
+                                bc: BlobClient = cont.get_blob_client(blob)
+                                with open(dest, "wb") as f:
+                                    stream = bc.download_blob()
+                                    f.write(stream.readall())
+                            yield Asset(name=f"az://{container}/{blob.name}", local_path=str(dest), size_bytes=size)
+                
+                    # --------- Local folder implementation ----------
+                    def _stream_local(self) -> Iterable[Asset]:
+                        base = Path(self.cfg.get("path") or ".")
+                        sub = self.prefix or ""
+                        root = (base / sub) if sub else base
+                        if not root.exists():
+                            raise RuntimeError(f"Local path not found: {root}")
+                        for p in root.rglob("*"):
+                            if not p.is_file():
+                                continue
+                            size = p.stat().st_size
+                            if self.max_bytes and size > self.max_bytes:
+                                continue
+                            yield Asset(name=str(p.relative_to(base)), local_path=str(p), size_bytes=size)
+
 
             # Edit / Delete
             e_col, d_col = c5.columns([1, 1])
@@ -2043,4 +2043,12 @@ with st.container(border=True):
 
     st.markdown("</div>", unsafe_allow_html=True)
 # =================================================================================================
+
+
+
+
+
+
+
+
 
