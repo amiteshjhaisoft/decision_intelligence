@@ -1686,3 +1686,197 @@ with st.container(border=True):
 
     st.markdown("</div>", unsafe_allow_html=True)
 # =================================================================================================
+# =================================================================================================
+# Pipeline execution wiring
+#   - Resolves source/destination profiles
+#   - Streams assets via ConnectorHub
+#   - Parses → chunks → embeds → upserts to Weaviate
+# =================================================================================================
+
+from pathlib import Path
+import tempfile
+from typing import Iterable, Dict, Any, List
+
+# If you've placed connector_hub.py next to this app:
+from connector_hub import ConnectorHub
+
+# ---------- Helpers to resolve connection profiles ----------
+def _get_profile(connector_id: str, profile_name: str) -> Dict[str, Any]:
+    store = _load_profiles_store()
+    profiles = store.get(connector_id, {}) or {}
+    prof = profiles.get(profile_name or "", {}) or {}
+    if not prof:
+        raise RuntimeError(f"Profile '{profile_name}' not found for connector '{connector_id}'.")
+    return prof
+
+def _make_weaviate_from_profile(dest_profile: Dict[str, Any]):
+    # Expected keys: url, api_key (optional), tenancy (optional)
+    url = dest_profile.get("url") or dest_profile.get("cluster_url") or ""
+    if not url:
+        raise RuntimeError("Weaviate profile is missing 'url'.")
+    api_key = dest_profile.get("api_key") or None
+    tenancy = dest_profile.get("tenancy") or None
+    client = make_weaviate_client(url, api_key)
+    ensure_collection(client, class_name=pipeline["collection"], tenancy=tenancy)
+    return client, tenancy
+
+# ---------- Core runner ----------
+def _run_pipeline(pipeline: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Execute a single pipeline dict from pipelines.json.
+    Returns a summary stats dict.
+    """
+    # 1) Resolve source + destination profiles
+    src_prof = _get_profile(pipeline["source_connector"], pipeline["source_profile"])
+    dst_prof = _get_profile("weaviate", pipeline["destination_profile"])
+
+    # 2) Build ConnectorHub with one source (extendable later)
+    cache_root = Path(tempfile.gettempdir()) / "kb_connectors_cache"
+    state_root = Path(tempfile.gettempdir()) / "kb_connectors_state"
+    connector_cfg: Dict[str, Any] = {"kind": pipeline["source_connector"]}
+
+    # Pass through all keys from the saved profile (so profiles can be flexible)
+    connector_cfg.update(src_prof)
+
+    # Reasonable fallbacks for common fields
+    connector_cfg.setdefault("prefix", src_prof.get("prefix", ""))
+    connector_cfg.setdefault("max_bytes", 50 * 1024 * 1024)
+
+    hub = ConnectorHub(cache_root, state_root, configs=[connector_cfg])
+
+    # 3) Destination client
+    w_client, tenancy = _make_weaviate_from_profile(dst_prof)
+
+    # 4) Execution knobs
+    chunk_size    = int(pipeline.get("chunk_size", 1000))
+    chunk_overlap = int(pipeline.get("chunk_overlap", 150))
+    max_docs      = int(pipeline.get("max_docs", 50))
+    collection    = pipeline.get("collection") or "Documents"
+
+    # 5) Temp dirs
+    tmp_dir = Path(tempfile.gettempdir()) / "kb_tmp_pipeline"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+
+    # Stats
+    processed_files = 0
+    processed_chunks = 0
+    skipped_files = 0
+    errors: List[str] = []
+
+    # 6) Stream, parse, chunk, embed, upsert
+    col = w_client.collections.get(collection, tenant=tenancy) if (V4 and tenancy) else w_client.collections.get(collection)
+
+    with st.status(f"Starting pipeline **{pipeline['name']}**", expanded=True) as status:
+        for asset in hub.stream():
+            if processed_files >= max_docs:
+                st.write(f"⏹️ Reached max_docs={max_docs}, stopping.")
+                break
+            try:
+                txt = guess_and_read_path(asset.name, asset.local_path, asset.size_bytes, tmp_dir).strip()
+                if not txt:
+                    st.write(f"⚠️ No extractable text: {asset.name}")
+                    skipped_files += 1
+                    continue
+
+                # Chunk with pipeline knobs
+                chunks_raw = RecursiveCharacterTextSplitter(
+                    chunk_size=chunk_size, chunk_overlap=chunk_overlap,
+                    separators=["\n\n", "\n", ". ", " ", ""]
+                ).split_text(txt)
+
+                if not chunks_raw:
+                    st.write(f"⚠️ No chunks produced: {asset.name}")
+                    skipped_files += 1
+                    continue
+
+                # Prefix each chunk with filename to help retrieval, then embed
+                doc_id = _hash(asset.name)
+                chunks = [f"FILE: {asset.name}\n{ch}" for ch in chunks_raw]
+                vecs = embed_texts(chunks)
+
+                # Batch upsert (v4/v3 handled by upsert_chunks)
+                items = []
+                for i, (ch, vec) in enumerate(zip(chunks, vecs)):
+                    items.append({
+                        "id": _hash(f"{doc_id}:{i}"),
+                        "properties": {
+                            "doc_id": doc_id,
+                            "source": asset.name,
+                            "chunk_index": i,
+                            "text": ch,
+                        },
+                    })
+
+                upserted = upsert_chunks(w_client, collection, items, vecs, tenancy=tenancy)
+                st.write(f"📄 {asset.name} → {upserted} chunks")
+                processed_chunks += upserted
+                processed_files += 1
+
+            except Exception as e:
+                err = f"{asset.name}: {e}"
+                errors.append(err)
+                st.write(f"❌ {err}")
+
+        status.update(
+            label=f"Finished pipeline **{pipeline['name']}**",
+            state="complete"
+        )
+
+    # 7) Close client (v4)
+    if V4:
+        try:
+            w_client.close()
+        except Exception:
+            pass
+
+    return {
+        "files": processed_files,
+        "chunks": processed_chunks,
+        "skipped": skipped_files,
+        "errors": errors,
+    }
+
+# ---------- Hook the “Run” buttons ----------
+for pid in sorted(pipelines.keys(), key=lambda x: pipelines[x]["name"].lower()):
+    p = pipelines[pid]
+    c1, c2, c3, c4, c5 = st.columns([4, 3, 2, 1, 2])
+    c1.markdown(f"**{p['name']}**")
+    src_meta = REG_BY_ID.get(p["source_connector"])
+    src_label = f"{(src_meta.icon + ' ' + src_meta.name) if src_meta else p['source_connector']} `{p['source_profile']}`"
+    dst_label = f"🧠 Weaviate `{p['destination_profile']}`"
+    c2.markdown(f"{src_label} → {dst_label}")
+    c3.markdown(f"`{p['collection']}`")
+
+    # Replace the old stub with a real run
+    if c4.button("▶️", key=f"run::{pid}", help="Run this pipeline now"):
+        try:
+            summary = _run_pipeline(p)
+            st.success(
+                f"✅ Pipeline **{p['name']}** complete — files: {summary['files']}, "
+                f"chunks: {summary['chunks']}, skipped: {summary['skipped']}."
+            )
+            if summary["errors"]:
+                with st.expander("View errors"):
+                    for e in summary["errors"]:
+                        st.write(f"- {e}")
+        except Exception as e:
+            st.error(f"Pipeline failed: {e}")
+
+    # Edit / Delete remain unchanged...
+    e_col, d_col = c5.columns([1, 1])
+    if e_col.button("📝", key=f"edit_pipe::{pid}", help="Edit"):
+        st.session_state["editing_pipeline_id"] = pid
+        st.session_state["pipeline_form_open"] = True
+        st.rerun()
+
+    if d_col.button("🗑️", key=f"delete_pipe::{pid}", help="Delete"):
+        try:
+            allp = _pipelines_load_all()
+            if pid in allp:
+                del allp[pid]
+                _pipelines_save_all(allp)
+                st.success(f"Deleted pipeline **{p['name']}**.")
+                st.rerun()
+        except Exception as e:
+            st.error(f"Failed to delete: {e}")
+
