@@ -1353,8 +1353,8 @@ with main_left:
         h1.markdown('<div class="rowhead">Connector</div>', unsafe_allow_html=True)
         h2.markdown('<div class="rowhead">Profile</div>', unsafe_allow_html=True)
         h3.markdown('<div class="rowhead">Status</div>', unsafe_allow_html=True)
-        h4.markdown('<div class="rowhead">Edit</div>', unsafe_allow_html=True)
-        h5.markdown('<div class="rowhead">Delete</div>', unsafe_allow_html=True)
+        h4.markdown('<div class="rowhead"></div>', unsafe_allow_html=True)
+        h5.markdown('<div class="rowhead"></div>', unsafe_allow_html=True)
 
         # Sorted display
         for cid in sorted(all_profiles.keys(), key=lambda c: (REG_BY_ID.get(c).name if REG_BY_ID.get(c) else c).lower()):
