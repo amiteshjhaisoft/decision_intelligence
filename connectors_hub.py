@@ -1710,15 +1710,18 @@ def _get_profile(connector_id: str, profile_name: str) -> Dict[str, Any]:
     return prof
 
 def _make_weaviate_from_profile(dest_profile: Dict[str, Any]):
-    # Expected keys: url, api_key (optional), tenancy (optional)
+    """
+    Build a Weaviate client from a saved profile. Call ensure_collection()
+    later, when you actually know the target collection name.
+    """
     url = dest_profile.get("url") or dest_profile.get("cluster_url") or ""
     if not url:
         raise RuntimeError("Weaviate profile is missing 'url'.")
     api_key = dest_profile.get("api_key") or None
     tenancy = dest_profile.get("tenancy") or None
     client = make_weaviate_client(url, api_key)
-    ensure_collection(client, class_name=pipeline["collection"], tenancy=tenancy)
     return client, tenancy
+
 
 # ---------- Core runner ----------
 def _run_pipeline(pipeline: Dict[str, Any]) -> Dict[str, Any]:
@@ -1726,22 +1729,31 @@ def _run_pipeline(pipeline: Dict[str, Any]) -> Dict[str, Any]:
     Execute a single pipeline dict from pipelines.json.
     Returns a summary stats dict.
     """
-    # 1) Resolve source + destination profiles
-    src_prof = _get_profile(pipeline["source_connector"], pipeline["source_profile"])
-    dst_prof = _get_profile("weaviate", pipeline["destination_profile"])
+    # 1) Resolve source + destination profiles (defensive)
+    src_conn_id = pipeline.get("source_connector") or ""
+    src_prof_id = pipeline.get("source_profile") or ""
+    dst_prof_id = pipeline.get("destination_profile") or ""
+    collection  = (pipeline.get("collection") or "Documents").strip()
+
+    if not src_conn_id or not src_prof_id:
+        raise RuntimeError("Pipeline is missing source connector/profile.")
+    if not dst_prof_id:
+        raise RuntimeError("Pipeline is missing Weaviate destination profile.")
+    if not collection:
+        raise RuntimeError("Collection name is empty.")
+
+    src_prof = _get_profile(src_conn_id, src_prof_id)
+    dst_prof = _get_profile("weaviate", dst_prof_id)
 
     # 2) Build ConnectorHub with one source (extendable later)
     cache_root = Path(tempfile.gettempdir()) / "kb_connectors_cache"
     state_root = Path(tempfile.gettempdir()) / "kb_connectors_state"
-    connector_cfg: Dict[str, Any] = {"kind": pipeline["source_connector"]}
-
-    # Pass through all keys from the saved profile (so profiles can be flexible)
-    connector_cfg.update(src_prof)
-
-    # Reasonable fallbacks for common fields
+    connector_cfg: Dict[str, Any] = {"kind": src_conn_id}
+    connector_cfg.update(src_prof)                            # pass saved profile fields through
     connector_cfg.setdefault("prefix", src_prof.get("prefix", ""))
-    connector_cfg.setdefault("max_bytes", 50 * 1024 * 1024)
+    connector_cfg.setdefault("max_bytes", 50 * 1024 * 1024)   # 50MB default guard
 
+    # NOTE: If ConnectorHub lives in this same file, do NOT import it elsewhere.
     hub = ConnectorHub(cache_root, state_root, configs=[connector_cfg])
 
     # 3) Destination client
@@ -1751,78 +1763,90 @@ def _run_pipeline(pipeline: Dict[str, Any]) -> Dict[str, Any]:
     chunk_size    = int(pipeline.get("chunk_size", 1000))
     chunk_overlap = int(pipeline.get("chunk_overlap", 150))
     max_docs      = int(pipeline.get("max_docs", 50))
-    collection    = pipeline.get("collection") or "Documents"
 
-    # 5) Temp dirs
+    # 5) Ensure collection exists now that we know its name
+    ensure_collection(w_client, class_name=collection, tenancy=tenancy)
+
+    # 6) Temps + stats
     tmp_dir = Path(tempfile.gettempdir()) / "kb_tmp_pipeline"
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
-    # Stats
-    processed_files = 0
-    processed_chunks = 0
-    skipped_files = 0
+    processed_files   = 0
+    processed_chunks  = 0
+    skipped_files     = 0
     errors: List[str] = []
 
-    # 6) Stream, parse, chunk, embed, upsert
-    col = w_client.collections.get(collection, tenant=tenancy) if (V4 and tenancy) else w_client.collections.get(collection)
+    # 7) Stream, parse, chunk, embed, upsert
+    with st.status(f"Starting pipeline **{pipeline.get('name','(unnamed)')}**", expanded=True) as status:
+        # Optional total estimate if the hub exposes it
+        try:
+            total_estimate = getattr(hub, "count", None)()  # some hubs implement count()
+        except Exception:
+            total_estimate = None
 
-    with st.status(f"Starting pipeline **{pipeline['name']}**", expanded=True) as status:
+        prog = st.progress(0.0) if isinstance(total_estimate, int) and total_estimate > 0 else None
+        seen = 0
+
         for asset in hub.stream():
             if processed_files >= max_docs:
                 st.write(f"⏹️ Reached max_docs={max_docs}, stopping.")
                 break
+
             try:
                 txt = guess_and_read_path(asset.name, asset.local_path, asset.size_bytes, tmp_dir).strip()
                 if not txt:
                     st.write(f"⚠️ No extractable text: {asset.name}")
                     skipped_files += 1
-                    continue
+                else:
+                    # Chunk with pipeline knobs
+                    chunks_raw = RecursiveCharacterTextSplitter(
+                        chunk_size=chunk_size, chunk_overlap=chunk_overlap,
+                        separators=["\n\n", "\n", ". ", " ", ""]
+                    ).split_text(txt)
 
-                # Chunk with pipeline knobs
-                chunks_raw = RecursiveCharacterTextSplitter(
-                    chunk_size=chunk_size, chunk_overlap=chunk_overlap,
-                    separators=["\n\n", "\n", ". ", " ", ""]
-                ).split_text(txt)
+                    if not chunks_raw:
+                        st.write(f"⚠️ No chunks produced: {asset.name}")
+                        skipped_files += 1
+                    else:
+                        # Prefix each chunk with filename to help retrieval, then embed
+                        doc_id = _hash(asset.name)
+                        chunks = [f"FILE: {asset.name}\n{ch}" for ch in chunks_raw]
+                        vecs   = embed_texts(chunks)
 
-                if not chunks_raw:
-                    st.write(f"⚠️ No chunks produced: {asset.name}")
-                    skipped_files += 1
-                    continue
+                        # Batch upsert (v4/v3 handled by upsert_chunks)
+                        items = []
+                        for i, ch in enumerate(chunks):
+                            items.append({
+                                "id": _hash(f"{doc_id}:{i}"),
+                                "properties": {
+                                    "doc_id": doc_id,
+                                    "source": asset.name,
+                                    "chunk_index": i,
+                                    "text": ch,
+                                },
+                            })
 
-                # Prefix each chunk with filename to help retrieval, then embed
-                doc_id = _hash(asset.name)
-                chunks = [f"FILE: {asset.name}\n{ch}" for ch in chunks_raw]
-                vecs = embed_texts(chunks)
-
-                # Batch upsert (v4/v3 handled by upsert_chunks)
-                items = []
-                for i, (ch, vec) in enumerate(zip(chunks, vecs)):
-                    items.append({
-                        "id": _hash(f"{doc_id}:{i}"),
-                        "properties": {
-                            "doc_id": doc_id,
-                            "source": asset.name,
-                            "chunk_index": i,
-                            "text": ch,
-                        },
-                    })
-
-                upserted = upsert_chunks(w_client, collection, items, vecs, tenancy=tenancy)
-                st.write(f"📄 {asset.name} → {upserted} chunks")
-                processed_chunks += upserted
-                processed_files += 1
+                        upserted = upsert_chunks(w_client, collection, items, vecs, tenancy=tenancy)
+                        st.write(f"📄 {asset.name} → {upserted} chunks")
+                        processed_chunks += upserted
+                        processed_files  += 1
 
             except Exception as e:
-                err = f"{asset.name}: {e}"
+                err = f"{getattr(asset, 'name', '(unknown)')}: {e}"
                 errors.append(err)
                 st.write(f"❌ {err}")
 
+            # Update progress if we know a total
+            seen += 1
+            if prog is not None and total_estimate:
+                prog.progress(min(1.0, seen / float(total_estimate)))
+
         status.update(
-            label=f"Finished pipeline **{pipeline['name']}**",
+            label=f"Finished pipeline **{pipeline.get('name','(unnamed)')}**",
             state="complete"
         )
 
-    # 7) Close client (v4)
+    # 8) Close client (v4)
     if V4:
         try:
             w_client.close()
@@ -1836,24 +1860,29 @@ def _run_pipeline(pipeline: Dict[str, Any]) -> Dict[str, Any]:
         "errors": errors,
     }
 
+
 # ---------- Hook the “Run” buttons ----------
 for pid in sorted(pipelines.keys(), key=lambda x: pipelines[x]["name"].lower()):
     p = pipelines[pid]
     c1, c2, c3, c4, c5 = st.columns([4, 3, 2, 1, 2])
+
     c1.markdown(f"**{p['name']}**")
-    src_meta = REG_BY_ID.get(p["source_connector"])
+
+    # Guard registry usage (won't crash if REG_BY_ID isn't present)
+    src_meta = REG_BY_ID.get(p["source_connector"]) if 'REG_BY_ID' in globals() else None
     src_label = f"{(src_meta.icon + ' ' + src_meta.name) if src_meta else p['source_connector']} `{p['source_profile']}`"
     dst_label = f"🧠 Weaviate `{p['destination_profile']}`"
+
     c2.markdown(f"{src_label} → {dst_label}")
     c3.markdown(f"`{p['collection']}`")
 
-    # Replace the old stub with a real run
+    # Manual Run (real)
     if c4.button("▶️", key=f"run::{pid}", help="Run this pipeline now"):
         try:
             summary = _run_pipeline(p)
             st.success(
-                f"✅ Pipeline **{p['name']}** complete — files: {summary['files']}, "
-                f"chunks: {summary['chunks']}, skipped: {summary['skipped']}."
+                f"✅ Pipeline **{p['name']}** complete — "
+                f"files: {summary['files']}, chunks: {summary['chunks']}, skipped: {summary['skipped']}."
             )
             if summary["errors"]:
                 with st.expander("View errors"):
@@ -1879,4 +1908,3 @@ for pid in sorted(pipelines.keys(), key=lambda x: pipelines[x]["name"].lower()):
                 st.rerun()
         except Exception as e:
             st.error(f"Failed to delete: {e}")
-
