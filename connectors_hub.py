@@ -1722,8 +1722,7 @@ def _make_weaviate_from_profile(dest_profile: Dict[str, Any]):
     client = make_weaviate_client(url, api_key)
     return client, tenancy
 
-
-# ---------- Core runner ----------
+# ---------- Core runner (unchanged) ----------
 def _run_pipeline(pipeline: Dict[str, Any]) -> Dict[str, Any]:
     """
     Execute a single pipeline dict from pipelines.json.
@@ -1749,11 +1748,10 @@ def _run_pipeline(pipeline: Dict[str, Any]) -> Dict[str, Any]:
     cache_root = Path(tempfile.gettempdir()) / "kb_connectors_cache"
     state_root = Path(tempfile.gettempdir()) / "kb_connectors_state"
     connector_cfg: Dict[str, Any] = {"kind": src_conn_id}
-    connector_cfg.update(src_prof)                            # pass saved profile fields through
+    connector_cfg.update(src_prof)
     connector_cfg.setdefault("prefix", src_prof.get("prefix", ""))
-    connector_cfg.setdefault("max_bytes", 50 * 1024 * 1024)   # 50MB default guard
+    connector_cfg.setdefault("max_bytes", 50 * 1024 * 1024)
 
-    # NOTE: If ConnectorHub lives in this same file, do NOT import it elsewhere.
     hub = ConnectorHub(cache_root, state_root, configs=[connector_cfg])
 
     # 3) Destination client
@@ -1764,7 +1762,7 @@ def _run_pipeline(pipeline: Dict[str, Any]) -> Dict[str, Any]:
     chunk_overlap = int(pipeline.get("chunk_overlap", 150))
     max_docs      = int(pipeline.get("max_docs", 50))
 
-    # 5) Ensure collection exists now that we know its name
+    # 5) Ensure collection exists
     ensure_collection(w_client, class_name=collection, tenancy=tenancy)
 
     # 6) Temps + stats
@@ -1778,9 +1776,8 @@ def _run_pipeline(pipeline: Dict[str, Any]) -> Dict[str, Any]:
 
     # 7) Stream, parse, chunk, embed, upsert
     with st.status(f"Starting pipeline **{pipeline.get('name','(unnamed)')}**", expanded=True) as status:
-        # Optional total estimate if the hub exposes it
         try:
-            total_estimate = getattr(hub, "count", None)()  # some hubs implement count()
+            total_estimate = getattr(hub, "count", None)()
         except Exception:
             total_estimate = None
 
@@ -1798,7 +1795,6 @@ def _run_pipeline(pipeline: Dict[str, Any]) -> Dict[str, Any]:
                     st.write(f"⚠️ No extractable text: {asset.name}")
                     skipped_files += 1
                 else:
-                    # Chunk with pipeline knobs
                     chunks_raw = RecursiveCharacterTextSplitter(
                         chunk_size=chunk_size, chunk_overlap=chunk_overlap,
                         separators=["\n\n", "\n", ". ", " ", ""]
@@ -1808,12 +1804,10 @@ def _run_pipeline(pipeline: Dict[str, Any]) -> Dict[str, Any]:
                         st.write(f"⚠️ No chunks produced: {asset.name}")
                         skipped_files += 1
                     else:
-                        # Prefix each chunk with filename to help retrieval, then embed
                         doc_id = _hash(asset.name)
                         chunks = [f"FILE: {asset.name}\n{ch}" for ch in chunks_raw]
                         vecs   = embed_texts(chunks)
 
-                        # Batch upsert (v4/v3 handled by upsert_chunks)
                         items = []
                         for i, ch in enumerate(chunks):
                             items.append({
@@ -1836,7 +1830,6 @@ def _run_pipeline(pipeline: Dict[str, Any]) -> Dict[str, Any]:
                 errors.append(err)
                 st.write(f"❌ {err}")
 
-            # Update progress if we know a total
             seen += 1
             if prog is not None and total_estimate:
                 prog.progress(min(1.0, seen / float(total_estimate)))
@@ -1846,7 +1839,6 @@ def _run_pipeline(pipeline: Dict[str, Any]) -> Dict[str, Any]:
             state="complete"
         )
 
-    # 8) Close client (v4)
     if V4:
         try:
             w_client.close()
@@ -1861,14 +1853,21 @@ def _run_pipeline(pipeline: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-# ---------- Hook the “Run” buttons ----------
+# ---------- Hook the “Run” buttons (keys made unique to this section) ----------
+SECTION_TAG = "pipelines_exec_v1"  # change if you render another table elsewhere
+
+def _safe_key(s: str) -> str:
+    # sanitize to avoid collisions across different renders
+    return re.sub(r"[^a-zA-Z0-9_-]+", "_", str(s))
+
 for pid in sorted(pipelines.keys(), key=lambda x: pipelines[x]["name"].lower()):
     p = pipelines[pid]
+    row_key = _safe_key(pid)  # stable per pipeline
+
     c1, c2, c3, c4, c5 = st.columns([4, 3, 2, 1, 2])
 
     c1.markdown(f"**{p['name']}**")
 
-    # Guard registry usage (won't crash if REG_BY_ID isn't present)
     src_meta = REG_BY_ID.get(p["source_connector"]) if 'REG_BY_ID' in globals() else None
     src_label = f"{(src_meta.icon + ' ' + src_meta.name) if src_meta else p['source_connector']} `{p['source_profile']}`"
     dst_label = f"🧠 Weaviate `{p['destination_profile']}`"
@@ -1876,8 +1875,12 @@ for pid in sorted(pipelines.keys(), key=lambda x: pipelines[x]["name"].lower()):
     c2.markdown(f"{src_label} → {dst_label}")
     c3.markdown(f"`{p['collection']}`")
 
-    # Manual Run (real)
-    if c4.button("▶️", key=f"run::{pid}", help="Run this pipeline now"):
+    # Unique keys per section + pipeline
+    run_key   = f"run::{SECTION_TAG}::{row_key}"
+    edit_key  = f"edit_pipe::{SECTION_TAG}::{row_key}"
+    delete_key= f"delete_pipe::{SECTION_TAG}::{row_key}"
+
+    if c4.button("▶️", key=run_key, help="Run this pipeline now"):
         try:
             summary = _run_pipeline(p)
             st.success(
@@ -1891,14 +1894,13 @@ for pid in sorted(pipelines.keys(), key=lambda x: pipelines[x]["name"].lower()):
         except Exception as e:
             st.error(f"Pipeline failed: {e}")
 
-    # Edit / Delete remain unchanged...
     e_col, d_col = c5.columns([1, 1])
-    if e_col.button("📝", key=f"edit_pipe::{pid}", help="Edit"):
+    if e_col.button("📝", key=edit_key, help="Edit"):
         st.session_state["editing_pipeline_id"] = pid
         st.session_state["pipeline_form_open"] = True
         st.rerun()
 
-    if d_col.button("🗑️", key=f"delete_pipe::{pid}", help="Delete"):
+    if d_col.button("🗑️", key=delete_key, help="Delete"):
         try:
             allp = _pipelines_load_all()
             if pid in allp:
