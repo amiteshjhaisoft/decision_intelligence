@@ -1698,7 +1698,7 @@ import tempfile
 from typing import Iterable, Dict, Any, List
 
 # If you've placed connector_hub.py next to this app:
-from connector_hub import ConnectorHub
+# from connector_hub import ConnectorHub
 
 # ---------- Helpers to resolve connection profiles ----------
 def _get_profile(connector_id: str, profile_name: str) -> Dict[str, Any]:
