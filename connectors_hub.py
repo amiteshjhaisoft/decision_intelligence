@@ -1713,6 +1713,37 @@ except Exception:
         def count(self):
             return None
 
+# ---------------------------------------------------------------------------------
+# Weaviate client helper (used by _make_weaviate_from_profile)
+# ---------------------------------------------------------------------------------
+def make_weaviate_client(url: str, api_key: Optional[str] = None):
+    """
+    Create a Weaviate client that works for both local (no API key)
+    and hosted cluster deployments (with API key).
+    """
+    try:
+        import weaviate
+        from weaviate.classes.init import Auth
+    except ImportError as e:
+        raise RuntimeError("weaviate library not installed. Please `pip install weaviate-client`.") from e
+
+    if not url:
+        raise ValueError("Weaviate URL cannot be empty.")
+
+    # Normalize the URL
+    if not url.startswith("http"):
+        url = f"http://{url}"
+
+    # Auth (optional)
+    if api_key:
+        auth = Auth.api_key(api_key)
+        client = weaviate.Client(url, auth_client_secret=auth)
+    else:
+        client = weaviate.Client(url)
+
+    return client
+
+
 # ---------- Helpers to resolve connection profiles ----------
 def _get_profile(connector_id: str, profile_name: str) -> Dict[str, Any]:
     store = _load_profiles_store()
