@@ -1674,8 +1674,8 @@ with st.container():
         h1.markdown('<div class="rowhead">Name</div>', unsafe_allow_html=True)
         h2.markdown('<div class="rowhead">Source → Destination</div>', unsafe_allow_html=True)
         h3.markdown('<div class="rowhead">Collection</div>', unsafe_allow_html=True)
-        h4.markdown('<div class="rowhead">Run</div>', unsafe_allow_html=True)
-        h5.markdown('<div class="rowhead">Edit / Delete</div>', unsafe_allow_html=True)
+        h4.markdown('<div class="rowhead"></div>', unsafe_allow_html=True)
+        h5.markdown('<div class="rowhead"></div>', unsafe_allow_html=True)
 
         for pid in sorted(pipelines.keys(), key=lambda x: pipelines[x]["name"].lower()):
             p = pipelines[pid]
