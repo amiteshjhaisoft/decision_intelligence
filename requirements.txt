@@ -1,9 +1,21 @@
+# ---------- Core UI ----------
 streamlit
 anthropic
+
+# ---------- Cloud & Connectors ----------
 azure-storage-blob
 weaviate-client>=4,<5
+
+# ---------- Vector & Embeddings ----------
 sentence-transformers
 langchain-text-splitters
+
+# ---------- Document Parsing ----------
 pypdf
 python-docx
+
+# ---------- Data Handling ----------
 pandas
+
+# ---------- Secrets & Config ----------
+python-dotenv
