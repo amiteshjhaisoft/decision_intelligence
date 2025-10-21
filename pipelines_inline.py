@@ -4,7 +4,7 @@
 # - Uses existing connections.json and a new pipelines.json in the same folder.
 
 from __future__ import annotations
-import os, io, re, json, time, hashlib, threading
+import os, io, re, json, hashlib
 from pathlib import Path
 from typing import Dict, Any, Iterable, List, Tuple, Optional
 
@@ -13,9 +13,10 @@ APP_DIR = Path(__file__).parent
 CONN_STORE = APP_DIR / "connections.json"
 PIPE_STORE = APP_DIR / "pipelines.json"
 
-# ------------------------------ STORES (1) --------------------------------------
+# ------------------------------ STORES ------------------------------------------
 def _load_json(p: Path) -> Dict[str, Any]:
-    if not p.exists(): return {}
+    if not p.exists():
+        return {}
     try:
         return json.loads(p.read_text(encoding="utf-8"))
     except Exception:
@@ -36,8 +37,8 @@ def load_pipelines() -> Dict[str, Any]:
 def save_pipelines(d: Dict[str, Any]) -> None:
     _save_json(PIPE_STORE, d)
 
-# ------------------------------ RUNNER (2) --------------------------------------
-# Optional deps kept graceful:
+# ------------------------------ RUNNER ------------------------------------------
+# Optional deps (kept graceful)
 try:
     from azure.storage.blob import BlobServiceClient
 except Exception:
@@ -45,7 +46,13 @@ except Exception:
 
 try:
     import weaviate
-    from weaviate import connect_to_wcs, connect_to_custom
+    from weaviate import connect_to_custom
+    try:
+        # new API (preferred)
+        from weaviate import connect_to_weaviate_cloud as connect_to_wcs
+    except Exception:
+        # fallback for older client
+        from weaviate import connect_to_wcs
     from weaviate.classes.config import Property, DataType, Configure
     from weaviate.classes.init import Auth
 except Exception:
@@ -103,8 +110,10 @@ def _bytes_to_text(name: str, data: bytes) -> Optional[str]:
             with io.BytesIO(data) as f:
                 r = pypdf.PdfReader(f)
                 for page in r.pages:
-                    try: txt.append(page.extract_text() or "")
-                    except Exception: pass
+                    try:
+                        txt.append(page.extract_text() or "")
+                    except Exception:
+                        pass
             return "\n".join(txt).strip()
         if ext == ".docx":
             import docx2txt, tempfile
@@ -115,10 +124,7 @@ def _bytes_to_text(name: str, data: bytes) -> Optional[str]:
             import pandas as pd
             with io.BytesIO(data) as f:
                 xls = pd.read_excel(f, sheet_name=None, dtype=str)
-            return "\n\n".join(
-                f"[Sheet: {sn}]\n" + df.fillna("").to_csv(index=False)
-                for sn, df in xls.items()
-            )
+            return "\n\n".join(f"[Sheet: {sn}]\n" + df.fillna("").to_csv(index=False) for sn, df in xls.items())
     except Exception:
         return None
     return None
@@ -129,10 +135,7 @@ def _make_splitter(cfg: Dict[str, Any]):
     chunk_overlap = int(cfg.get("chunk_overlap") or 80)
     if method == "tokens":
         return TokenTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
-    return RecursiveCharacterTextSplitter(
-        chunk_size=chunk_size, chunk_overlap=chunk_overlap,
-        separators=["\n\n", "\n", " ", ""]
-    )
+    return RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap, separators=["\n\n", "\n", " ", ""])
 
 def _embedder(model_name: str):
     if SentenceTransformer is None:
@@ -152,30 +155,26 @@ def _weaviate_client(cfg: Dict[str, Any]):
     port = int(cfg.get("port") or (443 if scheme == "https" else 80))
     if not host:
         raise RuntimeError("Weaviate host is required when cluster_url not provided.")
-    return connect_to_custom(
-        http_host=host, http_port=port, http_secure=(scheme == "https"),
-        auth_credentials=auth
-    )
+    return connect_to_custom(http_host=host, http_port=port, http_secure=(scheme == "https"), auth_credentials=auth)
 
 def _ensure_collection(client, name: str, dims: int = 384, mt: bool=False):
-    # sanitize collection name for Weaviate
+    # sanitize collection name for Weaviate; and be robust to SDK variants
     import re as _re
     name = _re.sub(r"[^A-Za-z0-9_]", "_", name).strip("_") or "KB"
     try:
         existing = client.collections.list_all()
     except Exception:
         existing = []
-    # list_all() may return a list of strings or objects with .name
     names = set()
     for c in existing:
+        # list_all() may return strings or objects with .name
         try:
-            names.add(getattr(c, 'name', c))
+            names.add(getattr(c, "name", c))
         except Exception:
             pass
     if name in names:
         return client.collections.get(name)
     return client.collections.create(
-
         name,
         vectorizer_config=Configure.Vectorizer.none(dims=dims),
         properties=[
@@ -183,7 +182,7 @@ def _ensure_collection(client, name: str, dims: int = 384, mt: bool=False):
             Property(name="chunk",  data_type=DataType.TEXT),
             Property(name="path",   data_type=DataType.TEXT),
         ],
-        multi_tenancy_config=Configure.MultiTenancy(enabled=bool(mt))
+        multi_tenancy_config=Configure.MultiTenancy(enabled=bool(mt)),
     )
 
 def run_pipeline_dict(p: Dict[str, Any]) -> Dict[str, Any]:
@@ -201,46 +200,31 @@ def run_pipeline_dict(p: Dict[str, Any]) -> Dict[str, Any]:
     fetch_cfg = p.get("source", {})
     if src_id == "azureblob":
         items: Iterable[Tuple[str, bytes]] = _iter_azblob_files(
-            src_cfg,
-            fetch_cfg.get("container",""),
-            fetch_cfg.get("prefix",""),
-            fetch_cfg.get("pattern", r".*"),
+            src_cfg, fetch_cfg.get("container", ""), fetch_cfg.get("prefix", ""), fetch_cfg.get("pattern", r".*")
         )
     elif src_id == "localfs":
-        items = _iter_local_files(
-            fetch_cfg.get("root","./KB"),
-            fetch_cfg.get("pattern", r".*"),
-        )
+        items = _iter_local_files(fetch_cfg.get("root", "./KB"), fetch_cfg.get("pattern", r".*"))
     else:
         raise NotImplementedError(f"Source {src_id} not supported.")
 
     # 2) Chunk
-    chunk_cfg = p.get("chunking", {"method":"recursive","chunk_size":800,"chunk_overlap":80})
+    chunk_cfg = p.get("chunking", {"method": "recursive", "chunk_size": 800, "chunk_overlap": 80})
     splitter = _make_splitter(chunk_cfg)
 
     docs: List[Dict[str, Any]] = []
     for path, data in items:
         txt = _bytes_to_text(path, data)
-        if not txt: 
+        if not txt:
             continue
         chunks = splitter.split_text(txt)
         for i, ch in enumerate(chunks):
-            docs.append({
-                "id": _sha1(f"{path}:{i}:{len(ch)}"),
-                "path": path,
-                "source": p["source"].get("name","src"),
-                "chunk": ch
-            })
+            docs.append({"id": _sha1(f"{path}:{i}:{len(ch)}"), "path": path, "source": p["source"].get("name", "src"), "chunk": ch})
 
     # 3) Embed
-    emb_cfg = p.get("embedding", {"model":"sentence-transformers/all-MiniLM-L6-v2"})
-    model_name = emb_cfg.get("model","sentence-transformers/all-MiniLM-L6-v2")
+    emb_cfg = p.get("embedding", {"model": "sentence-transformers/all-MiniLM-L6-v2"})
+    model_name = emb_cfg.get("model", "sentence-transformers/all-MiniLM-L6-v2")
     model = _embedder(model_name)
-    vectors = model.encode(
-        [d["chunk"] for d in docs],
-        batch_size=int(emb_cfg.get("batch_size", 64)),
-        show_progress_bar=True
-    )
+    vectors = model.encode([d["chunk"] for d in docs], batch_size=int(emb_cfg.get("batch_size", 64)), show_progress_bar=True)
 
     # 4) Upsert to Weaviate
     if sink_id != "weaviate":
@@ -249,19 +233,16 @@ def run_pipeline_dict(p: Dict[str, Any]) -> Dict[str, Any]:
     try:
         coll_name = p["sink"].get("collection", "KB")
         dims = int(getattr(model, "get_sentence_embedding_dimension", lambda: len(vectors[0]))())
-        mt = str(sink_cfg.get("multi_tenancy","")).lower() in ("true","1","yes")
+        mt = str(sink_cfg.get("multi_tenancy", "")).lower() in ("true", "1", "yes")
         coll = _ensure_collection(client, coll_name, dims=dims, mt=mt)
-        cnt = 0
         with coll.batch.dynamic() as batch:
             for vec, d in zip(vectors, docs):
-                batch.add_object(
-                    properties={"source": d["source"], "chunk": d["chunk"], "path": d["path"]},
-                    uuid=d["id"], vector=vec
-                )
-                cnt += 1
+                batch.add_object(properties={"source": d["source"], "chunk": d["chunk"], "path": d["path"]}, uuid=d["id"], vector=vec)
     finally:
-        try: client.close()
-        except Exception: pass
+        try:
+            client.close()
+        except Exception:
+            pass
 
     return {"ingested": len(docs), "collection": coll_name, "source": src_id, "sink": sink_id}
 
@@ -272,9 +253,8 @@ def run_pipeline_by_id(pipeline_id: str) -> Dict[str, Any]:
         raise ValueError(f"Pipeline {pipeline_id!r} not found.")
     return run_pipeline_dict(p)
 
-# ------------------------------ UI (3) ------------------------------------------
-# This section is safe to call inline from Streamlit-enabled connectors_hub.py
-
+# ------------------------------ UI ---------------------------------------------
+# Safe to call inline from Streamlit-enabled connectors_hub.py
 def render_pipelines_ui():
     import json as _json
     try:
@@ -288,24 +268,14 @@ def render_pipelines_ui():
     st.session_state.setdefault("pipelines_draft", None)
 
     def _new_empty_draft() -> Dict[str, Any]:
-        # No defaults for source/sink — empty until user picks from saved connections
+        # No defaults for source/sink — user must pick from saved connections
         return {
             "name": "",
-            "source": {
-                "connector_id": "",   # selected from saved connections
-                "profile_name": "",   # selected from saved profiles
-                # optional per-pipeline params (user may fill if needed)
-                "container": "", "prefix": "", "pattern": r".*",
-                "root": "", "name": ""
-            },
-            "chunking": {"method":"recursive","chunk_size":800,"chunk_overlap":80},
-            "embedding": {"model":"sentence-transformers/all-MiniLM-L6-v2","batch_size":64},
-            "sink": {
-                "connector_id":"",    # selected from saved connections
-                "profile_name":"",    # selected from saved profiles
-                "collection":""
-            },
-            "trigger": {"type":"manual","interval_minutes": 0}  # manual only (UI enforces)
+            "source": {"connector_id": "", "profile_name": "", "container": "", "prefix": "", "pattern": r".*", "root": "", "name": ""},
+            "chunking": {"method": "recursive", "chunk_size": 800, "chunk_overlap": 80},
+            "embedding": {"model": "sentence-transformers/all-MiniLM-L6-v2", "batch_size": 64},
+            "sink": {"connector_id": "", "profile_name": "", "collection": ""},
+            "trigger": {"type": "manual", "interval_minutes": 0},  # manual only
         }
 
     def _open_new():
@@ -315,7 +285,7 @@ def render_pipelines_ui():
 
     def _open_edit(pid: str, payload: Dict[str, Any]):
         st.session_state.pipelines_edit_id = pid
-        st.session_state.pipelines_draft = _json.loads(_json.dumps(payload))
+        st.session_state.pipelines_draft = _json.loads(_json.dumps(payload))  # deep copy
         st.session_state.pipelines_show_editor = True
 
     def _close_editor():
@@ -327,15 +297,11 @@ def render_pipelines_ui():
     conns = load_connections()
     pipes = load_pipelines()
 
-    # Which connectors are actually available from saved connections?
     saved_connector_ids = sorted(conns.keys())
-
-    # Only allow sources/sinks that the runner supports *and* exist in saved connections
     supported_sources = {"azureblob", "localfs"}
-    supported_sinks   = {"weaviate"}
-
+    supported_sinks = {"weaviate"}
     available_sources = [c for c in saved_connector_ids if c in supported_sources]
-    available_sinks   = [c for c in saved_connector_ids if c in supported_sinks]
+    available_sinks = [c for c in saved_connector_ids if c in supported_sinks]
 
     def _profiles_for(conn_id: str) -> List[str]:
         return sorted(list((conns.get(conn_id) or {}).keys()))
@@ -344,39 +310,39 @@ def render_pipelines_ui():
     st.markdown("## 🛠️ Pipelines")
     st.caption("Design pipelines that extract → chunk → embed → sync to your Vector DB (ADF-style).")
 
-    hdr_l, hdr_r = st.columns([1,5])
+    hdr_l, _ = st.columns([1, 5])
     with hdr_l:
-        if st.button("➕ Create pipeline", type="primary", use_container_width=True):
+        if st.button("➕ Create pipeline", type="primary", width="stretch"):
             _open_new()
 
-    left, right = st.columns([4,6], gap="large")
+    left, right = st.columns([4, 6], gap="large")
 
     # -------- left: saved list --------
     with left:
         st.markdown("### 📜 Saved pipelines")
         if not pipes:
             if not available_sources or not available_sinks:
-                st.warning("No pipelines yet. Also ensure you’ve saved at least one **source** and one **vector DB (sink)** connection in the Connections hub.")
+                st.warning("No pipelines yet. Ensure you’ve saved at least one **source** and one **vector DB (sink)** connection.")
             else:
                 st.info("No pipelines yet. Click **Create pipeline** to add one.")
         else:
-            for pid, meta in sorted(pipes.items(), key=lambda kv: kv[1].get("name","").lower()):
+            for pid, meta in sorted(pipes.items(), key=lambda kv: kv[1].get("name", "").lower()):
                 c = st.container(border=True)
                 with c:
-                    st.markdown(f"**{meta.get('name','(unnamed)')}**  
-`{pid}`")
-                    a, b, d = st.columns([2,2,2])
-                    if a.button("▶️ Run", key=f"run::{pid}", use_container_width=True):
+                    # keep text on a single f-string line (no unterminated f-string)
+                    st.markdown(f"**{meta.get('name','(unnamed)')}**  \\n`{pid}`")
+                    a, b, d = st.columns([2, 2, 2])
+                    if a.button("▶️ Run", key=f"run::{pid}", width="stretch"):
                         with st.spinner("Running..."):
                             try:
                                 result = run_pipeline_by_id(pid)
                                 st.success(f"Ingested {result['ingested']} chunks → **{result['collection']}**.")
                             except Exception as e:
                                 st.error(f"Run failed: {e}")
-                    if b.button("✏️ Edit", key=f"edit::{pid}", use_container_width=True):
+                    if b.button("✏️ Edit", key=f"edit::{pid}", width="stretch"):
                         _open_edit(pid, meta)
                         st.rerun()
-                    if d.button("🗑️ Delete", key=f"del::{pid}", use_container_width=True):
+                    if d.button("🗑️ Delete", key=f"del::{pid}", width="stretch"):
                         try:
                             pipes.pop(pid, None)
                             save_pipelines(pipes)
@@ -388,8 +354,8 @@ def render_pipelines_ui():
     # -------- right: editor --------
     with right:
         if not st.session_state.pipelines_show_editor:
-            st.markdown("### ✏️ Create / Edit pipeline")
-            st.info("Click **Create pipeline** or **Edit** on a saved item to open the editor.")
+            # no placeholder card; keep clean when editor closed
+            st.empty()
             return
 
         draft = st.session_state.pipelines_draft or _new_empty_draft()
@@ -398,80 +364,59 @@ def render_pipelines_ui():
         st.markdown(f"### ✏️ {title}")
 
         # ---- Basic
-        draft["name"] = st.text_input("Pipeline name", draft.get("name",""))
+        draft["name"] = st.text_input("Pipeline name", draft.get("name", ""))
 
         st.divider()
-        # ---- Source (no defaults; from saved connections only)
+        # ---- Source (from saved connections only)
         st.subheader("Source (from saved connections)")
-        src_conn = st.selectbox(
-            "Source connector",
-            available_sources,
-            index=None,
-            placeholder="Select a saved source connector",
-        )
+        src_conn = st.selectbox("Source connector", available_sources, index=None, placeholder="Select a saved source connector")
         if src_conn is None:
             draft["source"]["connector_id"] = ""
-            src_profiles = []
+            src_profiles: List[str] = []
         else:
             draft["source"]["connector_id"] = src_conn
             src_profiles = _profiles_for(src_conn)
 
-        src_prof = st.selectbox(
-            "Source profile",
-            src_profiles,
-            index=None,
-            placeholder="Select a saved source profile",
-        ) if src_profiles else None
+        src_prof = st.selectbox("Source profile", src_profiles, index=None, placeholder="Select a saved source profile") if src_profiles else None
         draft["source"]["profile_name"] = src_prof or ""
 
-        # Optional per-pipeline params (keep empty unless the user wants overrides)
+        # Optional per-pipeline params (leave blank unless overriding)
         if src_conn == "azureblob":
-            draft["source"]["container"] = st.text_input("Container (optional)", draft["source"].get("container",""))
-            draft["source"]["prefix"] = st.text_input("Prefix (optional)", draft["source"].get("prefix",""))
+            draft["source"]["container"] = st.text_input("Container (optional)", draft["source"].get("container", ""))
+            draft["source"]["prefix"] = st.text_input("Prefix (optional)", draft["source"].get("prefix", ""))
             draft["source"]["pattern"] = st.text_input("Filename regex", draft["source"].get("pattern", r".*"))
         elif src_conn == "localfs":
-            draft["source"]["root"] = st.text_input("Local folder path (optional)", draft["source"].get("root",""))
+            draft["source"]["root"] = st.text_input("Local folder path (optional)", draft["source"].get("root", ""))
             draft["source"]["pattern"] = st.text_input("Filename regex", draft["source"].get("pattern", r".*"))
 
-        draft["source"]["name"] = st.text_input("Source label (optional)", draft["source"].get("name",""))
+        draft["source"]["name"] = st.text_input("Source label (optional)", draft["source"].get("name", ""))
 
         # ---- Chunking
         st.subheader("Chunking")
         c1, c2, c3 = st.columns(3)
-        draft["chunking"]["method"] = c1.selectbox("Method", ["recursive","tokens"], index=0 if draft["chunking"].get("method","recursive")=="recursive" else 1)
-        draft["chunking"]["chunk_size"] = int(c2.number_input("Chunk size", 100, 5000, value=int(draft["chunking"].get("chunk_size",800)), step=50))
-        draft["chunking"]["chunk_overlap"] = int(c3.number_input("Overlap", 0, 1000, value=int(draft["chunking"].get("chunk_overlap",80)), step=10))
+        draft["chunking"]["method"] = c1.selectbox("Method", ["recursive", "tokens"], index=0 if draft["chunking"].get("method", "recursive") == "recursive" else 1)
+        draft["chunking"]["chunk_size"] = int(c2.number_input("Chunk size", 100, 5000, value=int(draft["chunking"].get("chunk_size", 800)), step=50))
+        draft["chunking"]["chunk_overlap"] = int(c3.number_input("Overlap", 0, 1000, value=int(draft["chunking"].get("chunk_overlap", 80)), step=10))
 
         # ---- Embedding
         st.subheader("Embedding")
-        e1, e2 = st.columns([3,1])
-        draft["embedding"]["model"] = e1.text_input("Sentence-Transformers model", draft["embedding"].get("model","sentence-transformers/all-MiniLM-L6-v2"))
-        draft["embedding"]["batch_size"] = int(e2.number_input("Batch size", 1, 4096, value=int(draft["embedding"].get("batch_size",64)), step=1))
+        e1, e2 = st.columns([3, 1])
+        draft["embedding"]["model"] = e1.text_input("Sentence-Transformers model", draft["embedding"].get("model", "sentence-transformers/all-MiniLM-L6-v2"))
+        draft["embedding"]["batch_size"] = int(e2.number_input("Batch size", 1, 4096, value=int(draft["embedding"].get("batch_size", 64)), step=1))
 
-        # ---- Sink (Sync) — from saved connections only; no defaults
+        # ---- Sink (Vector DB) — from saved connections only
         st.subheader("Sync (Vector DB) — from saved connections")
-        sink_conn = st.selectbox(
-            "Sink connector",
-            available_sinks,
-            index=None,
-            placeholder="Select a saved sink connector",
-        )
+        sink_conn = st.selectbox("Sink connector", available_sinks, index=None, placeholder="Select a saved sink connector")
         if sink_conn is None:
             draft["sink"]["connector_id"] = ""
-            sink_profiles = []
+            sink_profiles: List[str] = []
         else:
             draft["sink"]["connector_id"] = sink_conn
             sink_profiles = _profiles_for(sink_conn)
 
-        sink_prof = st.selectbox(
-            "Sink profile",
-            sink_profiles,
-            index=None,
-            placeholder="Select a saved sink profile",
-        ) if sink_profiles else None
+        sink_prof = st.selectbox("Sink profile", sink_profiles, index=None, placeholder="Select a saved sink profile") if sink_profiles else None
         draft["sink"]["profile_name"] = sink_prof or ""
-
-        draft["sink"]["collection"] = st.text_input("Collection name (optional)", draft["sink"].get("collection",""))
+        draft["sink"]["collection"] = st.text_input("Collection name (optional)", draft["sink"].get("collection", ""))
 
         # ---- Trigger (manual only)
         st.subheader("Trigger")
@@ -481,33 +426,33 @@ def render_pipelines_ui():
 
         st.divider()
 
-        # Validation: must pick source connector/profile and sink connector/profile
+        # Validation
         has_valid_source = bool(draft["source"]["connector_id"] and draft["source"]["profile_name"])
-        has_valid_sink   = bool(draft["sink"]["connector_id"] and draft["sink"]["profile_name"])
+        has_valid_sink = bool(draft["sink"]["connector_id"] and draft["sink"]["profile_name"])
 
-        warn_msg = []
+        warn = []
         if not available_sources:
-            warn_msg.append("No saved **source** connections found.")
+            warn.append("No saved **source** connections found.")
         if not available_sinks:
-            warn_msg.append("No saved **sink (vector DB)** connections found.")
+            warn.append("No saved **sink (vector DB)** connections found.")
         if not has_valid_source:
-            warn_msg.append("Select a **Source connector** and **Source profile**.")
+            warn.append("Select a **Source connector** and **Source profile**.")
         if not has_valid_sink:
-            warn_msg.append("Select a **Sink connector** and **Sink profile**.")
-        if warn_msg:
-            st.warning(" ".join(warn_msg))
+            warn.append("Select a **Sink connector** and **Sink profile**.")
+        if warn:
+            st.warning(" ".join(warn))
 
-        btn_save, btn_run, btn_cancel = st.columns([1,1,1])
-        if btn_save.button("💾 Save", use_container_width=True, disabled=not (has_valid_source and has_valid_sink)):
-            # Assign ID
+        btn_save, btn_run, btn_cancel = st.columns([1, 1, 1])
+        if btn_save.button("💾 Save", width="stretch", disabled=not (has_valid_source and has_valid_sink)):
+            # Assign ID (slug + numeric suffix if needed)
             pid = st.session_state.pipelines_edit_id
             if pid is None:
-                base = re.sub(r"[^A-Za-z0-9_]", "_", (draft.get("name","") or "pipeline").strip()) or "pipeline"
-                suffix = 1
+                base = re.sub(r"[^A-Za-z0-9_]", "_", (draft.get("name", "") or "pipeline").strip()) or "pipeline"
                 new_id = base
+                i = 1
                 while new_id in pipes:
-                    suffix += 1
-                    new_id = f"{base}_{suffix}"
+                    i += 1
+                    new_id = f"{base}_{i}"
                 pid = new_id
             pipes[pid] = draft
             save_pipelines(pipes)
@@ -515,7 +460,7 @@ def render_pipelines_ui():
             _close_editor()
             st.rerun()
 
-        if btn_run.button("▶️ Run now", use_container_width=True, disabled=not (has_valid_source and has_valid_sink)):
+        if btn_run.button("▶️ Run now", width="stretch", disabled=not (has_valid_source and has_valid_sink)):
             # Run a temporary draft without saving
             temp_id = "__tmp_draft__"
             pipes[temp_id] = draft
@@ -530,20 +475,10 @@ def render_pipelines_ui():
                 pipes.pop(temp_id, None)
                 save_pipelines(pipes)
 
-        if btn_cancel.button("✖️ Cancel", use_container_width=True):
+        if btn_cancel.button("✖️ Cancel", width="stretch"):
             _close_editor()
             st.rerun()
 
-# ------------------------------ EXAMPLE
-# ------------------------------ EXAMPLE (import or inline) ----------------------
-# Option A (inline): paste all of this into connectors_hub.py and call:
-#     render_pipelines_ui()
-#
-# Option B (import): save as pipelines_inline.py and in connectors_hub.py:
-#     from pipelines_inline import render_pipelines_ui
-#     render_pipelines_ui()
-#
-# Trigger loop (external scheduler):
-#     from pipelines_inline import trigger_loop_forever
-#     trigger_loop_forever(poll_seconds=30)
-# --------------------------------------------------------------------------------
+# ------------------------------ EXAMPLE -----------------------------------------
+# Option A (inline): paste into connectors_hub.py and call render_pipelines_ui().
+# Option B (import): from pipelines_inline import render_pipelines_ui; render_pipelines_ui().
