@@ -159,11 +159,23 @@ def _weaviate_client(cfg: Dict[str, Any]):
 
 def _ensure_collection(client, name: str, dims: int = 384, mt: bool=False):
     # sanitize collection name for Weaviate
-    name = re.sub(r"[^A-Za-z0-9_]", "_", name).strip("_") or "KB"
-    cols = {c.name: c for c in client.collections.list_all()}
-    if name in cols:
+    import re as _re
+    name = _re.sub(r"[^A-Za-z0-9_]", "_", name).strip("_") or "KB"
+    try:
+        existing = client.collections.list_all()
+    except Exception:
+        existing = []
+    # list_all() may return a list of strings or objects with .name
+    names = set()
+    for c in existing:
+        try:
+            names.add(getattr(c, 'name', c))
+        except Exception:
+            pass
+    if name in names:
         return client.collections.get(name)
     return client.collections.create(
+
         name,
         vectorizer_config=Configure.Vectorizer.none(dims=dims),
         properties=[
@@ -260,212 +272,269 @@ def run_pipeline_by_id(pipeline_id: str) -> Dict[str, Any]:
         raise ValueError(f"Pipeline {pipeline_id!r} not found.")
     return run_pipeline_dict(p)
 
-# ------------------------------ TRIGGER LOOP (4) --------------------------------
-def trigger_loop_once() -> bool:
-    """
-    Run due interval pipelines once (non-blocking helper for external schedulers).
-    Returns True if any pipeline state changed.
-    """
-    from datetime import datetime, timedelta
-    pipes = load_pipelines()
-    changed = False
-    now = datetime.utcnow()
-    for pid, p in pipes.items():
-        trig = p.get("trigger", {"type":"manual"})
-        if trig.get("type") != "interval":
-            continue
-        every = int(trig.get("interval_minutes", 60))
-        last = None
-        if p.get("_last_run_utc"):
-            try:
-                last = datetime.fromisoformat(p["_last_run_utc"])
-            except Exception:
-                last = None
-        due = (last is None) or (now - last >= timedelta(minutes=every))
-        if due:
-            try:
-                run_pipeline_dict(p)
-                p["_last_run_utc"] = now.isoformat()
-                changed = True
-            except Exception as e:
-                # Best-effort logging
-                print(f"[trigger] Run failed for {pid}: {e}")
-    if changed:
-        save_pipelines(pipes)
-    return changed
-
-def trigger_loop_forever(poll_seconds: int = 30):
-    """Blocking loop you can launch in a background process or scheduler."""
-    while True:
-        try:
-            trigger_loop_once()
-        except Exception as e:
-            print(f"[trigger] loop error: {e}")
-        time.sleep(poll_seconds)
-
 # ------------------------------ UI (3) ------------------------------------------
 # This section is safe to call inline from Streamlit-enabled connectors_hub.py
+
 def render_pipelines_ui():
+    import json as _json
     try:
         import streamlit as st
     except Exception:
         raise RuntimeError("Streamlit is required to render the pipelines UI.")
 
-    st.markdown("## 🛠️ Pipelines")
-    st.caption("Design pipelines that extract → chunk → embed → sync to your Vector DB (ADF-style).")
+    # ---------------- state ----------------
+    st.session_state.setdefault("pipelines_show_editor", False)
+    st.session_state.setdefault("pipelines_edit_id", None)
+    st.session_state.setdefault("pipelines_draft", None)
 
-    conns = load_connections()
-    pipes = load_pipelines()
-
-    def _defaults() -> Dict[str, Any]:
+    def _new_empty_draft() -> Dict[str, Any]:
+        # No defaults for source/sink — empty until user picks from saved connections
         return {
-            "name": "new_pipeline",
+            "name": "",
             "source": {
-                "connector_id": "azureblob",   # or "localfs"
-                "profile_name": "",
-                "container": "", "prefix": "", "pattern": r".*\.(txt|md|pdf|docx|xlsx|csv|json)$",
-                "root": "./KB",  # only for localfs
-                "name": "KB"
+                "connector_id": "",   # selected from saved connections
+                "profile_name": "",   # selected from saved profiles
+                # optional per-pipeline params (user may fill if needed)
+                "container": "", "prefix": "", "pattern": r".*",
+                "root": "", "name": ""
             },
             "chunking": {"method":"recursive","chunk_size":800,"chunk_overlap":80},
             "embedding": {"model":"sentence-transformers/all-MiniLM-L6-v2","batch_size":64},
-            "sink": {"connector_id":"weaviate","profile_name":"","collection":"KB"},
-            "trigger": {"type":"manual","interval_minutes": 0}
+            "sink": {
+                "connector_id":"",    # selected from saved connections
+                "profile_name":"",    # selected from saved profiles
+                "collection":""
+            },
+            "trigger": {"type":"manual","interval_minutes": 0}  # manual only (UI enforces)
         }
 
-    def _list_profiles(conn_id: str) -> List[str]:
+    def _open_new():
+        st.session_state.pipelines_edit_id = None
+        st.session_state.pipelines_draft = _new_empty_draft()
+        st.session_state.pipelines_show_editor = True
+
+    def _open_edit(pid: str, payload: Dict[str, Any]):
+        st.session_state.pipelines_edit_id = pid
+        st.session_state.pipelines_draft = _json.loads(_json.dumps(payload))
+        st.session_state.pipelines_show_editor = True
+
+    def _close_editor():
+        st.session_state.pipelines_show_editor = False
+        st.session_state.pipelines_edit_id = None
+        st.session_state.pipelines_draft = None
+
+    # ---------------- stores ----------------
+    conns = load_connections()
+    pipes = load_pipelines()
+
+    # Which connectors are actually available from saved connections?
+    saved_connector_ids = sorted(conns.keys())
+
+    # Only allow sources/sinks that the runner supports *and* exist in saved connections
+    supported_sources = {"azureblob", "localfs"}
+    supported_sinks   = {"weaviate"}
+
+    available_sources = [c for c in saved_connector_ids if c in supported_sources]
+    available_sinks   = [c for c in saved_connector_ids if c in supported_sinks]
+
+    def _profiles_for(conn_id: str) -> List[str]:
         return sorted(list((conns.get(conn_id) or {}).keys()))
+
+    # ---------------- UI ----------------
+    st.markdown("## 🛠️ Pipelines")
+    st.caption("Design pipelines that extract → chunk → embed → sync to your Vector DB (ADF-style).")
+
+    hdr_l, hdr_r = st.columns([1,5])
+    with hdr_l:
+        if st.button("➕ Create pipeline", type="primary", use_container_width=True):
+            _open_new()
 
     left, right = st.columns([4,6], gap="large")
 
-    # -------- Left: Saved pipelines with Run/Delete --------
+    # -------- left: saved list --------
     with left:
         st.markdown("### 📜 Saved pipelines")
         if not pipes:
-            st.info("No pipelines yet. Create one on the right.")
+            if not available_sources or not available_sinks:
+                st.warning("No pipelines yet. Also ensure you’ve saved at least one **source** and one **vector DB (sink)** connection in the Connections hub.")
+            else:
+                st.info("No pipelines yet. Click **Create pipeline** to add one.")
         else:
             for pid, meta in sorted(pipes.items(), key=lambda kv: kv[1].get("name","").lower()):
-                c1, c2, c3 = st.columns([6,2,2])
-                c1.write(f"**{meta.get('name','pipeline')}**  \n`{pid}`")
-                if c2.button("▶️ Run", key=f"run::{pid}", help="Run pipeline now", use_container_width=True):
-                    with st.spinner("Running..."):
-                        try:
-                            result = run_pipeline_by_id(pid)
-                            st.success(f"Ingested {result['ingested']} chunks → collection **{result['collection']}**.")
-                        except Exception as e:
-                            st.error(f"Run failed: {e}")
-                if c3.button("🗑️", key=f"del::{pid}", help="Delete pipeline", use_container_width=True):
-                    try:
-                        pipes.pop(pid, None)
-                        save_pipelines(pipes)
-                        st.success("Deleted.")
+                c = st.container(border=True)
+                with c:
+                    st.markdown(f"**{meta.get('name','(unnamed)')}**  
+`{pid}`")
+                    a, b, d = st.columns([2,2,2])
+                    if a.button("▶️ Run", key=f"run::{pid}", use_container_width=True):
+                        with st.spinner("Running..."):
+                            try:
+                                result = run_pipeline_by_id(pid)
+                                st.success(f"Ingested {result['ingested']} chunks → **{result['collection']}**.")
+                            except Exception as e:
+                                st.error(f"Run failed: {e}")
+                    if b.button("✏️ Edit", key=f"edit::{pid}", use_container_width=True):
+                        _open_edit(pid, meta)
                         st.rerun()
-                    except Exception as e:
-                        st.error(f"Delete failed: {e}")
+                    if d.button("🗑️ Delete", key=f"del::{pid}", use_container_width=True):
+                        try:
+                            pipes.pop(pid, None)
+                            save_pipelines(pipes)
+                            st.toast("Pipeline deleted.")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Delete failed: {e}")
 
-    # -------- Right: Editor (Create/Edit) --------
+    # -------- right: editor --------
     with right:
-        st.markdown("### ✏️ Create / Edit pipeline")
-        mode = st.radio("Mode", ["Create new", "Edit existing"], horizontal=True)
-        if mode == "Edit existing" and pipes:
-            sel_id = st.selectbox("Select pipeline", list(pipes.keys()))
-            draft = json.loads(json.dumps(pipes[sel_id]))  # deep copy
-        elif mode == "Edit existing" and not pipes:
-            st.warning("No pipelines to edit; switch to Create new.")
-            draft = _defaults()
-        else:
-            draft = _defaults()
+        if not st.session_state.pipelines_show_editor:
+            st.markdown("### ✏️ Create / Edit pipeline")
+            st.info("Click **Create pipeline** or **Edit** on a saved item to open the editor.")
+            return
 
-        draft["name"] = st.text_input("Pipeline name", draft.get("name","pipeline_1"))
+        draft = st.session_state.pipelines_draft or _new_empty_draft()
+        editing_id = st.session_state.pipelines_edit_id
+        title = "Create pipeline" if editing_id is None else f"Edit pipeline — `{editing_id}`"
+        st.markdown(f"### ✏️ {title}")
+
+        # ---- Basic
+        draft["name"] = st.text_input("Pipeline name", draft.get("name",""))
+
         st.divider()
-
-        st.subheader("Source")
-        src_id = st.selectbox(
-            "Source connector", ["azureblob","localfs"],
-            index=0 if draft["source"]["connector_id"]=="azureblob" else 1,
-            help="Pick from your saved connections"
+        # ---- Source (no defaults; from saved connections only)
+        st.subheader("Source (from saved connections)")
+        src_conn = st.selectbox(
+            "Source connector",
+            available_sources,
+            index=None,
+            placeholder="Select a saved source connector",
         )
-        draft["source"]["connector_id"] = src_id
-        src_profiles = _list_profiles(src_id)
-        draft["source"]["profile_name"] = st.selectbox(
-            "Source profile", src_profiles,
-            index=0 if src_profiles else None, placeholder="Select a saved profile"
-        ) if src_profiles else ""
+        if src_conn is None:
+            draft["source"]["connector_id"] = ""
+            src_profiles = []
+        else:
+            draft["source"]["connector_id"] = src_conn
+            src_profiles = _profiles_for(src_conn)
 
-        if src_id == "azureblob":
-            draft["source"]["container"] = st.text_input("Container", draft["source"].get("container",""))
+        src_prof = st.selectbox(
+            "Source profile",
+            src_profiles,
+            index=None,
+            placeholder="Select a saved source profile",
+        ) if src_profiles else None
+        draft["source"]["profile_name"] = src_prof or ""
+
+        # Optional per-pipeline params (keep empty unless the user wants overrides)
+        if src_conn == "azureblob":
+            draft["source"]["container"] = st.text_input("Container (optional)", draft["source"].get("container",""))
             draft["source"]["prefix"] = st.text_input("Prefix (optional)", draft["source"].get("prefix",""))
             draft["source"]["pattern"] = st.text_input("Filename regex", draft["source"].get("pattern", r".*"))
-        else:
-            draft["source"]["root"] = st.text_input("Local folder path", draft["source"].get("root","./KB"))
+        elif src_conn == "localfs":
+            draft["source"]["root"] = st.text_input("Local folder path (optional)", draft["source"].get("root",""))
             draft["source"]["pattern"] = st.text_input("Filename regex", draft["source"].get("pattern", r".*"))
 
-        draft["source"]["name"] = st.text_input("Source label (stored in metadata)", draft["source"].get("name","KB"))
+        draft["source"]["name"] = st.text_input("Source label (optional)", draft["source"].get("name",""))
 
+        # ---- Chunking
         st.subheader("Chunking")
         c1, c2, c3 = st.columns(3)
-        draft["chunking"]["method"] = c1.selectbox(
-            "Method", ["recursive","tokens"],
-            index=0 if draft["chunking"].get("method","recursive")=="recursive" else 1
-        )
+        draft["chunking"]["method"] = c1.selectbox("Method", ["recursive","tokens"], index=0 if draft["chunking"].get("method","recursive")=="recursive" else 1)
         draft["chunking"]["chunk_size"] = int(c2.number_input("Chunk size", 100, 5000, value=int(draft["chunking"].get("chunk_size",800)), step=50))
         draft["chunking"]["chunk_overlap"] = int(c3.number_input("Overlap", 0, 1000, value=int(draft["chunking"].get("chunk_overlap",80)), step=10))
 
+        # ---- Embedding
         st.subheader("Embedding")
         e1, e2 = st.columns([3,1])
         draft["embedding"]["model"] = e1.text_input("Sentence-Transformers model", draft["embedding"].get("model","sentence-transformers/all-MiniLM-L6-v2"))
         draft["embedding"]["batch_size"] = int(e2.number_input("Batch size", 1, 4096, value=int(draft["embedding"].get("batch_size",64)), step=1))
 
-        st.subheader("Sink (Vector DB)")
-        sink_id = st.selectbox("Sink connector", ["weaviate"], index=0, help="Choose a saved Weaviate profile")
-        draft["sink"]["connector_id"] = sink_id
-        sink_profiles = _list_profiles(sink_id)
-        draft["sink"]["profile_name"] = st.selectbox(
-            "Sink profile", sink_profiles,
-            index=0 if sink_profiles else None, placeholder="Select a saved profile"
-        ) if sink_profiles else ""
-        draft["sink"]["collection"] = st.text_input("Collection name", draft["sink"].get("collection","KB"))
+        # ---- Sink (Sync) — from saved connections only; no defaults
+        st.subheader("Sync (Vector DB) — from saved connections")
+        sink_conn = st.selectbox(
+            "Sink connector",
+            available_sinks,
+            index=None,
+            placeholder="Select a saved sink connector",
+        )
+        if sink_conn is None:
+            draft["sink"]["connector_id"] = ""
+            sink_profiles = []
+        else:
+            draft["sink"]["connector_id"] = sink_conn
+            sink_profiles = _profiles_for(sink_conn)
 
+        sink_prof = st.selectbox(
+            "Sink profile",
+            sink_profiles,
+            index=None,
+            placeholder="Select a saved sink profile",
+        ) if sink_profiles else None
+        draft["sink"]["profile_name"] = sink_prof or ""
+
+        draft["sink"]["collection"] = st.text_input("Collection name (optional)", draft["sink"].get("collection",""))
+
+        # ---- Trigger (manual only)
         st.subheader("Trigger")
-        tmode = st.selectbox("Type", ["manual","interval"])
-        draft["trigger"]["type"] = tmode
-        if tmode == "interval":
-            draft["trigger"]["interval_minutes"] = int(st.number_input("Every N minutes", 1, 10080, value=int(draft["trigger"].get("interval_minutes", 60))))
+        st.selectbox("Type", ["manual"], index=0, disabled=True)
+        draft["trigger"]["type"] = "manual"
+        draft["trigger"]["interval_minutes"] = 0
 
         st.divider()
-        cA, cB = st.columns([1,1])
-        if cA.button("💾 Save / Update", use_container_width=True):
-            pid = None
-            if mode == "Edit existing" and pipes:
-                pid = sel_id
-            else:
-                base = re.sub(r"[^A-Za-z0-9_]", "_", draft["name"]).strip("_") or "pipeline"
-                pid = base if base not in pipes else f"{base}_{len(pipes)+1}"
+
+        # Validation: must pick source connector/profile and sink connector/profile
+        has_valid_source = bool(draft["source"]["connector_id"] and draft["source"]["profile_name"])
+        has_valid_sink   = bool(draft["sink"]["connector_id"] and draft["sink"]["profile_name"])
+
+        warn_msg = []
+        if not available_sources:
+            warn_msg.append("No saved **source** connections found.")
+        if not available_sinks:
+            warn_msg.append("No saved **sink (vector DB)** connections found.")
+        if not has_valid_source:
+            warn_msg.append("Select a **Source connector** and **Source profile**.")
+        if not has_valid_sink:
+            warn_msg.append("Select a **Sink connector** and **Sink profile**.")
+        if warn_msg:
+            st.warning(" ".join(warn_msg))
+
+        btn_save, btn_run, btn_cancel = st.columns([1,1,1])
+        if btn_save.button("💾 Save", use_container_width=True, disabled=not (has_valid_source and has_valid_sink)):
+            # Assign ID
+            pid = st.session_state.pipelines_edit_id
+            if pid is None:
+                base = re.sub(r"[^A-Za-z0-9_]", "_", (draft.get("name","") or "pipeline").strip()) or "pipeline"
+                suffix = 1
+                new_id = base
+                while new_id in pipes:
+                    suffix += 1
+                    new_id = f"{base}_{suffix}"
+                pid = new_id
             pipes[pid] = draft
             save_pipelines(pipes)
-            st.success(f"Saved pipeline `{pid}`.")
+            st.toast("Pipeline saved.")
+            _close_editor()
             st.rerun()
 
-        if cB.button("▶️ Run now", type="primary", use_container_width=True):
-            with st.spinner("Running..."):
-                try:
-                    # if creating new but not saved, run the draft temporarily
-                    if mode == "Create new":
-                        tmp_id = "__tmp_draft__"
-                        pipes[tmp_id] = draft
-                        save_pipelines(pipes)
-                        pid_to_run = tmp_id
-                    else:
-                        pid_to_run = sel_id
-                    result = run_pipeline_by_id(pid_to_run)
-                    st.success(f"Ingested {result['ingested']} chunks → **{result['collection']}**.")
-                except Exception as e:
-                    st.error(f"Run failed: {e}")
-                finally:
-                    if "__tmp_draft__" in pipes:
-                        pipes.pop("__tmp_draft__", None)
-                        save_pipelines(pipes)
+        if btn_run.button("▶️ Run now", use_container_width=True, disabled=not (has_valid_source and has_valid_sink)):
+            # Run a temporary draft without saving
+            temp_id = "__tmp_draft__"
+            pipes[temp_id] = draft
+            save_pipelines(pipes)
+            try:
+                with st.spinner("Running..."):
+                    result = run_pipeline_by_id(temp_id)
+                st.success(f"Ingested {result['ingested']} chunks → **{result['collection']}**.")
+            except Exception as e:
+                st.error(f"Run failed: {e}")
+            finally:
+                pipes.pop(temp_id, None)
+                save_pipelines(pipes)
 
+        if btn_cancel.button("✖️ Cancel", use_container_width=True):
+            _close_editor()
+            st.rerun()
+
+# ------------------------------ EXAMPLE
 # ------------------------------ EXAMPLE (import or inline) ----------------------
 # Option A (inline): paste all of this into connectors_hub.py and call:
 #     render_pipelines_ui()
