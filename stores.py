@@ -1,28 +1,25 @@
+# stores.py
+from __future__ import annotations
+import json, os
 from pathlib import Path
-import json
-from typing import Dict, Any
+from typing import Dict, Any, List, Optional
 
-CONN_STORE = Path("connections.json")
-PIPE_STORE = Path("pipelines.json")
+APP_DIR = Path(__file__).parent
+CONN_STORE = APP_DIR / "connections.json"
+PIPE_STORE = APP_DIR / "pipelines.json"
 
-def load_connections() -> Dict[str, Any]:
-    if not CONN_STORE.exists():
-        return {}
-    try:
-        return json.loads(CONN_STORE.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
+def load_connections() -> Dict[str, Dict[str, Dict[str, Any]]]:
+    if not CONN_STORE.exists(): return {}
+    try: return json.loads(CONN_STORE.read_text(encoding="utf-8"))
+    except Exception: return {}
 
-def save_connections(data: Dict[str, Any]) -> None:
-    CONN_STORE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+def save_connections(d: Dict[str, Dict[str, Dict[str, Any]]]) -> None:
+    CONN_STORE.write_text(json.dumps(d, indent=2), encoding="utf-8")
 
 def load_pipelines() -> Dict[str, Any]:
-    if not PIPE_STORE.exists():
-        return {}
-    try:
-        return json.loads(PIPE_STORE.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
+    if not PIPE_STORE.exists(): return {}
+    try: return json.loads(PIPE_STORE.read_text(encoding="utf-8"))
+    except Exception: return {}
 
-def save_pipelines(data: Dict[str, Any]) -> None:
-    PIPE_STORE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+def save_pipelines(d: Dict[str, Any]) -> None:
+    PIPE_STORE.write_text(json.dumps(d, indent=2), encoding="utf-8")
