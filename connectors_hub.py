@@ -18,19 +18,19 @@ import streamlit as st
 from dotenv import load_dotenv
 load_dotenv()  # pull secrets from .env for $env resolution
 
-# Stores + Runner + Secrets
-from stores import load_connections, save_connections, load_pipelines, save_pipelines
-from runner import run_pipeline_by_id  # run by pipeline-id from pipelines.json
-from secrets import resolve_secrets     # optional: for debug/preview of resolved configs
+# # Stores + Runner + Secrets
+# from stores import load_connections, save_connections, load_pipelines, save_pipelines
+# from runner import run_pipeline_by_id  # run by pipeline-id from pipelines.json
+# from secrets import resolve_secrets     # optional: for debug/preview of resolved configs
 
-# (Optional) Ensure plugin modules are imported so SOURCES/SINKS are registered.
-# If you created plugin files, import them here (no-op side effects register them):
-import plugins.sources.localfs        # noqa: F401
-import plugins.sources.azureblob      # noqa: F401
-# import plugins.sources.s3             # noqa: F401
-# import plugins.sources.postgres       # noqa: F401
-import plugins.sinks.weaviate_sink    # noqa: F401
-# import plugins.sinks.qdrant_sink      # noqa: F401
+# # (Optional) Ensure plugin modules are imported so SOURCES/SINKS are registered.
+# # If you created plugin files, import them here (no-op side effects register them):
+# import plugins.sources.localfs        # noqa: F401
+# import plugins.sources.azureblob      # noqa: F401
+# # import plugins.sources.s3             # noqa: F401
+# # import plugins.sources.postgres       # noqa: F401
+# import plugins.sinks.weaviate_sink    # noqa: F401
+# # import plugins.sinks.qdrant_sink      # noqa: F401
 
 
 APP_TITLE = "🔌 Data Connectors Hub"
@@ -1714,14 +1714,10 @@ with st.container(border=True):
             c2.markdown(f"{src_label} → {dst_label}")
             c3.markdown(f"`{p['collection']}`")
 
-            # Manual Run (now wired to runner)
+            # Manual Run (stub hook)
             if c4.button("▶️", key=f"run::{pid}", help="Run this pipeline now"):
-                with st.spinner(f"Running pipeline: {p['name']} …"):
-                    try:
-                        msg = run_pipeline_by_id(pid)   # <-- executes via runner.py
-                        st.success(msg)
-                    except Exception as e:
-                        st.error(f"Run failed: {e}")
+                st.info("Runner not wired here. Plug your executor where this button is handled.")
+                # You can call your executor here: run_pipeline(p)
 
 
             # Edit / Delete
