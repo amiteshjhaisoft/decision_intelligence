@@ -1422,7 +1422,4 @@ with main_left:
     from pipelines_inline import render_pipelines_ui
     render_pipelines_ui()
 
-# Trigger loop (external scheduler):
-    from pipelines_inline import trigger_loop_forever
-    trigger_loop_forever(poll_seconds=30)
 
