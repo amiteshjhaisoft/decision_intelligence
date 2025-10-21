@@ -1418,55 +1418,531 @@ with main_left:
     st.markdown('</div>', unsafe_allow_html=True)
 
 
-# ---- Pipelines Runner (embed pipelines_app execution from within the Hub) ----
-with st.container():
-    st.markdown("### 🧩 Pipelines (Build & Run)")
-    st.caption("Use the pipeline builder page to create/edit pipelines, then run them here like an ETL job.")
+# ============================= Pipelines (Build & Run) — INLINE =============================
+import json, uuid, io, glob, os
+from pathlib import Path
+from typing import Any, Dict, List, Tuple, Optional
 
-    # Lazy import so Connectors Hub still loads if pipelines_app is missing
+import streamlit as st
+
+# ---------- Local persistence ----------
+_PIPELINES_JSON = Path("pipelines.json")
+_VECTOR_DIR = Path("./vector_indexes")
+_VECTOR_DIR.mkdir(parents=True, exist_ok=True)
+
+def _load_pipes_json() -> dict:
+    if not _PIPELINES_JSON.exists():
+        return {}
     try:
-        from pipelines_app import load_pipelines  # canvas code file
-        from runner import run_pipeline_by_id     # tiny shim you created above
-    except Exception as e:
-        st.info("Pipelines module not found. Place pipelines_app.py and runner.py next to this file.")
-        st.code(str(e))
-    else:
-        pipes = load_pipelines()
-        if not pipes:
-            st.warning("No pipelines found. Open the Pipeline Builder to create one first.")
-            st.markdown("• If you’re using multipage, go to **Pages → Pipelines**.\n• Or run `streamlit run pipelines_app.py` once and save a pipeline.")
-        else:
-            # Display as nice choices
-            options = [(pid, f"{p.name}  —  {p.source.kind} → {p.vectordb.kind}") for pid, p in pipes.items()]
-            pid_to_label = {pid: label for pid, label in options}
-            selected_id = st.selectbox("Select a pipeline to run", options=list(pid_to_label.keys()),
-                                       format_func=lambda k: pid_to_label[k], key="sel_pipeline_id")
+        return json.loads(_PIPELINES_JSON.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
 
-            # If the selected pipeline expects file uploads, show a file_uploader
-            sel = pipes[selected_id]
-            uploads = None
-            if sel.source.kind == "file_upload":
-                uploads = st.file_uploader(
-                    "Upload documents for this run",
-                    type=["txt","md","pdf","docx","csv","json"], accept_multiple_files=True
-                )
+def _save_pipes_json(store: dict) -> None:
+    _PIPELINES_JSON.write_text(json.dumps(store, indent=2), encoding="utf-8")
 
-            col_run, col_view = st.columns([1,1])
-            with col_run:
-                if st.button("▶️ Run Pipeline", use_container_width=True):
+# ---------- Utilities ----------
+def _pill(text: str) -> str:
+    return f"<span style='background:#EEF2FF;color:#3730A3;padding:2px 8px;border-radius:9999px;font-size:12px'>{text}</span>"
+
+def _status_log(container):
+    def log(msg: str):
+        with container:
+            st.write(msg)
+    return log
+
+# ---------- Source Readers ----------
+def _read_source_texts(source: Dict[str, Any], log) -> List[Tuple[str, str]]:
+    """
+    returns list[(doc_id, text)]
+    """
+    kind = source.get("kind")
+    p = source.get("params", {}) or {}
+    out: List[Tuple[str, str]] = []
+
+    def _add(doc_id: str, text: str):
+        if text and text.strip():
+            out.append((doc_id, text))
+
+    # optional deps (lazy)
+    try:
+        import pandas as pd  # noqa: F401
+    except Exception:
+        pd = None  # type: ignore
+    try:
+        from pypdf import PdfReader
+    except Exception:
+        PdfReader = None
+    try:
+        import docx2txt as _docx2txt
+    except Exception:
+        _docx2txt = None  # type: ignore
+
+    if kind == "local_folder":
+        root = p.get("path") or "./KB"
+        exts = set((p.get("exts") or ".txt,.md,.pdf,.docx,.csv,.json").split(","))
+        paths = []
+        for ext in exts:
+            paths.extend(glob.glob(str(Path(root) / f"**/*{ext.strip()}"), recursive=True))
+        for fp in paths:
+            try:
+                ext = Path(fp).suffix.lower()
+                if ext in {".txt", ".md", ".json"}:
+                    _add(fp, Path(fp).read_text(encoding="utf-8", errors="ignore"))
+                elif ext == ".csv" and pd is not None:
+                    import pandas as pd
+                    df = pd.read_csv(fp)
+                    _add(fp, df.to_csv(index=False))
+                elif ext == ".pdf" and PdfReader:
+                    reader = PdfReader(fp)
+                    text = "\n".join([(pg.extract_text() or "") for pg in reader.pages])
+                    _add(fp, text)
+                elif ext == ".docx" and _docx2txt:
+                    _add(fp, _docx2txt.process(fp) or "")
+            except Exception as e:
+                log(f"⚠️ Skipped {fp}: {e}")
+        log(f"Loaded {len(out)} files from local folder")
+
+    elif kind == "azure_blob":
+        try:
+            from azure.storage.blob import BlobServiceClient
+        except Exception:
+            raise RuntimeError("azure-storage-blob not installed. pip install azure-storage-blob")
+        conn = p.get("connection_string") or st.secrets.get("azure", {}).get("connection_string")
+        container = p.get("container") or st.secrets.get("azure", {}).get("container")
+        prefix = p.get("prefix") or st.secrets.get("azure", {}).get("prefix", "")
+        if not conn or not container:
+            raise RuntimeError("Azure connection_string and container are required.")
+        bsc = BlobServiceClient.from_connection_string(conn)
+        cont = bsc.get_container_client(container)
+        for b in cont.list_blobs(name_starts_with=prefix):
+            name = b.name
+            if name.endswith("/"):
+                continue
+            try:
+                data = cont.download_blob(name).readall()
+                ext = Path(name).suffix.lower()
+                if ext in {".txt", ".md", ".json"}:
+                    _add(name, data.decode("utf-8", errors="ignore"))
+                elif ext == ".csv":
                     try:
-                        res = run_pipeline_by_id(
-                            selected_id,
-                            uploads=uploads,
-                            ui_log=lambda m: st.write(m)  # pipe logs back to UI
-                        )
-                        st.success(f"Done. {res}")
-                    except Exception as e:
-                        st.error(f"Run failed: {e}")
+                        import pandas as pd
+                        from io import StringIO
+                        text = data.decode("utf-8", errors="ignore")
+                        df = pd.read_csv(StringIO(text))
+                        _add(name, df.to_csv(index=False))
+                    except Exception:
+                        _add(name, data.decode("utf-8", errors="ignore"))
+                elif ext == ".pdf" and PdfReader:
+                    with io.BytesIO(data) as bio:
+                        reader = PdfReader(bio)
+                        text = "\n".join([(pg.extract_text() or "") for pg in reader.pages])
+                        _add(name, text)
+                elif ext == ".docx" and _docx2txt:
+                    tmp = Path(f"/tmp/{uuid.uuid4().hex}.docx")
+                    tmp.write_bytes(data)
+                    _add(name, _docx2txt.process(str(tmp)) or "")
+                    try: tmp.unlink(missing_ok=True)
+                    except Exception: pass
+            except Exception as e:
+                log(f"⚠️ Skip blob {name}: {e}")
+        log(f"Loaded {len(out)} blobs from Azure")
 
-            with col_view:
-                # Convenience: open the Pipeline Builder page if you are using multipage layout
+    elif kind == "file_upload":
+        # Provided at run time
+        files: List[Tuple[str, bytes]] = p.get("files", [])
+        for fname, data in files:
+            try:
+                ext = Path(fname).suffix.lower()
+                if ext in {".txt", ".md", ".json"}:
+                    _add(fname, data.decode("utf-8", errors="ignore"))
+                elif ext == ".csv":
+                    try:
+                        import pandas as pd
+                        from io import StringIO
+                        text = data.decode("utf-8", errors="ignore")
+                        df = pd.read_csv(StringIO(text))
+                        _add(fname, df.to_csv(index=False))
+                    except Exception:
+                        _add(fname, data.decode("utf-8", errors="ignore"))
+                elif ext == ".pdf" and PdfReader:
+                    with io.BytesIO(data) as bio:
+                        reader = PdfReader(bio)
+                        text = "\n".join([(pg.extract_text() or "") for pg in reader.pages])
+                        _add(fname, text)
+                elif ext == ".docx" and _docx2txt:
+                    tmp = Path(f"/tmp/{uuid.uuid4().hex}.docx")
+                    tmp.write_bytes(data)
+                    _add(fname, _docx2txt.process(str(tmp)) or "")
+                    try: tmp.unlink(missing_ok=True)
+                    except Exception: pass
+            except Exception as e:
+                log(f"⚠️ Skip upload {fname}: {e}")
+        log(f"Loaded {len(out)} uploaded files")
+
+    else:
+        raise RuntimeError(f"Unsupported source kind: {kind}")
+
+    return out
+
+# ---------- Chunking ----------
+def _chunk_texts(texts: List[Tuple[str, str]], cfg: Dict[str, Any], log) -> List[Tuple[str, str]]:
+    chunks: List[Tuple[str, str]] = []
+    strategy = (cfg or {}).get("strategy", "recursive")
+    size = int((cfg or {}).get("chunk_size", 800))
+    overlap = int((cfg or {}).get("chunk_overlap", 120))
+    t_size = int((cfg or {}).get("token_chunk_size", 256))
+    t_overlap = int((cfg or {}).get("token_overlap", 32))
+
+    # optional splitters
+    try:
+        from langchain_text_splitters import (
+            RecursiveCharacterTextSplitter, MarkdownTextSplitter, SentenceTransformersTokenTextSplitter
+        )
+    except Exception:
+        RecursiveCharacterTextSplitter = MarkdownTextSplitter = SentenceTransformersTokenTextSplitter = None
+
+    def fallback_split(text: str, s: int, ov: int) -> List[str]:
+        out = []
+        i = 0
+        n = len(text)
+        step = max(1, s - ov)
+        while i < n:
+            out.append(text[i:i+s])
+            i += step
+        return out
+
+    for doc_id, text in texts:
+        if not text.strip():
+            continue
+        if strategy == "recursive" and RecursiveCharacterTextSplitter:
+            splitter = RecursiveCharacterTextSplitter(
+                chunk_size=size, chunk_overlap=overlap,
+                separators=["\n## ", "\n# ", "\n", " ", ""]
+            )
+            parts = splitter.split_text(text)
+        elif strategy == "markdown" and MarkdownTextSplitter:
+            splitter = MarkdownTextSplitter(chunk_size=size, chunk_overlap=overlap)
+            parts = splitter.split_text(text)
+        elif strategy == "token" and SentenceTransformersTokenTextSplitter:
+            splitter = SentenceTransformersTokenTextSplitter(chunk_size=t_size, chunk_overlap=t_overlap)
+            parts = splitter.split_text(text)
+        else:
+            parts = fallback_split(text, size, overlap)
+        for j, p in enumerate(parts):
+            chunks.append((f"{doc_id}::chunk{j}", p))
+
+    log(f"Created {len(chunks)} chunks using '{strategy}'")
+    return chunks
+
+# ---------- Embeddings ----------
+def _embed_chunks(chunks: List[Tuple[str, str]], cfg: Dict[str, Any], log) -> Tuple[List[str], List[List[float]]]:
+    ids = [cid for cid, _ in chunks]
+    texts = [t for _, t in chunks]
+    provider = (cfg or {}).get("provider", "sentence_transformers")
+    model_name = (cfg or {}).get("model_name", "sentence-transformers/all-MiniLM-L6-v2")
+    normalize = bool((cfg or {}).get("normalize", True))
+
+    if provider == "sentence_transformers":
+        try:
+            from sentence_transformers import SentenceTransformer
+        except Exception:
+            raise RuntimeError("sentence-transformers not installed. pip install sentence-transformers")
+        model = SentenceTransformer(model_name)
+        vecs = model.encode(texts, show_progress_bar=True, normalize_embeddings=normalize)
+        log(f"Embedded {len(texts)} chunks with {model_name}")
+        return ids, vecs.tolist()
+
+    elif provider == "openai":
+        try:
+            import openai
+        except Exception:
+            raise RuntimeError("openai not installed. pip install openai")
+        api_key = st.secrets.get("openai", {}).get("api_key") or os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            raise RuntimeError("OPENAI_API_KEY not set in env or secrets")
+        openai.api_key = api_key
+        m = model_name or "text-embedding-3-small"
+        out_vecs: List[List[float]] = []
+        B = 1000
+        for i in range(0, len(texts), B):
+            batch = texts[i:i+B]
+            resp = openai.embeddings.create(model=m, input=batch)
+            out_vecs.extend([d.embedding for d in resp.data])
+        log(f"Embedded {len(texts)} chunks with OpenAI: {m}")
+        return ids, out_vecs
+
+    else:
+        raise RuntimeError(f"Unsupported embedding provider: {provider}")
+
+# ---------- Vector DB Upsert ----------
+def _upsert_to_vdb(ids: List[str], vecs: List[List[float]], chunks: List[Tuple[str, str]],
+                   sink: Dict[str, Any], log) -> Dict[str, Any]:
+    kind = sink.get("kind", "faiss")
+    params = sink.get("params", {}) or {}
+
+    if kind == "faiss":
+        try:
+            import faiss
+            import numpy as np
+        except Exception:
+            raise RuntimeError("faiss-cpu not installed. pip install faiss-cpu")
+        arr = np.array(vecs, dtype="float32")
+        d = arr.shape[1]
+        index = faiss.IndexFlatIP(d)   # cosine-style when vectors are normalized
+        index.add(arr)
+        out_dir = Path(params.get("index_path") or (_VECTOR_DIR / "kb_index"))
+        out_dir.mkdir(parents=True, exist_ok=True)
+        faiss.write_index(index, str(out_dir / "index.faiss"))
+        meta = {i: {"id": ids[i], "text": chunks[i][1]} for i in range(len(ids))}
+        (out_dir / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+        log(f"Upserted {len(ids)} vectors to FAISS at {out_dir}")
+        return {"index_path": str(out_dir)}
+
+    elif kind == "weaviate":
+        try:
+            import weaviate
+            import weaviate.classes as wvc
+        except Exception:
+            raise RuntimeError("weaviate-client not installed. pip install weaviate-client")
+        url = params.get("url") or st.secrets.get("weaviate", {}).get("url")
+        api_key = params.get("api_key") or st.secrets.get("weaviate", {}).get("api_key")
+        clazz = params.get("class_name") or "KBChunk"
+        if not url:
+            raise RuntimeError("Weaviate URL required")
+        if api_key:
+            client = weaviate.WeaviateClient(
+                connection_params=weaviate.ConnectionParams.from_url(url),
+                auth_client_secret=weaviate.auth.AuthApiKey(api_key=api_key),
+                skip_init_checks=True,
+            )
+        else:
+            client = weaviate.WeaviateClient(
+                connection_params=weaviate.ConnectionParams.from_url(url),
+                skip_init_checks=True,
+            )
+        # Ensure collection
+        existing = [c.class_name for c in client.collections.list_all()] if hasattr(client, "collections") else []
+        dim = len(vecs[0]) if vecs else 384
+        if clazz not in existing:
+            client.collections.create(
+                name=clazz,
+                vectorizer_config=wvc.config.Configure.Vectorizer.none(),
+                vector_index_config=wvc.config.Configure.VectorIndex.hnsw(
+                    distance_metric=wvc.config.VectorDistances.COSINE
+                ),
+                properties=[
+                    wvc.config.Property(name="doc_id", data_type=wvc.config.DataType.TEXT),
+                    wvc.config.Property(name="text", data_type=wvc.config.DataType.TEXT),
+                ],
+                vector_dimensions=dim,
+            )
+        coll = client.collections.get(clazz)
+        import uuid as _uuid
+        with coll.batch.dynamic() as batch:
+            for i, (cid, txt) in enumerate(chunks):
+                batch.add_object(
+                    properties={"doc_id": cid, "text": txt},
+                    vector=vecs[i],
+                    uuid=_uuid.uuid5(_uuid.NAMESPACE_URL, cid).hex,
+                )
+        log(f"Upserted {len(ids)} vectors to Weaviate '{clazz}' @ {url}")
+        return {"class_name": clazz, "url": url}
+
+    else:
+        raise RuntimeError(f"Unsupported vector DB kind: {kind}")
+
+# ---------- Runner ----------
+def _run_pipeline_obj(p: Dict[str, Any], uploads=None, ui_log=None) -> Dict[str, Any]:
+    def log(msg: str):
+        if ui_log:
+            ui_log(msg)
+        else:
+            print(msg)
+
+    src = p["source"]
+    if src["kind"] == "file_upload" and uploads:
+        src = {"kind": "file_upload", "params": {"files": [(u.name, u.getvalue()) for u in uploads]}}
+
+    with st.status("Fetching source data…", expanded=True) as s1:
+        texts = _read_source_texts(src, log)
+        s1.update(label=f"Fetched {len(texts)} docs", state="complete")
+
+    with st.status("Chunking…", expanded=False) as s2:
+        chunks = _chunk_texts(texts, p["chunking"], log)
+        s2.update(label=f"Created {len(chunks)} chunks", state="complete")
+
+    with st.status("Embedding…", expanded=False) as s3:
+        ids, vecs = _embed_chunks(chunks, p["embedding"], log)
+        s3.update(label=f"Embedded {len(ids)} chunks", state="complete")
+
+    with st.status("Upserting to Vector DB…", expanded=False) as s4:
+        sink_info = _upsert_to_vdb(ids, vecs, chunks, p["vectordb"], log)
+        s4.update(label="Completed upsert", state="complete")
+
+    return {"documents": len(texts), "chunks": len(ids), "sink_info": sink_info}
+
+# ---------- UI: Runner list ----------
+st.markdown("### 🧩 Pipelines (Build & Run)")
+st.caption("Define pipelines below, then run them like an ETL job. All saved to `pipelines.json`.")
+store = _load_pipes_json()
+
+if not store:
+    st.info("No pipelines yet. Create one in the **Pipeline Builder (Inline)** section below.")
+else:
+    for pid, pdata in list(store.items()):
+        with st.container(border=True):
+            c1, c2, c3 = st.columns([0.6, 0.2, 0.2])
+            with c1:
+                st.markdown(f"**{pdata.get('name','(unnamed)')}**")
+                st.caption(pdata.get("description",""))
+                st.markdown(
+                    f"{_pill(pdata['source']['kind'])} {_pill(pdata['chunking']['strategy'])} "
+                    f"{_pill(pdata['embedding']['provider'])} {_pill(pdata['vectordb']['kind'])}",
+                    unsafe_allow_html=True
+                )
+            with c2:
+                # file upload if needed only appears below when clicked
+                run_key = f"run_{pid}"
+                if st.button("▶️ Run", key=run_key, use_container_width=True):
+                    st.session_state[f"want_run_{pid}"] = True
+            with c3:
+                if st.button("✏️ Edit", key=f"edit_{pid}", use_container_width=True):
+                    st.session_state["__edit_sel__"] = pid
+
+        # If user clicked Run, show uploader (for file_upload source) and execute
+        if st.session_state.get(f"want_run_{pid}"):
+            uploads = None
+            if pdata["source"]["kind"] == "file_upload":
+                uploads = st.file_uploader("Upload documents for this run",
+                                           type=["txt","md","pdf","docx","csv","json"],
+                                           accept_multiple_files=True, key=f"up_{pid}")
+            if st.button("Run now", key=f"run_now_{pid}"):
                 try:
-                    st.page_link("pages/2_Pipelines.py", label="Open Pipeline Builder", use_container_width=True)
-                except Exception:
-                    st.caption("Tip: put `pipelines_app.py` under pages/ as `2_Pipelines.py` to enable quick navigation.")
+                    res = _run_pipeline_obj(pdata, uploads=uploads, ui_log=_status_log(st.container()))
+                    st.success(f"Done: {res}")
+                except Exception as e:
+                    st.error(f"Run failed: {e}")
+                finally:
+                    st.session_state.pop(f"want_run_{pid}", None)
+
+st.divider()
+
+# ---------- UI: Inline Builder ----------
+st.markdown("### 🛠️ Pipeline Builder (Inline)")
+st.caption("Create / edit / delete pipelines here. These are saved to `pipelines.json` and runnable above.")
+
+store = _load_pipes_json()
+existing_ids = list(store.keys())
+
+col_sel, col_new = st.columns([0.65, 0.35])
+with col_sel:
+    sel_id = st.selectbox("Choose a pipeline to edit", ["(new)"] + existing_ids,
+                          index=(["(new)"]+existing_ids).index(st.session_state.get("__edit_sel__","(new)")))
+with col_new:
+    if st.button("➕ New pipeline", use_container_width=True):
+        st.session_state["__edit_sel__"] = "(new)"
+        st.rerun()
+
+sel = store.get(sel_id, {}) if sel_id != "(new)" else {}
+
+with st.form("inline_builder_form", clear_on_submit=False):
+    name = st.text_input("Name", value=sel.get("name", "My Pipeline"))
+    desc = st.text_area("Description", value=sel.get("description", ""), height=80)
+
+    st.markdown("#### Source")
+    src_kind = st.selectbox("Source type", ["local_folder","azure_blob","file_upload"],
+                            index=["local_folder","azure_blob","file_upload"].index(
+                                (sel.get("source") or {}).get("kind","local_folder")))
+    cur_src_params = (sel.get("source") or {}).get("params", {}) or {}
+    if src_kind == "local_folder":
+        p_path = st.text_input("Folder path", value=cur_src_params.get("path","./KB"))
+        p_exts = st.text_input("Extensions (comma-sep)", value=cur_src_params.get("exts",".txt,.md,.pdf,.docx,.csv,.json"))
+        src_params = {"path": p_path, "exts": p_exts}
+    elif src_kind == "azure_blob":
+        az = st.secrets.get("azure", {})
+        p_conn = st.text_input("Azure connection_string", value=cur_src_params.get("connection_string", az.get("connection_string","")))
+        p_cont = st.text_input("Container", value=cur_src_params.get("container", az.get("container","")))
+        p_pref = st.text_input("Prefix (folder)", value=cur_src_params.get("prefix", az.get("prefix","")))
+        src_params = {"connection_string": p_conn, "container": p_cont, "prefix": p_pref}
+    else:  # file_upload
+        st.caption("Files are provided during Run (not saved in pipelines.json).")
+        src_params = {"note": "files provided at run"}
+
+    st.markdown("#### Chunking")
+    strat = st.selectbox("Strategy", ["recursive","markdown","token","fixed"],
+                         index=["recursive","markdown","token","fixed"].index(
+                             (sel.get("chunking") or {}).get("strategy","recursive")))
+    c1, c2 = st.columns(2)
+    with c1:
+        csize = st.number_input("Chunk size (chars)", 100, 5000,
+                                value=(sel.get("chunking",{}).get("chunk_size",800)), step=50)
+    with c2:
+        cover = st.number_input("Chunk overlap (chars)", 0, 1000,
+                                value=(sel.get("chunking",{}).get("chunk_overlap",120)), step=10)
+    c3, c4 = st.columns(2)
+    with c3:
+        tsize = st.number_input("Token chunk size", 32, 2048,
+                                value=(sel.get("chunking",{}).get("token_chunk_size",256)), step=16)
+    with c4:
+        tover = st.number_input("Token overlap", 0, 512,
+                                value=(sel.get("chunking",{}).get("token_overlap",32)), step=8)
+
+    st.markdown("#### Embeddings")
+    prov = st.selectbox("Provider", ["sentence_transformers","openai"],
+                        index=["sentence_transformers","openai"].index(
+                            (sel.get("embedding") or {}).get("provider","sentence_transformers")))
+    model = st.text_input("Model name", value=(sel.get("embedding",{}).get("model_name","sentence-transformers/all-MiniLM-L6-v2")))
+    norm = st.checkbox("Normalize embeddings (cosine)",
+                       value=(sel.get("embedding",{}).get("normalize",True)))
+
+    st.markdown("#### Vector DB (Sink)")
+    vkind = st.selectbox("Vector DB", ["faiss","weaviate"],
+                         index=["faiss","weaviate"].index(
+                             (sel.get("vectordb") or {}).get("kind","faiss")))
+    vsink = (sel.get("vectordb") or {}).get("params", {}) or {}
+    if vkind == "faiss":
+        vpath = st.text_input("Index output dir", value=vsink.get("index_path", str(_VECTOR_DIR / "kb_index")))
+        vsink = {"index_path": vpath}
+    else:
+        w = st.secrets.get("weaviate", {})
+        wurl = st.text_input("Weaviate URL", value=vsink.get("url", w.get("url","http://localhost:8080")))
+        wkey = st.text_input("API Key (optional)", value=vsink.get("api_key", w.get("api_key","")))
+        wcls = st.text_input("Class name", value=vsink.get("class_name","KBChunk"))
+        vsink = {"url": wurl, "api_key": wkey, "class_name": wcls}
+
+    submitted = st.form_submit_button("💾 Save Pipeline")
+
+if submitted:
+    pid = sel_id if sel_id != "(new)" else uuid.uuid4().hex
+    store[pid] = {
+        "id": pid,
+        "name": name.strip(),
+        "description": desc.strip(),
+        "source": {"kind": src_kind, "params": src_params},
+        "chunking": {
+            "strategy": strat,
+            "chunk_size": int(csize),
+            "chunk_overlap": int(cover),
+            "token_chunk_size": int(tsize),
+            "token_overlap": int(tover),
+        },
+        "embedding": {"provider": prov, "model_name": model.strip(), "normalize": bool(norm)},
+        "vectordb": {"kind": vkind, "params": vsink},
+    }
+    _save_pipes_json(store)
+    st.success("Pipeline saved.")
+    st.session_state["__edit_sel__"] = pid
+    st.rerun()
+
+if sel_id != "(new)":
+    cols = st.columns(2)
+    with cols[0]:
+        if st.button("🗑️ Delete Pipeline", type="secondary", use_container_width=True):
+            store.pop(sel_id, None)
+            _save_pipes_json(store)
+            st.success("Pipeline deleted.")
+            st.session_state["__edit_sel__"] = "(new)"
+            st.rerun()
+# =========================== END Pipelines (Build & Run) — INLINE ===========================
+
