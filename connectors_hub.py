@@ -1418,7 +1418,7 @@ with main_left:
     st.markdown('</div>', unsafe_allow_html=True)
 
 
-Option B (import): save as pipelines_inline.py and in connectors_hub.py:
+# Option B (import): save as pipelines_inline.py and in connectors_hub.py:
     from pipelines_inline import render_pipelines_ui
     render_pipelines_ui()
 
