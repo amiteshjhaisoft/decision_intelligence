@@ -45,11 +45,7 @@ except Exception:
 
 try:
     import weaviate
-    from weaviate import connect_to_custom
-try:
-    from weaviate import connect_to_weaviate_cloud as connect_to_wcs
-except Exception:
-    from weaviate import connect_to_wcs
+    from weaviate import connect_to_wcs, connect_to_custom
     from weaviate.classes.config import Property, DataType, Configure
     from weaviate.classes.init import Auth
 except Exception:
@@ -163,11 +159,23 @@ def _weaviate_client(cfg: Dict[str, Any]):
 
 def _ensure_collection(client, name: str, dims: int = 384, mt: bool=False):
     # sanitize collection name for Weaviate
-    name = re.sub(r"[^A-Za-z0-9_]", "_", name).strip("_") or "KB"
-    cols = {c.name: c for c in client.collections.list_all()}
-    if name in cols:
+    import re as _re
+    name = _re.sub(r"[^A-Za-z0-9_]", "_", name).strip("_") or "KB"
+    try:
+        existing = client.collections.list_all()
+    except Exception:
+        existing = []
+    # list_all() may return a list of strings or objects with .name
+    names = set()
+    for c in existing:
+        try:
+            names.add(getattr(c, 'name', c))
+        except Exception:
+            pass
+    if name in names:
         return client.collections.get(name)
     return client.collections.create(
+
         name,
         vectorizer_config=Configure.Vectorizer.none(dims=dims),
         properties=[
@@ -338,7 +346,7 @@ def render_pipelines_ui():
 
     hdr_l, hdr_r = st.columns([1,5])
     with hdr_l:
-        if st.button("➕ Create pipeline", type="primary", width='stretch'):
+        if st.button("➕ Create pipeline", type="primary", use_container_width=True):
             _open_new()
 
     left, right = st.columns([4,6], gap="large")
@@ -355,19 +363,20 @@ def render_pipelines_ui():
             for pid, meta in sorted(pipes.items(), key=lambda kv: kv[1].get("name","").lower()):
                 c = st.container(border=True)
                 with c:
-                    st.markdown(f"**{meta.get('name','(unnamed)')}**  \\n`{pid}`")
+                    st.markdown(f"**{meta.get('name','(unnamed)')}**  
+`{pid}`")
                     a, b, d = st.columns([2,2,2])
-                    if a.button("▶️ Run", key=f"run::{pid}", width='stretch'):
+                    if a.button("▶️ Run", key=f"run::{pid}", use_container_width=True):
                         with st.spinner("Running..."):
                             try:
                                 result = run_pipeline_by_id(pid)
                                 st.success(f"Ingested {result['ingested']} chunks → **{result['collection']}**.")
                             except Exception as e:
                                 st.error(f"Run failed: {e}")
-                    if b.button("✏️ Edit", key=f"edit::{pid}", width='stretch'):
+                    if b.button("✏️ Edit", key=f"edit::{pid}", use_container_width=True):
                         _open_edit(pid, meta)
                         st.rerun()
-                    if d.button("🗑️ Delete", key=f"del::{pid}", width='stretch'):
+                    if d.button("🗑️ Delete", key=f"del::{pid}", use_container_width=True):
                         try:
                             pipes.pop(pid, None)
                             save_pipelines(pipes)
@@ -379,7 +388,8 @@ def render_pipelines_ui():
     # -------- right: editor --------
     with right:
         if not st.session_state.pipelines_show_editor:
-            st.empty()
+            st.markdown("### ✏️ Create / Edit pipeline")
+            st.info("Click **Create pipeline** or **Edit** on a saved item to open the editor.")
             return
 
         draft = st.session_state.pipelines_draft or _new_empty_draft()
@@ -488,7 +498,7 @@ def render_pipelines_ui():
             st.warning(" ".join(warn_msg))
 
         btn_save, btn_run, btn_cancel = st.columns([1,1,1])
-        if btn_save.button("💾 Save", width='stretch', disabled=not (has_valid_source and has_valid_sink)):
+        if btn_save.button("💾 Save", use_container_width=True, disabled=not (has_valid_source and has_valid_sink)):
             # Assign ID
             pid = st.session_state.pipelines_edit_id
             if pid is None:
@@ -505,7 +515,7 @@ def render_pipelines_ui():
             _close_editor()
             st.rerun()
 
-        if btn_run.button("▶️ Run now", width='stretch', disabled=not (has_valid_source and has_valid_sink)):
+        if btn_run.button("▶️ Run now", use_container_width=True, disabled=not (has_valid_source and has_valid_sink)):
             # Run a temporary draft without saving
             temp_id = "__tmp_draft__"
             pipes[temp_id] = draft
@@ -520,6 +530,20 @@ def render_pipelines_ui():
                 pipes.pop(temp_id, None)
                 save_pipelines(pipes)
 
-        if btn_cancel.button("✖️ Cancel", width='stretch'):
+        if btn_cancel.button("✖️ Cancel", use_container_width=True):
             _close_editor()
             st.rerun()
+
+# ------------------------------ EXAMPLE
+# ------------------------------ EXAMPLE (import or inline) ----------------------
+# Option A (inline): paste all of this into connectors_hub.py and call:
+#     render_pipelines_ui()
+#
+# Option B (import): save as pipelines_inline.py and in connectors_hub.py:
+#     from pipelines_inline import render_pipelines_ui
+#     render_pipelines_ui()
+#
+# Trigger loop (external scheduler):
+#     from pipelines_inline import trigger_loop_forever
+#     trigger_loop_forever(poll_seconds=30)
+# --------------------------------------------------------------------------------
