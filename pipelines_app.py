@@ -1,5 +1,5 @@
 """
-Author: You + ChatGPT (for Amitesh Jha | iSoft ANZ)
+Author: Amitesh Jha | iSoft ANZ
 Date: 2025-10-21
 File: pipelines_app.py
 
