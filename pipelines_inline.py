@@ -351,8 +351,7 @@ def render_pipelines_ui():
             for pid, meta in sorted(pipes.items(), key=lambda kv: kv[1].get("name","").lower()):
                 c = st.container(border=True)
                 with c:
-                    st.markdown(f"**{meta.get('name','(unnamed)')}**  
-`{pid}`")
+                    st.markdown(f"**{meta.get('name','(unnamed)')}**  `{pid}`")
                     a, b, d = st.columns([2,2,2])
                     if a.button("▶️ Run", key=f"run::{pid}", use_container_width=True):
                         with st.spinner("Running..."):
