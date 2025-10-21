@@ -1416,3 +1416,57 @@ with main_left:
                         st.error(f"Failed to delete: {e}")
 
     st.markdown('</div>', unsafe_allow_html=True)
+
+
+# ---- Pipelines Runner (embed pipelines_app execution from within the Hub) ----
+with st.container():
+    st.markdown("### 🧩 Pipelines (Build & Run)")
+    st.caption("Use the pipeline builder page to create/edit pipelines, then run them here like an ETL job.")
+
+    # Lazy import so Connectors Hub still loads if pipelines_app is missing
+    try:
+        from pipelines_app import load_pipelines  # canvas code file
+        from runner import run_pipeline_by_id     # tiny shim you created above
+    except Exception as e:
+        st.info("Pipelines module not found. Place pipelines_app.py and runner.py next to this file.")
+        st.code(str(e))
+    else:
+        pipes = load_pipelines()
+        if not pipes:
+            st.warning("No pipelines found. Open the Pipeline Builder to create one first.")
+            st.markdown("• If you’re using multipage, go to **Pages → Pipelines**.\n• Or run `streamlit run pipelines_app.py` once and save a pipeline.")
+        else:
+            # Display as nice choices
+            options = [(pid, f"{p.name}  —  {p.source.kind} → {p.vectordb.kind}") for pid, p in pipes.items()]
+            pid_to_label = {pid: label for pid, label in options}
+            selected_id = st.selectbox("Select a pipeline to run", options=list(pid_to_label.keys()),
+                                       format_func=lambda k: pid_to_label[k], key="sel_pipeline_id")
+
+            # If the selected pipeline expects file uploads, show a file_uploader
+            sel = pipes[selected_id]
+            uploads = None
+            if sel.source.kind == "file_upload":
+                uploads = st.file_uploader(
+                    "Upload documents for this run",
+                    type=["txt","md","pdf","docx","csv","json"], accept_multiple_files=True
+                )
+
+            col_run, col_view = st.columns([1,1])
+            with col_run:
+                if st.button("▶️ Run Pipeline", use_container_width=True):
+                    try:
+                        res = run_pipeline_by_id(
+                            selected_id,
+                            uploads=uploads,
+                            ui_log=lambda m: st.write(m)  # pipe logs back to UI
+                        )
+                        st.success(f"Done. {res}")
+                    except Exception as e:
+                        st.error(f"Run failed: {e}")
+
+            with col_view:
+                # Convenience: open the Pipeline Builder page if you are using multipage layout
+                try:
+                    st.page_link("pages/2_Pipelines.py", label="Open Pipeline Builder", use_container_width=True)
+                except Exception:
+                    st.caption("Tip: put `pipelines_app.py` under pages/ as `2_Pipelines.py` to enable quick navigation.")
