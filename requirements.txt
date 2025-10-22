@@ -19,3 +19,6 @@ pandas
 
 # ---------- Secrets & Config ----------
 python-dotenv
+
+
+tiktoken
